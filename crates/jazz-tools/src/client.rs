@@ -358,7 +358,7 @@ impl JazzClient {
             subs.insert(handle, SubscriptionState { runtime_handle });
         }
 
-        Ok(SubscriptionStream::new(rx))
+        Ok(SubscriptionStream::new(rx, handle))
     }
 
     /// One-shot query, optionally waiting for a durability tier.

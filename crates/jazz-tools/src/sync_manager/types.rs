@@ -54,7 +54,7 @@ impl std::fmt::Display for ServerId {
 }
 
 /// Unique identifier for a client connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ClientId(pub Uuid);
 
 impl ClientId {
@@ -81,7 +81,7 @@ impl std::fmt::Display for ClientId {
 }
 
 /// Unique identifier for a query subscription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct QueryId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -602,9 +602,11 @@ impl SyncPayload {
         postcard::to_allocvec(self)
     }
 
-    /// Decode a payload from postcard bytes.
+    /// Decode a payload from postcard bytes. Nesting is bounded at
+    /// `wire_depth::WIRE_MAX_NESTING`: the wire is untrusted, the recursive types are
+    /// derived deserializers, and an overflowed worker stack aborts the process.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        super::wire_depth::from_postcard_bounded(bytes, super::wire_depth::WIRE_MAX_NESTING)
     }
 
     pub fn to_json(&self) -> Result<String, serde_json::Error> {

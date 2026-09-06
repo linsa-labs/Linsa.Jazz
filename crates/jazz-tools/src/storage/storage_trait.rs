@@ -12,6 +12,14 @@ use super::*;
 // Storage Trait
 // ============================================================================
 
+/// v18 item 4: what a settle pass left behind in the store's transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassOutcome {
+    /// At least one write landed in the pass's transaction; the durability barrier owns
+    /// the COMMIT. `false`: the pass's read transaction (if any) is already closed.
+    pub wrote: bool,
+}
+
 /// Synchronous storage for metadata, row histories, raw tables, and indices.
 ///
 /// All operations are **synchronous** - they return immediately with results.
@@ -1916,6 +1924,42 @@ pub trait Storage {
     fn close(&self) -> Result<(), StorageError> {
         Ok(())
     }
+
+    /// v18 item 4 (C1): a settle pass begins. A store with statement-level transaction
+    /// cost (SQLite) opens ONE read transaction for the pass here; nested passes (a tick
+    /// inside a tick) inherit it. No-op by default.
+    fn begin_read_pass(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// v18 item 4 (C1): the pass ends. **Call this even when `begin_read_pass` returned
+    /// `Err`** (diff r21 SF1): the store's depth bookkeeping runs before the reconcile that
+    /// reports, so a begin that failed still counted, and only a matching end brings the depth
+    /// back down. The core's tick swallows the begin's `Err` for exactly this reason.
+    /// `wrote` hands a dirty transaction to the durability barrier; a clean one is closed
+    /// here. `Err(LostWrites)` is the store's report that its
+    /// transaction was ended behind its back with landed writes in it.
+    fn end_read_pass(&self) -> Result<PassOutcome, StorageError> {
+        Ok(PassOutcome { wrote: false })
+    }
+
+    /// v18 item 5 (D2): the read ladder recovered a visible row from a family its locators
+    /// did not name; persist the exact locator so the next read does not walk again. `&self`
+    /// because the ladder runs on the read path. No-op by default (stores whose reads never
+    /// ladder).
+    fn record_visible_row_table_locator_recovery(
+        &self,
+        branch: &str,
+        row_id: ObjectId,
+        locator: &ExactRowTableLocator,
+    ) -> Result<(), StorageError> {
+        let _ = (branch, row_id, locator);
+        Ok(())
+    }
+
+    /// v18 item 5: the ladder walked (per-store count; the process-global is
+    /// `settle_cost::LOCATOR_LADDER_RECOVERIES`). No-op by default.
+    fn note_visible_locator_recovery(&self) {}
 }
 
 // Box<Storage> is used to allow for dynamic dispatch of the Storage trait.
@@ -2553,6 +2597,36 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
 
     fn close(&self) -> Result<(), StorageError> {
         (**self).close()
+    }
+
+    fn begin_read_pass(&self) -> Result<(), StorageError> {
+        (**self).begin_read_pass()
+    }
+
+    fn end_read_pass(&self) -> Result<PassOutcome, StorageError> {
+        (**self).end_read_pass()
+    }
+
+    // v18 item 5: these two forwards are UNREACHABLE today, and are kept deliberately.
+    // The D2 hook runs inside `load_visible_region_row_bytes_with_storage<H>`, which every
+    // concrete store reaches through its OWN override of `load_visible_region_row_bytes`
+    // (sqlite, rocksdb, memory, opfs_btree — all four override it), so `H` is the concrete
+    // store and the `Box` has been peeled before the hook calls either method. Omitting them
+    // would hand a boxed store the trait's no-op defaults above the day some store inherits
+    // the default read body — silently, and that is defect 20's class exactly. Chain rows
+    // E10/E11 measured this: disarming these forwards leaves G-C5 green, so the rows now
+    // disarm the hook itself. Do not "simplify" these away because no test covers them.
+    fn record_visible_row_table_locator_recovery(
+        &self,
+        branch: &str,
+        row_id: ObjectId,
+        locator: &ExactRowTableLocator,
+    ) -> Result<(), StorageError> {
+        (**self).record_visible_row_table_locator_recovery(branch, row_id, locator)
+    }
+
+    fn note_visible_locator_recovery(&self) {
+        (**self).note_visible_locator_recovery()
     }
 }
 

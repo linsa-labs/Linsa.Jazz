@@ -322,7 +322,7 @@ fn parse_subscription_inputs(
 )> {
     let query = parse_query(query_json)?;
     let session = parse_session_json(session_json)?;
-    let (durability, propagation, _transaction_batch_id) =
+    let (durability, propagation, _transaction_batch_id, _timeout_ms) =
         parse_read_durability_options(tier.as_deref(), options_json.as_deref())
             .map_err(napi::Error::from_reason)?;
     Ok((query, session, durability, propagation))
@@ -551,6 +551,79 @@ fn deliver_pending_mutation_errors(core_arc: &Arc<Mutex<NapiCoreType>>) {
     }
 }
 
+/// The directives the client engine should log under, or `None` for "stay silent".
+///
+/// Split out from the install below because the install is a process-global, once-only side
+/// effect and this is the whole of the policy: opt in on a non-empty value, and treat an empty
+/// or whitespace-only one as unset. Compose files set variables to `""` all the time, and a
+/// client engine that started logging because of that would be a surprise nobody asked for.
+fn napi_logging_directives(raw: Option<&str>) -> Option<&str> {
+    let directives = raw?.trim();
+    (!directives.is_empty()).then_some(directives)
+}
+
+/// Whether the client engine's logging has been installed. Process-global by nature.
+static NAPI_RUNTIME_LOG_INIT: OnceLock<bool> = OnceLock::new();
+
+/// v18 measurement instrument: give the CLIENT engine a log.
+///
+/// `init_jazz_server_telemetry` above is for an embedded `JazzServer` and returns immediately
+/// unless a collector URL is passed; prod passes none. So `NapiRuntime` — the engine the
+/// rpc-server does all of its reads and writes through — has never emitted a line: no
+/// `settle_cost`, no span, not even a thread name, since its tick runs on an anonymous
+/// `std::thread`. `archive/prodrepro/REPRO.md` records what that cost: the prod bottleneck had
+/// to be localised to this engine from the OUTSIDE, by elimination, because there was nothing
+/// to read from the inside, and the v18 counters (`autocommit_reads`,
+/// `locator_ladder_recoveries`, `checkpoints`) are unreadable here for the same reason.
+///
+/// Deliberately narrow, and the variable is `JAZZ_NAPI_LOG` rather than `RUST_LOG` **because
+/// diff r28 measured that `RUST_LOG` is not opt-in here**: `Linsa.Server/docker/compose.prod.yml`
+/// sets `RUST_LOG: "${RPC_SERVER_RUST_LOG:-info}"` on the rpc-server — the very process that
+/// embeds this engine — so keying on it would have turned on a ~30-field line per settle pass, in
+/// production, on the day this tag landed, written synchronously to stderr from inside the pass
+/// while it holds the whole-`RuntimeCore` mutex. A dedicated variable is opt-in in fact and not
+/// only in the comment.
+///
+/// ANSI is off unconditionally. This is a machine-read log — `archive/prodrepro/after-report.py`
+/// scrapes `field=value` — and the escape codes land BETWEEN the name and the `=`, so a coloured
+/// line reports every counter as absent. Relying on `NO_COLOR` would not have helped: it is set
+/// on jazz-sync in all three compose files and on none of the rpc-server blocks.
+///
+/// `set_global_default` fails harmlessly when `init_jazz_server_telemetry` already claimed the
+/// slot, so the two never fight over it; the returned bool says which happened, and a failed
+/// install warns rather than disappearing.
+fn init_napi_runtime_logging() -> bool {
+    *NAPI_RUNTIME_LOG_INIT.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let raw = std::env::var("JAZZ_NAPI_LOG").ok();
+        let Some(directives) = napi_logging_directives(raw.as_deref()) else {
+            return false;
+        };
+        let installed = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(directives))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_ansi(false),
+                ),
+        )
+        .is_ok();
+        if !installed {
+            // Someone already owns the global subscriber — today that can only be
+            // `init_jazz_server_telemetry`. Say so, because the alternative is an operator who
+            // set `JAZZ_NAPI_LOG` and sees nothing, with no way to tell that from a build
+            // without this at all.
+            eprintln!(
+                "jazz: JAZZ_NAPI_LOG is set but a tracing subscriber was already installed; \
+                 the client engine will not log"
+            );
+        }
+        installed
+    })
+}
+
 fn build_napi_runtime(
     schema_json: String,
     app_id: String,
@@ -559,6 +632,9 @@ fn build_napi_runtime(
     storage: Box<dyn Storage + Send>,
     tier: Option<String>,
 ) -> napi::Result<NapiRuntime> {
+    // Before anything else, so that a failure while building the runtime is itself visible.
+    init_napi_runtime_logging();
+
     // Parse schema
     let runtime_schema = parse_runtime_schema_input(&schema_json)
         .map_err(|e| napi::Error::from_reason(format!("Invalid schema JSON: {}", e)))?;
@@ -932,16 +1008,16 @@ impl NapiRuntime {
         let query = parse_query(&query_json)?;
         let session = parse_session_json(session_json)?;
 
-        let (durability, propagation, transaction_batch_id) =
+        let (durability, propagation, transaction_batch_id, timeout_ms) =
             parse_read_durability_options(tier.as_deref(), options_json.as_deref())
                 .map_err(napi::Error::from_reason)?;
 
-        let future = {
+        let (handle, future) = {
             let mut core = self
                 .core
                 .lock()
                 .map_err(|_| napi::Error::from_reason("lock"))?;
-            core.query_with_local_batch(
+            core.query_with_local_batch_tracked(
                 query,
                 session,
                 durability,
@@ -951,9 +1027,31 @@ impl NapiRuntime {
             .map_err(|e| napi::Error::from_reason(format!("Query setup failed: {e}")))?
         };
 
-        let rows = future
-            .await
-            .map_err(|e| napi::Error::from_reason(format!("Query failed: {:?}", e)))?;
+        let result = match timeout_ms {
+            Some(ms) => {
+                match tokio::time::timeout(std::time::Duration::from_millis(ms), future).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        // The caller has given up: release the engine's subscription now
+                        // so the abandoned read stops costing settle passes here and at
+                        // the server. `false` means it settled in the meantime — the
+                        // tick already cleaned it up.
+                        let cancelled = self
+                            .core
+                            .lock()
+                            .map_err(|_| napi::Error::from_reason("lock"))?
+                            .cancel_one_shot_query(handle);
+                        return Err(napi::Error::from_reason(format!(
+                            "Query timed out after {ms}ms and was cancelled (released={cancelled})"
+                        )));
+                    }
+                }
+            }
+            None => future.await,
+        };
+
+        let rows =
+            result.map_err(|e| napi::Error::from_reason(format!("Query failed: {:?}", e)))?;
 
         Ok(QueryRows(rows))
     }
@@ -1461,6 +1559,87 @@ pub fn verify_local_first_identity_proof_napi(
 
 #[cfg(test)]
 mod tests {
+    /// Gate G5d: the deadline the caller passes as `timeout_ms` rejects the read AND releases
+    /// the engine's subscription, through the real binding path (`NapiRuntime::query` on a
+    /// tokio runtime with the time driver), because that glue has no other test and the
+    /// rpc-server's facade depends on its error text.
+    #[test]
+    fn a_query_deadline_rejects_the_read_and_releases_its_subscription() {
+        use jazz_tools::query_manager::types::{ColumnType, SchemaBuilder, TableSchema};
+        use jazz_tools::sync_manager::ServerId;
+
+        let schema = SchemaBuilder::new()
+            .table(TableSchema::builder("docs").column("body", ColumnType::Text))
+            .build();
+        let dir = std::env::temp_dir().join(format!(
+            "jazz-napi-query-deadline-gate-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let runtime = super::NapiRuntime::new(
+            serde_json::to_string(&schema).expect("serialize schema"),
+            "query-deadline-gate".to_string(),
+            "dev".to_string(),
+            "main".to_string(),
+            dir.join("runtime.sqlite").to_string_lossy().into_owned(),
+            None,
+        )
+        .expect("runtime should construct");
+        // An upstream that never answers: the tiered read below waits on its settle.
+        let baseline = {
+            let mut core = runtime.core.lock().expect("lock");
+            core.schema_manager_mut()
+                .query_manager_mut()
+                .sync_manager_mut()
+                .add_pending_server(ServerId::new());
+            core.schema_manager().query_manager().subscription_count()
+        };
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let query_json =
+            serde_json::to_string(&jazz_tools::query_manager::query::Query::new("docs"))
+                .expect("serialize query");
+        let started = std::time::Instant::now();
+        let outcome = tokio_runtime.block_on(runtime.query(
+            query_json,
+            None,
+            Some("edge".to_string()),
+            Some(r#"{"timeout_ms":50}"#.to_string()),
+        ));
+
+        let err = outcome
+            .err()
+            .expect("the read must be rejected by its deadline");
+        let regex = regex_lite_matches(&err.reason);
+        assert!(
+            regex,
+            "the rejection must carry the timeout contract the facade matches on, got {:?}",
+            err.reason
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline, not some other limit, must have ended the read"
+        );
+        let core = runtime.core.lock().expect("lock");
+        assert_eq!(core.pending_one_shot_query_count(), 0);
+        assert_eq!(
+            core.schema_manager().query_manager().subscription_count(),
+            baseline,
+            "the abandoned read must not keep its subscription"
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The facade's contract (`/timed out|cancelled/i`), spelled out without a regex crate.
+    fn regex_lite_matches(reason: &str) -> bool {
+        let lower = reason.to_ascii_lowercase();
+        lower.contains("timed out") || lower.contains("cancelled")
+    }
     use jazz_tools::query_manager::types::{
         ColumnType, ComposedBranchName, Schema, SchemaBuilder, TableName, TableSchema, Value,
     };
@@ -1643,5 +1822,49 @@ mod tests {
             .column("done")
             .unwrap();
         assert_eq!(done.default, Some(Value::Boolean(false)));
+    }
+}
+
+#[cfg(test)]
+mod napi_logging_gates {
+    use super::napi_logging_directives;
+
+    /// Internal on purpose: `napi_logging_directives` is a private policy helper with no public
+    /// surface, and the thing it guards — a process-global `set_global_default` — cannot be
+    /// asserted from an integration test without a second subscriber install racing it. What is
+    /// testable is the decision, so that is what is pinned here.
+    ///
+    /// G-LOG. The client engine logs only on a non-empty `JAZZ_NAPI_LOG`. Two things are pinned
+    /// here and both were nearly wrong:
+    ///
+    /// * the empty-string case — compose and `.env` files set variables to `""` routinely, and
+    ///   an engine that started writing every trace event to stderr because of one would be a
+    ///   regression in a shipping build, not a measurement;
+    /// * the VARIABLE. The first version keyed on `RUST_LOG`, and `compose.prod.yml` sets
+    ///   `RUST_LOG` on the rpc-server, the process that embeds this engine — so "opt-in" would
+    ///   have meant "on in production immediately" (diff r28). The gate below names the variable
+    ///   so that changing it back is a visible edit.
+    #[test]
+    fn the_client_engine_logs_only_when_its_own_variable_says_something() {
+        assert_eq!(
+            napi_logging_directives(None),
+            None,
+            "no JAZZ_NAPI_LOG at all is today's behaviour and must stay silent"
+        );
+        assert_eq!(
+            napi_logging_directives(Some("")),
+            None,
+            "an empty JAZZ_NAPI_LOG is how a compose file spells `unset`, not `log everything`"
+        );
+        assert_eq!(
+            napi_logging_directives(Some("   ")),
+            None,
+            "whitespace is the same thing with a typo in it"
+        );
+        assert_eq!(
+            napi_logging_directives(Some(" jazz_tools=info ")),
+            Some("jazz_tools=info"),
+            "a real directive is passed through trimmed, so `EnvFilter` sees what was meant"
+        );
     }
 }

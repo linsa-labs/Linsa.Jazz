@@ -331,6 +331,9 @@ fn build_catalogue_runtime(
     in_flight_pushes: Arc<AtomicUsize>,
     push_errors: Arc<Mutex<Vec<String>>>,
 ) -> TokioRuntime<MemoryStorage> {
+    // v18 item 3: the outbox callback runs on the runtime's own `jazz-tick` thread, which
+    // has no tokio context — spawn through a handle captured here, on the test's runtime.
+    let handle = tokio::runtime::Handle::current();
     TokioRuntime::new(schema_manager, storage, move |entry: OutboxEntry| {
         let OutboxEntry {
             destination,
@@ -341,7 +344,7 @@ fn build_catalogue_runtime(
             let state = state.clone();
             let push_errors = push_errors.clone();
             let in_flight_pushes = in_flight_pushes.clone();
-            tokio::spawn(async move {
+            handle.spawn(async move {
                 let entry = jazz_tools::sync_manager::OutboxEntry {
                     destination: Destination::Server(ServerId::default()),
                     payload,

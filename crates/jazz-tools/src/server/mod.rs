@@ -385,6 +385,9 @@ impl ConnectionEventHub {
 pub struct DisconnectCandidate {
     /// When the last SSE connection closed.
     pub disconnected_at: Instant,
+    /// v18 item 3: reap attempts that did not finish (the `remove_client` task panicked).
+    /// The third strike drops the candidate instead of re-queueing it forever.
+    pub reap_failures: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -427,6 +430,32 @@ pub struct ServerState {
     /// Optional sync message tracer for test observability.
     pub sync_tracer: Option<crate::sync_tracer::SyncTracer>,
     pub shutdown: ShutdownController,
+    /// v18 item 3: the largest decoded size a post-handshake client frame may declare
+    /// (`JAZZ_MAX_WS_DECODED_FRAME_BYTES`). Over it the connection is closed with
+    /// `frame_too_large`.
+    pub max_ws_decoded_frame_bytes: usize,
+    /// v18 item 3: sockets currently waiting for the in-flight decoded-bytes budget.
+    /// Internal on purpose: a gate's precondition ("socket k is queued before socket k+1
+    /// sends"), visible through no wire message.
+    pub budget_waiters: std::sync::atomic::AtomicUsize,
+}
+
+/// Why a client frame was not turned into inbox entries.
+#[derive(Debug)]
+pub enum ClientFrameError {
+    /// The server is shutting down; the frame is dropped.
+    ShuttingDown,
+    /// The payload is neither an `OutboxEntry` nor a `SyncBatchRequest`.
+    Invalid(String),
+}
+
+impl std::fmt::Display for ClientFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientFrameError::ShuttingDown => f.write_str("server is shutting down"),
+            ClientFrameError::Invalid(message) => write!(f, "invalid ws payload: {message}"),
+        }
+    }
 }
 
 /// State for a single SSE connection.
@@ -537,6 +566,7 @@ impl ServerState {
                 client_id,
                 DisconnectCandidate {
                     disconnected_at: Instant::now(),
+                    reap_failures: 0,
                 },
             );
         }
@@ -556,12 +586,12 @@ impl ServerState {
         let now = tokio::time::Instant::now();
 
         // Step 1: drain expired entries from candidates
-        let expired: Vec<ClientId> = {
+        let expired: Vec<(ClientId, u8)> = {
             let mut candidates = self.disconnect_candidates.write().await;
             let mut expired = Vec::new();
             candidates.retain(|&client_id, candidate| {
                 if now.duration_since(candidate.disconnected_at) >= ttl {
-                    expired.push(client_id);
+                    expired.push((client_id, candidate.reap_failures));
                     false // remove from candidates
                 } else {
                     true // keep
@@ -576,7 +606,7 @@ impl ServerState {
 
         let mut reaped = Vec::new();
         let mut requeued = Vec::new();
-        for client_id in expired {
+        for (client_id, reap_failures) in expired {
             // Check for active connections right before reaping to close the
             // TOCTOU window: if a client reconnects between the candidate drain
             // above and this check, we see the new connection and skip.
@@ -590,14 +620,47 @@ impl ServerState {
                 tracing::debug!(%client_id, "skipping reap: client reconnected");
                 continue;
             }
-            match self.runtime.remove_client(client_id) {
+            // v18 item 3: `remove_client` takes the engine lock; a pass may hold it for a
+            // long time, and the sweep runs on the I/O worker — so the call waits on the
+            // blocking pool, never on a worker thread. Residual: that pool (512 threads by
+            // default) is shared with the handshake closures, so under a reconnect storm
+            // that parks every thread on the lock this call queues behind them — bounded by
+            // the lock hold plus one handshake's registration; the I/O worker is never
+            // blocked either way.
+            let runtime = self.runtime.clone();
+            let removal = match tokio::task::spawn_blocking(move || {
+                runtime.remove_client(client_id)
+            })
+            .await
+            {
+                Ok(removal) => removal,
+                Err(join_error) => {
+                    // The candidate was already drained above: re-queue it, or the
+                    // core's client state leaks until the process restarts (its staging
+                    // entry does not: the drain retires an empty entry with no waiters).
+                    // A deterministic panic would re-queue forever: three strikes and the
+                    // candidate is dropped, said once at `error!`.
+                    if reap_failures + 1 >= 3 {
+                        tracing::error!(
+                            %client_id,
+                            error = %join_error,
+                            "reap task did not finish three times; dropping the candidate"
+                        );
+                    } else {
+                        tracing::error!(%client_id, error = %join_error, "reap task did not finish");
+                        requeued.push((client_id, reap_failures + 1));
+                    }
+                    continue;
+                }
+            };
+            match removal {
                 Ok(true) => {
                     reaped.push(client_id);
                     tracing::debug!(%client_id, "reaped disconnected client");
                 }
                 Ok(false) => {
                     // Client has unpersisted data — re-queue for next sweep
-                    requeued.push(client_id);
+                    requeued.push((client_id, reap_failures));
                 }
                 Err(e) => {
                     tracing::error!(%client_id, error = %e, "failed to reap client");
@@ -608,9 +671,10 @@ impl ServerState {
         // Re-insert clients that couldn't be reaped yet
         if !requeued.is_empty() {
             let mut candidates = self.disconnect_candidates.write().await;
-            for client_id in requeued {
+            for (client_id, reap_failures) in requeued {
                 candidates.entry(client_id).or_insert(DisconnectCandidate {
                     disconnected_at: Instant::now(),
+                    reap_failures,
                 });
             }
         }
@@ -623,47 +687,68 @@ impl ServerState {
         *self.client_ttl.write().await = ttl;
     }
 
-    /// Process a raw binary payload received from a WebSocket client and push it
-    /// into the runtime sync inbox.
-    ///
-    /// Frames are expected to be post-handshake postcard payloads: either an
-    /// `OutboxEntry` for a single message or a `SyncBatchRequest` for batched
-    /// messages.
+    /// Decode a post-handshake client payload (the decoded frame body) into inbox entries:
+    /// either an `OutboxEntry` for a single message or a `SyncBatchRequest` for batched
+    /// messages. Refused while the server shuts down (new frames only; a frame a socket
+    /// already admitted is staged uncapped on its way out).
+    pub fn decode_client_frame(
+        &self,
+        client_id: ClientId,
+        payload: &[u8],
+    ) -> Result<Vec<InboxEntry>, ClientFrameError> {
+        if self.shutdown.is_shutting_down() {
+            return Err(ClientFrameError::ShuttingDown);
+        }
+        if let Ok(payload) = crate::transport_protocol::decode_outbox_entry_payload(payload) {
+            return Ok(vec![InboxEntry {
+                source: Source::Client(client_id),
+                payload,
+            }]);
+        }
+        match crate::transport_protocol::SyncBatchRequest::decode_payload(payload) {
+            Ok(batch) => Ok(batch
+                .payloads
+                .into_iter()
+                .map(|payload| InboxEntry {
+                    source: Source::Client(client_id),
+                    payload,
+                })
+                .collect()),
+            Err(e) => Err(ClientFrameError::Invalid(e.to_string())),
+        }
+    }
+
+    /// Process a raw binary payload received from a WebSocket client: decode it and stage
+    /// it for the next tick, waiting for the client's staging cap when it is at it. This is
+    /// the waiting wrapper for the tests that feed frames without a socket; the socket loop
+    /// stages synchronously and pauses its inbound side instead. No production caller.
+    #[cfg(any(test, feature = "test"))]
     pub async fn process_ws_client_frame(
         &self,
         client_id: ClientId,
         payload: &[u8],
     ) -> Result<(), String> {
-        if self.shutdown.is_shutting_down() {
-            return Err("server is shutting down".to_string());
-        }
-
-        if let Ok(payload) = crate::transport_protocol::decode_outbox_entry_payload(payload) {
-            let inbox = InboxEntry {
-                source: Source::Client(client_id),
-                payload,
-            };
-            return self
-                .runtime
-                .push_sync_inbox(inbox)
-                .map_err(|e| e.to_string());
-        }
-
-        match crate::transport_protocol::SyncBatchRequest::decode_payload(payload) {
-            Ok(batch) => {
-                let entries = batch
-                    .payloads
-                    .into_iter()
-                    .map(|payload| InboxEntry {
-                        source: Source::Client(client_id),
-                        payload,
-                    })
-                    .collect();
-                self.runtime
-                    .push_sync_inbox_batch(entries)
-                    .map_err(|e| e.to_string())
+        let entries = self
+            .decode_client_frame(client_id, payload)
+            .map_err(|e| e.to_string())?;
+        let bytes = payload.len();
+        let mut outcome = self
+            .runtime
+            .stage_sync_inbox(client_id, entries, bytes, None);
+        loop {
+            match outcome {
+                crate::runtime_tokio::StagePush::Staged => return Ok(()),
+                crate::runtime_tokio::StagePush::Backpressure {
+                    entries,
+                    permit,
+                    waiter,
+                } => {
+                    waiter.notified().await;
+                    outcome = self
+                        .runtime
+                        .stage_sync_inbox_with_waiter(waiter, client_id, entries, bytes, permit);
+                }
             }
-            Err(e) => Err(format!("invalid ws payload: {e}")),
         }
     }
 }
@@ -746,6 +831,8 @@ mod tests {
             client_ttl: RwLock::new(Duration::from_secs(300)),
             sync_tracer: None,
             shutdown: ShutdownController::new(timeout),
+            max_ws_decoded_frame_bytes: crate::server::builder::DEFAULT_MAX_WS_DECODED_FRAME_BYTES,
+            budget_waiters: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -997,6 +1084,7 @@ mod tests {
                 alice,
                 super::DisconnectCandidate {
                     disconnected_at: tokio::time::Instant::now() - Duration::from_secs(301),
+                    reap_failures: 0,
                 },
             );
         }
@@ -1071,6 +1159,7 @@ mod tests {
                 alice,
                 super::DisconnectCandidate {
                     disconnected_at: tokio::time::Instant::now() - Duration::from_secs(301),
+                    reap_failures: 0,
                 },
             );
         }

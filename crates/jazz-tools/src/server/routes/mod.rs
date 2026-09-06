@@ -2264,9 +2264,12 @@ mod tests {
             acks_deliveries: false,
         };
 
-        let diagnostics = connection_schema_diagnostics_from_handshake(&state, &handshake)
-            .expect("compute diagnostics")
-            .expect("declared schema mismatch should produce diagnostics");
+        let diagnostics = connection_schema_diagnostics_for_declared_hash(
+            &state,
+            handshake.declared_schema_hash(),
+        )
+        .expect("compute diagnostics")
+        .expect("declared schema mismatch should produce diagnostics");
 
         assert_eq!(diagnostics.client_schema_hash, declared_hash);
     }

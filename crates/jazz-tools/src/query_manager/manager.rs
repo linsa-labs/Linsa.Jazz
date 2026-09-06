@@ -543,6 +543,57 @@ pub struct CatalogueUpdate {
     pub content: Vec<u8>,
 }
 
+/// v18 item 6: the key of a settle unit that can stall (registrations never enter the set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum UnitKey {
+    Server(ClientId, QueryId),
+    Local(QuerySubscriptionId),
+}
+
+/// v18 item 6: a slot of the fair rotation — one per downstream client, plus the local
+/// pseudo-client, ordered by client id with `Local` last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum RotationSlot {
+    Client(ClientId),
+    Local,
+}
+
+/// v18 item 6: one deadline per lock hold (design v3 § B2). The first unit of the tick
+/// always runs; every further unit runs only while the tick is under its budget.
+#[derive(Debug)]
+pub(super) struct SettleClock {
+    started: web_time::Instant,
+    budget: Option<std::time::Duration>,
+    first_unit_ran: bool,
+}
+
+impl SettleClock {
+    pub(super) fn new(budget_micros: Option<u64>) -> Self {
+        Self {
+            started: web_time::Instant::now(),
+            budget: budget_micros.map(std::time::Duration::from_micros),
+            first_unit_ran: false,
+        }
+    }
+
+    /// Whether the next charged unit may run. `None` budget: always.
+    pub(super) fn may_run_unit(&self) -> bool {
+        match self.budget {
+            None => true,
+            Some(budget) => !self.first_unit_ran || self.started.elapsed() < budget,
+        }
+    }
+
+    /// A charged unit ran.
+    pub(super) fn note_unit_ran(&mut self) {
+        self.first_unit_ran = true;
+    }
+
+    pub(super) fn is_bounded(&self) -> bool {
+        self.budget.is_some()
+    }
+}
+
 /// Manages reactive SQL queries over storage-backed relational state.
 ///
 /// No global Setup/Ready state machine: indices and rows are loaded lazily from
@@ -638,6 +689,43 @@ pub struct QueryManager {
     /// Counts settle passes, so a parked exemption can tell "a scope snapshot arrived
     /// after I was parked" from "one arrived in the same pass".
     pub(super) settle_pass: u64,
+    /// v18 item 6: the settle budget per pass in microseconds (`None` = unbounded). A pass
+    /// always runs its first unit of work; every further unit runs only while the pass is
+    /// under the budget. Set from `JAZZ_SETTLE_BUDGET_MS` by the server binary, or by tests.
+    pub(super) settle_budget_micros: Option<u64>,
+    /// v18 item 6: the deadline of the tick this pass runs in. Established by the outermost
+    /// tick (`begin_tick`) and inherited by every `process` inside it; a standalone `process`
+    /// (the gates) begins its own. `None` budget → the clock never expires.
+    /// Nobody re-arms for a standalone `process` (a `QueryManager` has no scheduler);
+    /// every production `SchemaManager::process` site sits inside `immediate_tick_inner`,
+    /// so the clock a standalone pass begins is a gate's, never a host's (diff r2 S8).
+    pub(super) tick_clock: Option<SettleClock>,
+    /// v18 item 6: set by a pass that deferred a NON-stalled unit for budget (or tripped the
+    /// outbox limiter); peeked by `immediate_tick` to schedule a batched tick, taken by
+    /// `batched_tick`'s continuation. Recomputed by every pass.
+    pub(super) settle_work_remains: bool,
+    /// v18 item 6: units that ran without progress since the last un-stalling event for
+    /// their key (design v4 § B1, v5 § B1). Ordered last in the pool; never re-arm a tick.
+    pub(super) stalled: HashSet<UnitKey>,
+    /// v18 item 6: the rotation cursor — the slot served last; the next pass starts after it.
+    pub(super) rotation_cursor: Option<RotationSlot>,
+    /// v18 item 6: whether the last pass saw a live pending server; the true→false flip
+    /// un-stalls every local key (server arrival or `PENDING_SERVER_TIMEOUT` expiry).
+    pub(super) had_live_pending_servers: bool,
+    /// v18 item 6 (diff r1 S3): the last server — connected or pending — going away frees
+    /// every local unit waiting on the frontier; polled once per pass like the flag above.
+    pub(super) had_servers: bool,
+    /// v18 item 6 (tests only): passes run by this manager — the continuation must not spend
+    /// one under a spent clock (design v7).
+    #[cfg(any(test, feature = "test"))]
+    pub(super) passes: u64,
+    /// v18 item 6 (tests only): server settles past the clean short-circuit, per manager —
+    /// the global `SUBSCRIPTIONS_SETTLED` cross-talks between parallel tests.
+    #[cfg(any(test, feature = "test"))]
+    pub(super) server_settles: u64,
+    /// v18 item 6 (tests only): charged units the pool dispatched, per manager.
+    #[cfg(any(test, feature = "test"))]
+    pub(super) pool_units_run: u64,
 
     /// Per query, the pass in which it last received a settle FROM A SERVER at or above
     /// its own required tier. This is the authority a parked exemption is measured
@@ -749,6 +837,129 @@ impl QueryManager {
         groups.into_values().collect()
     }
 
+    /// v18 item 6 (tests only): the stalled set's size.
+    #[cfg(any(test, feature = "test"))]
+    pub fn stalled_units_for_test(&self) -> usize {
+        self.stalled.len()
+    }
+
+    /// v18 item 6 (tests only): the differential's quiescence predicate — a pass with no
+    /// pending registration and no non-stalled unit has nothing left to do.
+    #[cfg(any(test, feature = "test"))]
+    pub fn has_live_units_for_test(&self) -> bool {
+        self.sync_manager.has_pending_query_subscriptions()
+            || self.server_subscriptions.iter().any(|(key, sub)| {
+                Self::server_subscription_is_unit(sub)
+                    && !self.stalled.contains(&UnitKey::Server(key.0, key.1))
+            })
+            || self.subscriptions.iter().any(|(id, sub)| {
+                Self::local_subscription_is_unit(sub)
+                    && !self.stalled.contains(&UnitKey::Local(*id))
+                    // A local subscription whose ONLY reason is `has_pending_local_updates`
+                    // is sticky (v5 § B3: a local write that produced no visible delta leaves
+                    // the flag set for the life of the subscription): under `None` it is
+                    // re-settled to an empty delta every pass, under a budget it runs once
+                    // and stalls. Not progress-bearing either way — excluded here so a
+                    // quiescence loop can end under `None` too (differential, diff r1 S2).
+                    && !Self::local_unit_is_sticky_only(sub)
+            })
+    }
+
+    /// v18 item 6 (tests only): passes run by this manager.
+    #[cfg(any(test, feature = "test"))]
+    pub fn passes_for_test(&self) -> u64 {
+        self.passes
+    }
+
+    /// See `has_live_units_for_test`: a unit by the pending-local-updates flag alone.
+    #[cfg(any(test, feature = "test"))]
+    fn local_unit_is_sticky_only(subscription: &QuerySubscription) -> bool {
+        subscription.has_pending_local_updates
+            && subscription.settled_once
+            && !subscription.needs_recompile
+            && !subscription.needs_visibility_recompute
+            && !subscription.graph.has_dirty_nodes()
+    }
+
+    /// v18 item 6 (tests only): server settles past the clean short-circuit on this manager.
+    #[cfg(any(test, feature = "test"))]
+    pub fn server_settles_for_test(&self) -> u64 {
+        self.server_settles
+    }
+
+    /// v18 item 6 (tests only): charged units the pool dispatched on this manager.
+    #[cfg(any(test, feature = "test"))]
+    pub fn pool_units_run_for_test(&self) -> u64 {
+        self.pool_units_run
+    }
+
+    /// v18 item 6 (tests only): whether an authorization schema is set (G6-7(d)'s fixture
+    /// asserts it is NOT after `require_authorization_schema`).
+    #[cfg(any(test, feature = "test"))]
+    pub fn has_authorization_schema_for_test(&self) -> bool {
+        self.authorization_schema.is_some()
+    }
+
+    /// v18 item 6: `JAZZ_SETTLE_BUDGET_MS` → the budget in microseconds. Unset, empty, `0`
+    /// or unparsable → `None` (unbounded, today's behaviour); otherwise `Some(ms · 1000)`,
+    /// saturating: a huge value becomes `Duration::from_micros(u64::MAX)` in
+    /// `SettleClock::new` (≈ 5.8 × 10⁵ years — unbounded, reached from the other end). It
+    /// must stay a saturation, never a wrap (a tiny budget by accident) or a clamp.
+    pub fn settle_budget_micros_from_env(raw: Option<&str>) -> Option<u64> {
+        let text = raw.map(str::trim).filter(|text| !text.is_empty())?;
+        match text.parse::<u64>() {
+            Ok(0) => None,
+            Ok(millis) => Some(millis.saturating_mul(1000)),
+            Err(_) => {
+                tracing::warn!(
+                    value = text,
+                    "JAZZ_SETTLE_BUDGET_MS is not a number; unbounded"
+                );
+                None
+            }
+        }
+    }
+
+    /// v18 item 6: establish the tick's settle clock if none is running. Returns `true`
+    /// when this call created it (the caller then ends it); nested ticks inherit.
+    pub fn begin_tick(&mut self) -> bool {
+        if self.tick_clock.is_some() {
+            return false;
+        }
+        self.tick_clock = Some(SettleClock::new(self.settle_budget_micros));
+        true
+    }
+
+    /// v18 item 6: end the clock begun by `begin_tick` (only the creator calls this).
+    pub fn end_tick(&mut self) {
+        self.tick_clock = None;
+    }
+
+    /// v18 item 6: peek — did the last pass leave non-stalled work behind for budget?
+    pub fn settle_work_remains(&self) -> bool {
+        self.settle_work_remains
+    }
+
+    /// Whether the current tick's clock would let another charged unit run: `true` with no
+    /// clock or no budget, `false` once the budget is spent (the first unit ran and the
+    /// deadline passed). The continuation asks before spending a pass on nothing.
+    pub fn settle_clock_has_room(&self) -> bool {
+        self.tick_clock
+            .as_ref()
+            .is_none_or(SettleClock::may_run_unit)
+    }
+
+    /// v18 item 6: take the flag (the batched tick's continuation).
+    pub fn take_settle_work_remains(&mut self) -> bool {
+        std::mem::take(&mut self.settle_work_remains)
+    }
+
+    /// v18 item 6: bound the work a settle pass does under the engine lock. `Some(0)` runs
+    /// exactly one unit per pass, which is what the gates use to observe the fair order.
+    pub fn set_settle_budget_micros(&mut self, micros: Option<u64>) {
+        self.settle_budget_micros = micros;
+    }
+
     /// Create a new QueryManager with empty schema context.
     ///
     /// Call `set_current_schema()` to initialize the current schema before queries.
@@ -780,6 +991,19 @@ impl QueryManager {
             scope_exempt_local_rows: HashMap::new(),
             confirmed_local_rows_awaiting_scope: HashMap::new(),
             settle_pass: 0,
+            settle_budget_micros: None,
+            tick_clock: None,
+            settle_work_remains: false,
+            stalled: HashSet::new(),
+            rotation_cursor: None,
+            had_live_pending_servers: false,
+            had_servers: false,
+            #[cfg(any(test, feature = "test"))]
+            passes: 0,
+            #[cfg(any(test, feature = "test"))]
+            server_settles: 0,
+            #[cfg(any(test, feature = "test"))]
+            pool_units_run: 0,
             authoritative_snapshot_pass: HashMap::new(),
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
@@ -840,6 +1064,8 @@ impl QueryManager {
         );
         self.pending_catalogue_schema_hashes.clear();
         self.mark_schema_catalogue_dirty(self.schema_context.current_hash);
+        // v18 item 6: a schema change with a policy mode un-stalls everything (r4 #5).
+        self.stalled.clear();
     }
 
     /// How many row-authorization verdicts were served from the cross-tick cache.
@@ -862,6 +1088,10 @@ impl QueryManager {
         self.authorization_context_cache.clear();
         self.row_policy_mode = RowPolicyMode::Enforcing;
         self.authorization_schema_required = true;
+        // v18 item 6: the authorization schema arriving is the un-stalling event for class
+        // (i) — and the recompile marking above IS the hook: the recompile step of the next
+        // pass un-stalls every key it recompiles (falsified: an explicit clear here changed
+        // no gate, the differential's authorization rounds converge through the recompile).
         self.mark_subscriptions_for_recompile();
     }
 
@@ -1075,6 +1305,20 @@ impl QueryManager {
         let current_schema = self.schema.clone();
         let current_schema_context = self.schema_context.clone();
         let authorization_schema = self.authorization_schema.clone();
+        // v18 item 6: a recompile marks its key un-stalled (design v5 § B1). Under `None`
+        // the set is always empty (nothing outside the pool inserts) — skip the walks (r1 S7).
+        if !self.stalled.is_empty() {
+            for (sub_id, sub) in &self.subscriptions {
+                if sub.needs_recompile {
+                    self.stalled.remove(&UnitKey::Local(*sub_id));
+                }
+            }
+            for (key, sub) in &self.server_subscriptions {
+                if sub.needs_recompile {
+                    self.stalled.remove(&UnitKey::Server(key.0, key.1));
+                }
+            }
+        }
 
         // Recompile local subscriptions
         for (sub_id, sub) in &mut self.subscriptions {
@@ -1141,6 +1385,7 @@ impl QueryManager {
         }
 
         for (sub_id, reason) in failed_local {
+            self.stalled.remove(&UnitKey::Local(sub_id));
             let propagation = self
                 .subscriptions
                 .remove(&sub_id)
@@ -1247,6 +1492,7 @@ impl QueryManager {
         }
 
         for (client_id, query_id, code, reason, propagation) in failed_server {
+            self.stalled.remove(&UnitKey::Server(client_id, query_id));
             if self
                 .server_subscriptions
                 .remove(&(client_id, query_id))
@@ -1261,6 +1507,7 @@ impl QueryManager {
             }
             self.sync_manager
                 .drop_client_query_subscription(client_id, query_id);
+            self.sync_manager.forget_client_query(client_id, query_id);
             if propagation == QueryPropagation::Full {
                 self.sync_manager
                     .send_query_unsubscription_to_servers(query_id);
@@ -1435,6 +1682,8 @@ impl QueryManager {
             self.record_authoritative_snapshot(query_id, tier);
         }
         let sub_id = QuerySubscriptionId(query_id.0);
+        // v18 item 6: a settle from above un-stalls the frontier-waiting local unit.
+        self.stalled.remove(&UnitKey::Local(sub_id));
         if let Some(sub) = self.subscriptions.get_mut(&sub_id) {
             let was_unsatisfied = !Self::subscription_query_frontier_satisfied(sub);
             let before = sub.query_frontier_settled_tier;
@@ -1614,6 +1863,9 @@ impl QueryManager {
             .retain(|&(cid, _), _| cid != client_id);
         self.active_policy_checks
             .retain(|_, state| state.pending_check.client_id != client_id);
+        // v18 item 6: purge the client's stalled keys with its subscriptions.
+        self.stalled
+            .retain(|key| !matches!(key, UnitKey::Server(owner, _) if *owner == client_id));
         true
     }
 
@@ -1640,6 +1892,58 @@ impl QueryManager {
         // ran longer than `JAZZ_SETTLE_LOG_MS`.
         let _settle_cost = super::settle_cost::SettlePass::begin();
         self.settle_pass = self.settle_pass.wrapping_add(1);
+        // v18 item 6: a standalone `process` (no tick around it) begins its own clock. The
+        // clock is released even if the pass panics (diff r2 S7): a clock left set would
+        // make every later `begin_tick` look nested, and no unit would run under a budget
+        // again on a host that survives a caught panic.
+        // Only the owner catches (diff r4 S1): in production every `process` runs inside
+        // `immediate_tick_inner`, so this is the always-nested path and the landing pad
+        // would be pure cost on the very pass this item budgets; a nested pass has no clock
+        // to release and its panic reaches the owner's catch above it.
+        let owns_clock = self.begin_tick();
+        let outcome = if owns_clock {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.process_pass(storage)))
+        } else {
+            self.process_pass(storage);
+            Ok(())
+        };
+        if owns_clock {
+            self.end_tick();
+        }
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// The body of one settle pass; `process` wraps it with the accounting guard and the
+    /// clock ownership.
+    fn process_pass<H: Storage>(&mut self, storage: &mut H) {
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.passes += 1;
+        }
+        // v18 item 6: the un-stalling events polled once per pass (design v5 § B1; r4 #3, #4):
+        // a client's role actually changed → its server units; the last live pending server
+        // arrived or timed out → every local unit. The flag is recomputed by every pass.
+        for client_id in self.sync_manager.take_role_changes() {
+            self.stalled
+                .retain(|key| !matches!(key, UnitKey::Server(owner, _) if *owner == client_id));
+        }
+        let live_pending_servers = self.sync_manager.has_live_pending_servers();
+        if self.had_live_pending_servers && !live_pending_servers {
+            self.stalled.retain(|key| !matches!(key, UnitKey::Local(_)));
+        }
+        self.had_live_pending_servers = live_pending_servers;
+        let servers = self.sync_manager.has_servers_or_pending_servers();
+        if self.had_servers && !servers {
+            self.stalled.retain(|key| !matches!(key, UnitKey::Local(_)));
+        }
+        self.had_servers = servers;
+        self.settle_work_remains = false;
+        let bounded = self
+            .tick_clock
+            .as_ref()
+            .is_some_and(SettleClock::is_bounded);
 
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
@@ -1651,6 +1955,9 @@ impl QueryManager {
         for query_id in remote_scope_dirty_query_ids {
             if let Some(sub) = self.subscriptions.get_mut(&QuerySubscriptionId(query_id.0)) {
                 sub.needs_visibility_recompute = true;
+                // New work for the unit (r1 S3): a stalled key must be able to run it.
+                self.stalled
+                    .remove(&UnitKey::Local(QuerySubscriptionId(query_id.0)));
             }
         }
         self.pending_catalogue_updates.extend(
@@ -1684,8 +1991,12 @@ impl QueryManager {
         self.process_pending_query_unsubscriptions();
 
         // 3b. Process pending query subscriptions from downstream clients
-        // (after indices are updated, so initial settle finds existing data)
-        self.process_pending_query_subscriptions(storage);
+        // (after indices are updated, so initial settle finds existing data).
+        // v18 item 6: under a bounded budget the registrations join the one unit pool
+        // dispatched at step 8 (design v4 SF1); under `None` this pass is today's.
+        if !bounded {
+            self.process_pending_query_subscriptions(storage);
+        }
 
         // 4. Pick up new permission check intents from SyncManager
         self.pick_up_pending_permission_checks(storage);
@@ -1744,6 +2055,11 @@ impl QueryManager {
 
         // 7. Settle all subscriptions - row_loader reads from subscription's branches
         // Extract references to avoid borrowing self in the closure
+        // v18 item 6: under a bounded budget the local units are part of the pool (step 8).
+        if bounded {
+            self.dispatch_unit_pool(storage);
+            return;
+        }
         let dirty_count = self
             .subscriptions
             .values()
@@ -1760,307 +2076,14 @@ impl QueryManager {
         let subscription_ids: Vec<_> = self.subscriptions.keys().copied().collect();
 
         for sub_id in subscription_ids {
-            let should_process_subscription =
-                self.subscriptions.get(&sub_id).is_some_and(|subscription| {
-                    subscription.needs_recompile
-                        || !subscription.settled_once
-                        || subscription.needs_visibility_recompute
-                        || subscription.has_pending_local_updates
-                        || subscription.graph.has_dirty_nodes()
-                });
+            let should_process_subscription = self
+                .subscriptions
+                .get(&sub_id)
+                .is_some_and(Self::local_subscription_is_unit);
             if !should_process_subscription {
                 continue;
             }
-
-            let Some(mut subscription) = self.subscriptions.remove(&sub_id) else {
-                continue;
-            };
-
-            let _sub_span = tracing::trace_span!("settle_subscription", sub_id = sub_id.0, table = %subscription.graph.table).entered();
-            let branches = subscription.branches.clone();
-            let table = subscription.graph.table.as_str().to_string();
-            let mut schema_warnings = SchemaWarningAccumulator::default();
-            let include_deleted = subscription.query.include_deleted;
-            let local_durability_satisfies_subscription = subscription
-                .durability_tier
-                .is_some_and(|tier| self.sync_manager.has_local_durability_at_least(tier));
-            let remote_scope_satisfies_subscription =
-                subscription.durability_tier.is_none_or(|tier| {
-                    self.sync_manager
-                        .has_remote_query_scope_snapshot_at_least(QueryId(sub_id.0), tier)
-                });
-
-            // Settle-cost accounting: this subscription is past every
-            // short-circuit above, so it is about to do real settle work — the
-            // clock read sits next to a graph settle, never next to a skip.
-            let settle_started = web_time::Instant::now();
-            let delta = {
-                let schema_context = &self.schema_context;
-                let branch_schema_map = &self.branch_schema_map;
-                let row_bytes_dedup = &self.row_bytes_dedup;
-                let row_loader =
-                    |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
-                        let lacks_authoritative_remote_scope = subscription.sync_backed
-                            && subscription.local_updates == LocalUpdates::Immediate
-                            && !remote_scope_satisfies_subscription;
-                        let durability_tier = if lacks_authoritative_remote_scope
-                            || (subscription.local_updates == LocalUpdates::Immediate
-                                && subscription.pending_local_row_ids.contains(&id))
-                        {
-                            None
-                        } else {
-                            subscription.durability_tier
-                        };
-                        let local_pending_version = if !subscription.local_overlay_rows.is_empty() {
-                            subscription.local_overlay_rows.get(&id).copied()
-                        } else {
-                            (subscription.local_updates == LocalUpdates::Immediate)
-                                .then(|| self.pending_local_row_batches.get(&id).copied())
-                                .flatten()
-                        };
-                        Self::load_visible_row_for_query(
-                            storage_ref,
-                            id,
-                            table_hint.as_ref().map(TableName::as_str),
-                            &branches,
-                            durability_tier,
-                            local_pending_version,
-                            !subscription.local_overlay_rows.is_empty(),
-                            !subscription.local_overlay_rows.is_empty()
-                                || (subscription.sync_backed
-                                    && subscription.durability_tier.is_some()
-                                    && subscription.local_updates == LocalUpdates::Immediate),
-                            include_deleted,
-                            schema_context,
-                            branch_schema_map,
-                            &table,
-                            sub_id,
-                            &mut schema_warnings,
-                            row_bytes_dedup,
-                        )
-                    };
-
-                // This map is QueryManager-global and table-blind: every entry in it is
-                // walked, and its full row bytes read, by every full IndexScanNode rescan
-                // in every qualifying subscription. Its length is therefore a multiplier
-                // on a settle's storage reads, and it is the number that says whether a
-                // settle reading hundreds of megabytes does so because the overlay never
-                // drained.
-                crate::query_manager::settle_cost::set_gauge(
-                    &crate::query_manager::settle_cost::PENDING_LOCAL_ROW_BATCHES,
-                    self.pending_local_row_batches.len() as u64,
-                );
-                let source_overlay_rows = if !subscription.local_overlay_rows.is_empty() {
-                    Some(&subscription.local_overlay_rows)
-                } else if subscription.local_updates == LocalUpdates::Immediate
-                    && subscription.sync_backed
-                    && subscription.durability_tier.is_some()
-                    && !self.pending_local_row_batches.is_empty()
-                {
-                    Some(&self.pending_local_row_batches)
-                } else {
-                    None
-                };
-                subscription.graph.settle_with_source_overlay(
-                    storage_ref,
-                    source_overlay_rows,
-                    row_loader,
-                )
-            };
-            super::settle_cost::bump(&super::settle_cost::SUBSCRIPTIONS_SETTLED);
-            super::settle_cost::add(
-                &super::settle_cost::ROWS_EMITTED,
-                (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
-            );
-            // Local subscriptions have no downstream client; the query id alone
-            // identifies them.
-            super::settle_cost::note_subscription_settle(None, sub_id.0, settle_started.elapsed());
-            subscription.needs_visibility_recompute = false;
-            let new_schema_warnings = Self::finalize_schema_warnings(
-                &mut subscription.reported_schema_warnings,
-                schema_warnings.warnings_for_query(QueryId(sub_id.0)),
-            );
-            for warning in &new_schema_warnings {
-                crate::sync_manager::log_schema_warning(warning, None, Some(sub_id.0));
-            }
-            if !delta.added.is_empty() || !delta.removed.is_empty() {
-                tracing::debug!(
-                    sub_id = sub_id.0,
-                    added = delta.added.len(),
-                    removed = delta.removed.len(),
-                    "settle delta"
-                );
-            }
-
-            if !subscription.settled_once
-                && !Self::subscription_query_frontier_satisfied(&subscription)
-                && self.sync_manager.has_servers_or_pending_servers()
-            {
-                // Graph state updated by settle(), but don't deliver until the
-                // initial upstream frontier has been replayed — or until every
-                // still-pending server has exceeded PENDING_SERVER_TIMEOUT,
-                // which means nothing upstream is going to replay.
-                tracing::trace!(
-                    sub_id = sub_id.0,
-                    table = %table,
-                    required_tier = ?subscription.durability_tier,
-                    settled_tier = ?subscription.query_frontier_settled_tier,
-                    dirty = subscription.graph.has_dirty_nodes(),
-                    needs_recompile = subscription.needs_recompile,
-                    needs_visibility_recompute = subscription.needs_visibility_recompute,
-                    pending_local_updates = subscription.has_pending_local_updates,
-                    has_servers_or_pending_servers = self.sync_manager.has_servers_or_pending_servers(),
-                    "jazz trace subscription waiting for initial frontier"
-                );
-                self.subscriptions.insert(sub_id, subscription);
-                continue;
-            }
-
-            let mut visible_tuples = if subscription.uses_explicit_authorization_filtering {
-                let auth_schema_context = self.schema_context.clone();
-                let auth_branch_schema_map = self.branch_schema_map.clone();
-                let mut settlement_eval_cache = SettlementEvalCache::default();
-                Cow::Owned(self.authorized_tuples_from_graph_with_cache(
-                    storage_ref,
-                    &mut settlement_eval_cache,
-                    &subscription.graph,
-                    &auth_schema_context,
-                    &auth_branch_schema_map,
-                    subscription.session.as_ref(),
-                ))
-            } else {
-                Cow::Borrowed(subscription.graph.current_output_tuples_ref())
-            };
-
-            if subscription.sync_backed
-                && Self::subscription_query_frontier_satisfied(&subscription)
-                && (!local_durability_satisfies_subscription || remote_scope_satisfies_subscription)
-                && self
-                    .sync_manager
-                    .has_remote_query_scope_snapshot(QueryId(sub_id.0))
-                && (subscription.propagation == QueryPropagation::Full
-                    || !self.sync_manager.has_durability_identity())
-            {
-                visible_tuples = Cow::Owned(
-                    self.filter_synced_query_scope_tuples(
-                        QueryId(sub_id.0),
-                        subscription.durability_tier,
-                        LocalWriteAuthority {
-                            overlay: (!subscription.local_overlay_rows.is_empty())
-                                .then_some(&subscription.local_overlay_rows),
-                            process_wide: subscription.local_updates == LocalUpdates::Immediate,
-                        },
-                        visible_tuples.into_owned(),
-                    ),
-                );
-            }
-
-            visible_tuples = self.filter_transaction_visible_tuples(
-                storage_ref,
-                QueryId(sub_id.0),
-                visible_tuples,
-            );
-
-            if !subscription.settled_once {
-                let visible_rows =
-                    Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
-                let row_count = visible_rows.len();
-                let ordered_ids_after: Vec<_> = visible_rows.iter().map(|row| row.id).collect();
-                let ordered_delta = OrderedRowDelta {
-                    added: visible_rows
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(index, row)| OrderedAdded {
-                            id: row.id,
-                            index,
-                            row,
-                        })
-                        .collect(),
-                    removed: Vec::new(),
-                    updated: Vec::new(),
-                    pending: false,
-                };
-                let visible_rows_by_id: HashMap<_, _> = visible_rows
-                    .iter()
-                    .cloned()
-                    .map(|row| (row.id, row))
-                    .collect();
-                let visible_delta = RowDelta {
-                    added: visible_rows,
-                    removed: Vec::new(),
-                    moved: Vec::new(),
-                    updated: Vec::new(),
-                };
-                tracing::trace!(
-                    sub_id = sub_id.0,
-                    table = %table,
-                    rows = row_count,
-                    added = visible_delta.added.len(),
-                    settled_tier = ?subscription.query_frontier_settled_tier,
-                    required_tier = ?subscription.durability_tier,
-                    "jazz trace subscription first delivery"
-                );
-                subscription.settled_once = true;
-                subscription.current_ordered_ids = ordered_ids_after;
-                subscription.current_visible_rows = visible_rows_by_id;
-                self.update_outbox.push(QueryUpdate {
-                    subscription_id: sub_id,
-                    delta: visible_delta,
-                    ordered_delta,
-                    descriptor: subscription.graph.combined_descriptor.clone(),
-                });
-                subscription.has_pending_local_updates = false;
-                subscription
-                    .pending_local_row_ids
-                    .retain(|id| self.pending_local_row_batches.contains_key(id));
-            } else {
-                let visible_rows =
-                    Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
-                let visible_rows_by_id: HashMap<_, _> = visible_rows
-                    .iter()
-                    .cloned()
-                    .map(|row| (row.id, row))
-                    .collect();
-                let visible_delta = Self::row_delta_from_rows(
-                    &subscription.current_visible_rows,
-                    &subscription.current_ordered_ids,
-                    &visible_rows,
-                );
-                if visible_delta.is_empty() {
-                    self.subscriptions.insert(sub_id, subscription);
-                    continue;
-                }
-                let ordered_ids_after: Vec<ObjectId> =
-                    visible_rows.iter().map(|row| row.id).collect();
-                let ordered = build_ordered_delta_with_post_ids(
-                    &subscription.current_ordered_ids,
-                    &ordered_ids_after,
-                    &visible_delta,
-                    false,
-                );
-                subscription.current_ordered_ids = ordered.ordered_ids_after;
-                subscription.current_visible_rows = visible_rows_by_id;
-                tracing::debug!(
-                    sub_id = sub_id.0,
-                    added = visible_delta.added.len(),
-                    removed = visible_delta.removed.len(),
-                    updated = visible_delta.updated.len(),
-                    "incremental delivery"
-                );
-                self.update_outbox.push(QueryUpdate {
-                    subscription_id: sub_id,
-                    delta: visible_delta,
-                    ordered_delta: ordered.delta,
-                    descriptor: subscription.graph.combined_descriptor.clone(),
-                });
-                subscription.has_pending_local_updates = false;
-                subscription
-                    .pending_local_row_ids
-                    .retain(|id| self.pending_local_row_batches.contains_key(id));
-            }
-
-            self.subscriptions.insert(sub_id, subscription);
+            self.settle_one_local_subscription(storage_ref, sub_id);
         }
 
         // Note: With sync storage, object loading is immediate. No need to request
@@ -2068,6 +2091,304 @@ impl QueryManager {
 
         // 8. Settle server-side subscriptions and update scopes
         self.settle_server_subscriptions(storage_ref);
+    }
+
+    /// Whether a local subscription is a settle unit (design v4 § B1): the loop predicate.
+    pub(super) fn local_subscription_is_unit(subscription: &QuerySubscription) -> bool {
+        subscription.needs_recompile
+            || !subscription.settled_once
+            || subscription.needs_visibility_recompute
+            || subscription.has_pending_local_updates
+            || subscription.graph.has_dirty_nodes()
+    }
+
+    /// One (L) unit. Extracted from the local settle loop unchanged (v18 item 6).
+    pub(super) fn settle_one_local_subscription(
+        &mut self,
+        storage_ref: &dyn Storage,
+        sub_id: QuerySubscriptionId,
+    ) {
+        let Some(mut subscription) = self.subscriptions.remove(&sub_id) else {
+            return;
+        };
+
+        let _sub_span = tracing::trace_span!("settle_subscription", sub_id = sub_id.0, table = %subscription.graph.table).entered();
+        let branches = subscription.branches.clone();
+        let table = subscription.graph.table.as_str().to_string();
+        let mut schema_warnings = SchemaWarningAccumulator::default();
+        let include_deleted = subscription.query.include_deleted;
+        let local_durability_satisfies_subscription = subscription
+            .durability_tier
+            .is_some_and(|tier| self.sync_manager.has_local_durability_at_least(tier));
+        let remote_scope_satisfies_subscription = subscription.durability_tier.is_none_or(|tier| {
+            self.sync_manager
+                .has_remote_query_scope_snapshot_at_least(QueryId(sub_id.0), tier)
+        });
+
+        // Settle-cost accounting: this subscription is past every
+        // short-circuit above, so it is about to do real settle work — the
+        // clock read sits next to a graph settle, never next to a skip.
+        let settle_started = web_time::Instant::now();
+        let delta = {
+            let schema_context = &self.schema_context;
+            let branch_schema_map = &self.branch_schema_map;
+            let row_bytes_dedup = &self.row_bytes_dedup;
+            let row_loader = |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
+                let lacks_authoritative_remote_scope = subscription.sync_backed
+                    && subscription.local_updates == LocalUpdates::Immediate
+                    && !remote_scope_satisfies_subscription;
+                let durability_tier = if lacks_authoritative_remote_scope
+                    || (subscription.local_updates == LocalUpdates::Immediate
+                        && subscription.pending_local_row_ids.contains(&id))
+                {
+                    None
+                } else {
+                    subscription.durability_tier
+                };
+                let local_pending_version = if !subscription.local_overlay_rows.is_empty() {
+                    subscription.local_overlay_rows.get(&id).copied()
+                } else {
+                    (subscription.local_updates == LocalUpdates::Immediate)
+                        .then(|| self.pending_local_row_batches.get(&id).copied())
+                        .flatten()
+                };
+                Self::load_visible_row_for_query(
+                    storage_ref,
+                    id,
+                    table_hint.as_ref().map(TableName::as_str),
+                    &branches,
+                    durability_tier,
+                    local_pending_version,
+                    !subscription.local_overlay_rows.is_empty(),
+                    !subscription.local_overlay_rows.is_empty()
+                        || (subscription.sync_backed
+                            && subscription.durability_tier.is_some()
+                            && subscription.local_updates == LocalUpdates::Immediate),
+                    include_deleted,
+                    schema_context,
+                    branch_schema_map,
+                    &table,
+                    sub_id,
+                    &mut schema_warnings,
+                    row_bytes_dedup,
+                )
+            };
+
+            // This map is QueryManager-global and table-blind: every entry in it is
+            // walked, and its full row bytes read, by every full IndexScanNode rescan
+            // in every qualifying subscription. Its length is therefore a multiplier
+            // on a settle's storage reads, and it is the number that says whether a
+            // settle reading hundreds of megabytes does so because the overlay never
+            // drained.
+            crate::query_manager::settle_cost::set_gauge(
+                &crate::query_manager::settle_cost::PENDING_LOCAL_ROW_BATCHES,
+                self.pending_local_row_batches.len() as u64,
+            );
+            let source_overlay_rows = if !subscription.local_overlay_rows.is_empty() {
+                Some(&subscription.local_overlay_rows)
+            } else if subscription.local_updates == LocalUpdates::Immediate
+                && subscription.sync_backed
+                && subscription.durability_tier.is_some()
+                && !self.pending_local_row_batches.is_empty()
+            {
+                Some(&self.pending_local_row_batches)
+            } else {
+                None
+            };
+            subscription.graph.settle_with_source_overlay(
+                storage_ref,
+                source_overlay_rows,
+                row_loader,
+            )
+        };
+        super::settle_cost::bump(&super::settle_cost::SUBSCRIPTIONS_SETTLED);
+        super::settle_cost::add(
+            &super::settle_cost::ROWS_EMITTED,
+            (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+        );
+        // Local subscriptions have no downstream client; the query id alone
+        // identifies them.
+        super::settle_cost::note_subscription_settle(None, sub_id.0, settle_started.elapsed());
+        subscription.needs_visibility_recompute = false;
+        let new_schema_warnings = Self::finalize_schema_warnings(
+            &mut subscription.reported_schema_warnings,
+            schema_warnings.warnings_for_query(QueryId(sub_id.0)),
+        );
+        for warning in &new_schema_warnings {
+            crate::sync_manager::log_schema_warning(warning, None, Some(sub_id.0));
+        }
+        if !delta.added.is_empty() || !delta.removed.is_empty() {
+            tracing::debug!(
+                sub_id = sub_id.0,
+                added = delta.added.len(),
+                removed = delta.removed.len(),
+                "settle delta"
+            );
+        }
+
+        if !subscription.settled_once
+            && !Self::subscription_query_frontier_satisfied(&subscription)
+            && self.sync_manager.has_servers_or_pending_servers()
+        {
+            // Graph state updated by settle(), but don't deliver until the
+            // initial upstream frontier has been replayed — or until every
+            // still-pending server has exceeded PENDING_SERVER_TIMEOUT,
+            // which means nothing upstream is going to replay.
+            tracing::trace!(
+                sub_id = sub_id.0,
+                table = %table,
+                required_tier = ?subscription.durability_tier,
+                settled_tier = ?subscription.query_frontier_settled_tier,
+                dirty = subscription.graph.has_dirty_nodes(),
+                needs_recompile = subscription.needs_recompile,
+                needs_visibility_recompute = subscription.needs_visibility_recompute,
+                pending_local_updates = subscription.has_pending_local_updates,
+                has_servers_or_pending_servers = self.sync_manager.has_servers_or_pending_servers(),
+                "jazz trace subscription waiting for initial frontier"
+            );
+            self.subscriptions.insert(sub_id, subscription);
+            return;
+        }
+
+        let mut visible_tuples = if subscription.uses_explicit_authorization_filtering {
+            let auth_schema_context = self.schema_context.clone();
+            let auth_branch_schema_map = self.branch_schema_map.clone();
+            let mut settlement_eval_cache = SettlementEvalCache::default();
+            Cow::Owned(self.authorized_tuples_from_graph_with_cache(
+                storage_ref,
+                &mut settlement_eval_cache,
+                &subscription.graph,
+                &auth_schema_context,
+                &auth_branch_schema_map,
+                subscription.session.as_ref(),
+            ))
+        } else {
+            Cow::Borrowed(subscription.graph.current_output_tuples_ref())
+        };
+
+        if subscription.sync_backed
+            && Self::subscription_query_frontier_satisfied(&subscription)
+            && (!local_durability_satisfies_subscription || remote_scope_satisfies_subscription)
+            && self
+                .sync_manager
+                .has_remote_query_scope_snapshot(QueryId(sub_id.0))
+            && (subscription.propagation == QueryPropagation::Full
+                || !self.sync_manager.has_durability_identity())
+        {
+            visible_tuples = Cow::Owned(
+                self.filter_synced_query_scope_tuples(
+                    QueryId(sub_id.0),
+                    subscription.durability_tier,
+                    LocalWriteAuthority {
+                        overlay: (!subscription.local_overlay_rows.is_empty())
+                            .then_some(&subscription.local_overlay_rows),
+                        process_wide: subscription.local_updates == LocalUpdates::Immediate,
+                    },
+                    visible_tuples.into_owned(),
+                ),
+            );
+        }
+
+        visible_tuples =
+            self.filter_transaction_visible_tuples(storage_ref, QueryId(sub_id.0), visible_tuples);
+
+        if !subscription.settled_once {
+            let visible_rows = Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
+            let row_count = visible_rows.len();
+            let ordered_ids_after: Vec<_> = visible_rows.iter().map(|row| row.id).collect();
+            let ordered_delta = OrderedRowDelta {
+                added: visible_rows
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, row)| OrderedAdded {
+                        id: row.id,
+                        index,
+                        row,
+                    })
+                    .collect(),
+                removed: Vec::new(),
+                updated: Vec::new(),
+                pending: false,
+            };
+            let visible_rows_by_id: HashMap<_, _> = visible_rows
+                .iter()
+                .cloned()
+                .map(|row| (row.id, row))
+                .collect();
+            let visible_delta = RowDelta {
+                added: visible_rows,
+                removed: Vec::new(),
+                moved: Vec::new(),
+                updated: Vec::new(),
+            };
+            tracing::trace!(
+                sub_id = sub_id.0,
+                table = %table,
+                rows = row_count,
+                added = visible_delta.added.len(),
+                settled_tier = ?subscription.query_frontier_settled_tier,
+                required_tier = ?subscription.durability_tier,
+                "jazz trace subscription first delivery"
+            );
+            subscription.settled_once = true;
+            subscription.current_ordered_ids = ordered_ids_after;
+            subscription.current_visible_rows = visible_rows_by_id;
+            self.update_outbox.push(QueryUpdate {
+                subscription_id: sub_id,
+                delta: visible_delta,
+                ordered_delta,
+                descriptor: subscription.graph.combined_descriptor.clone(),
+            });
+            subscription.has_pending_local_updates = false;
+            subscription
+                .pending_local_row_ids
+                .retain(|id| self.pending_local_row_batches.contains_key(id));
+        } else {
+            let visible_rows = Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
+            let visible_rows_by_id: HashMap<_, _> = visible_rows
+                .iter()
+                .cloned()
+                .map(|row| (row.id, row))
+                .collect();
+            let visible_delta = Self::row_delta_from_rows(
+                &subscription.current_visible_rows,
+                &subscription.current_ordered_ids,
+                &visible_rows,
+            );
+            if visible_delta.is_empty() {
+                self.subscriptions.insert(sub_id, subscription);
+                return;
+            }
+            let ordered_ids_after: Vec<ObjectId> = visible_rows.iter().map(|row| row.id).collect();
+            let ordered = build_ordered_delta_with_post_ids(
+                &subscription.current_ordered_ids,
+                &ordered_ids_after,
+                &visible_delta,
+                false,
+            );
+            subscription.current_ordered_ids = ordered.ordered_ids_after;
+            subscription.current_visible_rows = visible_rows_by_id;
+            tracing::debug!(
+                sub_id = sub_id.0,
+                added = visible_delta.added.len(),
+                removed = visible_delta.removed.len(),
+                updated = visible_delta.updated.len(),
+                "incremental delivery"
+            );
+            self.update_outbox.push(QueryUpdate {
+                subscription_id: sub_id,
+                delta: visible_delta,
+                ordered_delta: ordered.delta,
+                descriptor: subscription.graph.combined_descriptor.clone(),
+            });
+            subscription.has_pending_local_updates = false;
+            subscription
+                .pending_local_row_ids
+                .retain(|id| self.pending_local_row_batches.contains_key(id));
+        }
+
+        self.subscriptions.insert(sub_id, subscription);
     }
 
     pub(super) fn handle_row_update_with_origin(
@@ -2632,11 +2953,13 @@ impl QueryManager {
     /// Mark subscriptions dirty for a table based on update origin.
     fn mark_subscriptions_dirty_with_origin(&mut self, table: &str, local_update: bool) {
         // Mark local subscriptions dirty
-        for subscription in self.subscriptions.values_mut() {
+        for (sub_id, subscription) in self.subscriptions.iter_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_dirty_for_table(table);
                 if local_update {
                     subscription.has_pending_local_updates = true;
+                    // v18 item 6: a local write is an un-stalling event for its unit (r4 #6).
+                    self.stalled.remove(&UnitKey::Local(*sub_id));
                 }
             }
         }
@@ -2656,11 +2979,12 @@ impl QueryManager {
         rows: &ahash::AHashSet<ObjectId>,
         local_update: bool,
     ) {
-        for subscription in self.subscriptions.values_mut() {
+        for (sub_id, subscription) in self.subscriptions.iter_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_changed_for_table(table, rows);
                 if local_update {
                     subscription.has_pending_local_updates = true;
+                    self.stalled.remove(&UnitKey::Local(*sub_id));
                 }
             }
         }

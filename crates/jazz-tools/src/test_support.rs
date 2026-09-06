@@ -47,6 +47,82 @@ pub fn persist_test_schema<H: Storage + ?Sized>(storage: &mut H, schema: &Schema
     schema_hash
 }
 
+/// v18 item 5: a store holding ONE visible row whose `__row_locator` names a schema
+/// generation the store has no raw tables for — the defect-20 split. The shape both the
+/// SQLite `split_locator_tests` and the RocksDB G-D1r need, so it lives here rather than
+/// twice. The positive control (the row reads back through the honest locator) runs INSIDE,
+/// before the poison: no caller can gate on a fixture that never reproduced the split.
+/// Returns the branch, the row, and the schema hash of the family that physically holds the
+/// bytes.
+pub fn poisoned_split_row<H: Storage>(storage: &mut H) -> (String, ObjectId, SchemaHash) {
+    use crate::query_manager::types::{
+        ColumnDescriptor, ColumnType, ComposedBranchName, RowDescriptor, TableName,
+    };
+
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("users"),
+        RowDescriptor::new(vec![ColumnDescriptor::new("name", ColumnType::Text)]).into(),
+    );
+    let schema_hash = persist_test_schema(storage, &schema);
+    let branch = ComposedBranchName::new("dev", schema_hash, "main").to_branch_name();
+
+    let row_id = ObjectId::new();
+    storage
+        .put_row_locator(
+            row_id,
+            Some(&crate::storage::RowLocator {
+                table: "users".to_string().into(),
+                origin_schema_hash: Some(schema_hash),
+            }),
+        )
+        .expect("locator persists");
+    let descriptor = schema
+        .get(&TableName::new("users"))
+        .expect("users descriptor")
+        .columns
+        .clone();
+    let data = crate::row_format::encode_row(
+        &descriptor,
+        &[crate::query_manager::types::Value::Text("split".into())],
+    )
+    .expect("row encodes");
+    let row = StoredRowBatch::new(
+        row_id,
+        branch.as_str(),
+        Vec::new(),
+        data,
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+        HashMap::new(),
+        crate::row_histories::RowState::VisibleDirect,
+        None,
+    );
+    apply_row_batch(storage, row_id, &BranchName::new(branch.as_str()), row, &[])
+        .expect("batch applies");
+
+    assert!(
+        storage
+            .load_visible_region_row_bytes("users", branch.as_str(), row_id)
+            .expect("read succeeds")
+            .is_some(),
+        "fixture: the row must be readable before poisoning"
+    );
+
+    // The poison: re-stamp the locator with a schema hash the store has no raw tables for
+    // (the locator names one generation, the bytes sit in another).
+    storage
+        .put_row_locator(
+            row_id,
+            Some(&crate::storage::RowLocator {
+                table: "users".to_string().into(),
+                origin_schema_hash: Some(SchemaHash::from_bytes([7u8; 32])),
+            }),
+        )
+        .expect("poisoned locator persists");
+
+    (branch.as_str().to_string(), row_id, schema_hash)
+}
+
 pub fn seeded_memory_storage(schema: &Schema) -> MemoryStorage {
     let mut storage = MemoryStorage::new();
     persist_test_schema(&mut storage, schema);

@@ -14,7 +14,9 @@ use crate::sync_manager::{
 };
 
 use super::authz_cache::{AuthzMarker, AuthzSessionKey};
+use super::graph_nodes::output::QuerySubscriptionId;
 use super::manager::{QueryManager, SchemaWarningAccumulator, ServerQuerySubscription};
+use super::manager::{RotationSlot, SettleClock, UnitKey};
 use super::policy::{ComplexClause, Operation, PolicyExpr};
 use super::policy_graph::{PolicyGraph, PolicyGraphBuildOptions};
 use super::session::Session;
@@ -127,6 +129,22 @@ struct UpdatePermissionRequest<'a> {
     branch_table_schema: &'a TableSchema,
     auth_schema: &'a Schema,
     auth_context: &'a crate::schema_manager::SchemaContext,
+}
+
+/// Outcome of one (R) unit, v18 item 6. `Deferred` is a schema-deferred registration
+/// (class iii): requeued without being charged. `FastPath` did no compile and no settle and is
+/// not a unit either. `Inserted` carries whether the first settle produced a scope: a
+/// subscription inserted with `settled_once == false` is stalled from birth (design v5 § B2).
+/// `Deferred` is boxed (diff r3 B1): the subscription is ~650 bytes against 25 for the next
+/// variant, and every outcome moves through the pool's `match`.
+pub(super) enum RegistrationOutcome {
+    Deferred(Box<crate::sync_manager::PendingQuerySubscription>),
+    FastPath,
+    Rejected,
+    Inserted {
+        key: (ClientId, crate::sync_manager::QueryId),
+        settled_once: bool,
+    },
 }
 
 impl QueryManager {
@@ -1221,6 +1239,383 @@ impl QueryManager {
         policy_tables
     }
 
+    /// One (R) unit: a downstream registration taken to its outcome. Extracted from the
+    /// registration loop unchanged (v18 item 6) so that the budgeted pool and the unbounded
+    /// loop run the same code; under `None` the loop below calls it in today's order.
+    fn process_one_pending_query_subscription<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        sub: crate::sync_manager::PendingQuerySubscription,
+        schema_warning_notifications: &mut Vec<(ClientId, crate::sync_manager::SchemaWarning)>,
+    ) -> RegistrationOutcome {
+        let key = (sub.client_id, sub.query_id);
+        let Some((schema_for_compile, subscription_context)) =
+            self.build_server_subscription_context(&sub.query)
+        else {
+            return RegistrationOutcome::Deferred(Box::new(sub));
+        };
+
+        // Defence in depth: if the subscription has no session (client omitted
+        // it), fall back to the connection-level session set during JWT auth
+        // on the WebSocket handshake. This ensures the PolicyFilterNode is
+        // always present — at worst it will fail closed (zero results) rather
+        // than fail open (bypass policies).
+        let session_for_policy = sub.session.clone().or_else(|| {
+            self.sync_manager
+                .get_client(sub.client_id)
+                .and_then(|c| c.session.clone())
+        });
+        let existing_subscription_state = self
+            .server_subscriptions
+            .get(&(sub.client_id, sub.query_id))
+            .map(|existing| {
+                (
+                    existing.query == sub.query
+                        && existing.session == session_for_policy
+                        && existing.required_tier == sub.required_tier
+                        && existing.propagation == sub.propagation
+                        && existing.policy_context_tables == sub.policy_context_tables,
+                    existing.sent_below_required_settled,
+                    existing.last_emitted_settled_tier,
+                    existing.last_scope.clone(),
+                    existing.settled_once,
+                )
+            });
+        let equivalent_existing_subscription = existing_subscription_state
+            .as_ref()
+            .is_some_and(|(equivalent, ..)| *equivalent);
+
+        // A peer that was away replays the same query id, so the subscription looks
+        // equivalent and already settled. Answering from the cached scope re-derives
+        // nothing, and re-derivation is the only place that sets `force_resend` — which
+        // is why a row it never confirmed is otherwise never offered again. Decline the
+        // fast path for that one pass.
+        let owed_rows = self
+            .sync_manager
+            .client_has_undelivered_payloads(sub.client_id);
+        tracing::info!(
+            target: "jazz::conn",
+            client_id = %sub.client_id,
+            query_id = sub.query_id.0,
+            equivalent = equivalent_existing_subscription,
+            owed_rows,
+            decision = if owed_rows {
+                "re-derive: peer is owed rows"
+            } else if equivalent_existing_subscription {
+                "fast path: nothing re-derived"
+            } else {
+                "re-derive: new or changed subscription"
+            },
+            "subscription registered"
+        );
+        if !owed_rows
+            && equivalent_existing_subscription
+            && existing_subscription_state
+                .as_ref()
+                .is_some_and(|(_, _, _, _, settled_once)| *settled_once)
+        {
+            let settled_tier = self
+                .sync_manager
+                .max_local_durability_tier()
+                .unwrap_or(DurabilityTier::Local);
+            let mut emission_scope = None;
+
+            if let Some(existing) = self
+                .server_subscriptions
+                .get_mut(&(sub.client_id, sub.query_id))
+                && Self::should_emit_query_settled_to_downstream(
+                    existing.required_tier,
+                    settled_tier,
+                    &mut existing.sent_below_required_settled,
+                    &mut existing.last_emitted_settled_tier,
+                    false,
+                )
+            {
+                emission_scope = Some(existing.last_scope.clone());
+            }
+
+            if let Some(scope) = emission_scope.as_ref() {
+                self.sync_manager.emit_query_settled(
+                    sub.client_id,
+                    sub.query_id,
+                    settled_tier,
+                    scope,
+                );
+            }
+
+            return RegistrationOutcome::FastPath;
+        }
+
+        // Build QueryGraph with client's session for policy filtering (schema-aware)
+        let query_for_compile = Self::query_for_server_compile(&sub.query, &subscription_context);
+        let compile_row_policy_mode = if self
+            .authorization_schema_for_context(
+                &subscription_context.env,
+                &subscription_context.user_branch,
+            )
+            .as_ref()
+            .map(|(auth_schema, _)| auth_schema.as_ref() != schema_for_compile.as_ref())
+            .unwrap_or(false)
+        {
+            crate::query_manager::types::RowPolicyMode::PermissiveLocal
+        } else {
+            self.row_policy_mode
+        };
+        let graph = Self::compile_graph(
+            &query_for_compile,
+            &schema_for_compile,
+            session_for_policy.clone(),
+            &subscription_context,
+            compile_row_policy_mode,
+        );
+
+        let Ok(mut graph) = graph else {
+            // Query compilation failed (e.g., missing table) - notify client with compiler context.
+            let compile_error = graph
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "unknown compile error".to_string());
+            let reason = format!(
+                "query compilation failed for query_id {}: {}",
+                sub.query_id.0, compile_error
+            );
+            // The client is told this id is dead, so whatever the id held ends here:
+            // a re-registration of a live query that fails to compile must not leave
+            // the old subscription settling, uncounted, for the life of the connection.
+            if let Some(replaced) = self
+                .server_subscriptions
+                .remove(&(sub.client_id, sub.query_id))
+            {
+                tracing::info!(
+                    client_id = %sub.client_id,
+                    query_id = sub.query_id.0,
+                    total = self.server_subscriptions.len(),
+                    "server subscription removed: its re-registration failed to compile"
+                );
+                // What this node forwarded upstream for the replaced query ends with it,
+                // as on the recompile and unsubscribe paths.
+                if replaced.propagation == crate::sync_manager::QueryPropagation::Full {
+                    self.sync_manager
+                        .send_query_unsubscription_to_servers(sub.query_id);
+                }
+            }
+            self.sync_manager
+                .drop_client_query_subscription(sub.client_id, sub.query_id);
+            self.sync_manager
+                .forget_client_query(sub.client_id, sub.query_id);
+            self.sync_manager.emit_query_subscription_rejected(
+                sub.client_id,
+                sub.query_id,
+                "query_compilation_failed",
+                reason,
+            );
+            self.stalled.remove(&UnitKey::Server(key.0, key.1));
+            return RegistrationOutcome::Rejected;
+        };
+
+        let branch_schema_map = Self::branch_schema_map_for_context(&subscription_context);
+
+        // Initial settle to populate the graph
+        let storage_ref: &dyn Storage = storage;
+
+        let branches =
+            Self::resolved_server_query_branches(&query_for_compile, &subscription_context);
+        let table = sub.query.table.as_str().to_string();
+        let mut schema_warnings = SchemaWarningAccumulator::default();
+        let include_deleted = sub.query.include_deleted;
+        // Settle-cost accounting: a subscription's FIRST settle happens
+        // here, not in `settle_server_subscriptions`. It is the most
+        // expensive settle a subscription ever has (cold graph, cold
+        // authz verdict cache), so leaving it unattributed would hide the
+        // subscription-storm shape entirely.
+        let settle_started = web_time::Instant::now();
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
+        );
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.server_settles += 1;
+        }
+        {
+            let row_bytes_dedup = &self.row_bytes_dedup;
+            let row_loader = |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
+                Self::load_visible_row_for_query(
+                    storage_ref,
+                    id,
+                    table_hint.as_ref().map(TableName::as_str),
+                    &branches,
+                    None,
+                    None,
+                    false,
+                    false,
+                    include_deleted,
+                    &subscription_context,
+                    &branch_schema_map,
+                    &table,
+                    super::graph_nodes::output::QuerySubscriptionId(sub.query_id.0),
+                    &mut schema_warnings,
+                    row_bytes_dedup,
+                )
+            };
+
+            let delta = graph.settle(storage_ref, row_loader);
+            crate::query_manager::settle_cost::add(
+                &crate::query_manager::settle_cost::ROWS_EMITTED,
+                (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+            );
+        }
+        let mut reported_schema_warnings = HashSet::new();
+        let new_schema_warnings = Self::finalize_schema_warnings(
+            &mut reported_schema_warnings,
+            schema_warnings.warnings_for_query(sub.query_id),
+        );
+        schema_warning_notifications.extend(
+            new_schema_warnings
+                .into_iter()
+                .map(|warning| (sub.client_id, warning)),
+        );
+
+        // Sync the rows needed for the client to reproduce the current result
+        // locally, including any ordered prefix required by pagination.
+        let policy_context_tables =
+            Self::merged_policy_context_tables(&graph, &sub.policy_context_tables);
+        let scope = if self
+            .client_bypasses_authorization_filtering(sub.client_id, session_for_policy.as_ref())
+        {
+            let result_scope = graph.sync_scope_object_ids();
+            Some(if !policy_context_tables.is_empty() {
+                Self::scope_with_policy_context_rows_for_tables(
+                    &result_scope,
+                    &policy_context_tables,
+                    &branches,
+                    storage_ref,
+                )
+            } else {
+                result_scope
+            })
+        } else {
+            let mut settlement_eval_cache = SettlementEvalCache::default();
+            self.authorized_scope_from_graph_if_available(
+                storage_ref,
+                &mut settlement_eval_cache,
+                &graph,
+                &subscription_context,
+                &branch_schema_map,
+                session_for_policy.as_ref(),
+            )
+        };
+        let settled_once = scope.is_some();
+        let mut sent_below_required_settled = existing_subscription_state
+            .as_ref()
+            .filter(|(equivalent, ..)| *equivalent)
+            .map(|(_, sent_below_required_settled, ..)| *sent_below_required_settled)
+            .unwrap_or(false);
+        let mut last_emitted_settled_tier = existing_subscription_state
+            .as_ref()
+            .filter(|(equivalent, ..)| *equivalent)
+            .and_then(|(_, _, last_emitted_settled_tier, _, _)| *last_emitted_settled_tier);
+
+        if let Some(scope) = scope.as_ref() {
+            // A returning peer's scope is unchanged by definition — it was away, not
+            // re-scoped — so this gate would skip the one call that re-offers rows.
+            let scope_changed = owed_rows
+                || !equivalent_existing_subscription
+                || existing_subscription_state
+                    .as_ref()
+                    .is_none_or(|(_, _, _, last_scope, _)| *last_scope != *scope);
+
+            if scope_changed {
+                self.sync_manager.set_client_query_scope_with_storage(
+                    storage_ref,
+                    sub.client_id,
+                    sub.query_id,
+                    scope.clone(),
+                    session_for_policy.clone(),
+                );
+            }
+
+            let settled_tier = self
+                .sync_manager
+                .max_local_durability_tier()
+                .unwrap_or(DurabilityTier::Local);
+            if Self::should_emit_query_settled_to_downstream(
+                sub.required_tier,
+                settled_tier,
+                &mut sent_below_required_settled,
+                &mut last_emitted_settled_tier,
+                scope_changed,
+            ) {
+                // Keep the QuerySettled marker immediately after the rows
+                // for this query's scope. Deferring all settlements until
+                // after every pending subscription lets one huge query put
+                // unrelated smaller queries' first callbacks behind its
+                // entire row replay.
+                self.sync_manager.emit_query_settled(
+                    sub.client_id,
+                    sub.query_id,
+                    settled_tier,
+                    scope,
+                );
+            }
+        }
+
+        // Covers the initial graph settle AND the authorization scope
+        // computation that follows it.
+        crate::query_manager::settle_cost::note_subscription_settle(
+            Some(sub.client_id),
+            sub.query_id.0,
+            settle_started.elapsed(),
+        );
+
+        // Forward QuerySubscription to upstream servers (multi-tier forwarding)
+        // This allows hub servers to know about the query and push matching data
+        if sub.propagation == crate::sync_manager::QueryPropagation::Full {
+            tracing::trace!(
+                %sub.client_id,
+                query_id = sub.query_id.0,
+                table = %sub.query.table,
+                "jazz trace forwarding downstream query subscription upstream"
+            );
+            self.sync_manager.send_query_subscription_to_servers(
+                sub.query_id,
+                sub.query.clone(),
+                session_for_policy.clone(),
+                None,
+                sub.propagation,
+                sub.policy_context_tables.clone(),
+            );
+        }
+
+        // Store the server subscription for reactive updates
+        tracing::info!(
+            client_id = %sub.client_id,
+            query_id = sub.query_id.0,
+            table = %sub.query.table,
+            total = self.server_subscriptions.len() + 1,
+            "server subscription registered"
+        );
+        self.server_subscriptions.insert(
+            (sub.client_id, sub.query_id),
+            ServerQuerySubscription {
+                query: sub.query,
+                graph,
+                schema_context: subscription_context,
+                session: session_for_policy,
+                branches,
+                policy_context_tables: sub.policy_context_tables,
+                required_tier: sub.required_tier,
+                sent_below_required_settled,
+                last_emitted_settled_tier,
+                last_scope: scope.unwrap_or_default(),
+                needs_recompile: false,
+                settled_once,
+                propagation: sub.propagation,
+                reported_schema_warnings,
+            },
+        );
+        RegistrationOutcome::Inserted { key, settled_once }
+    }
+
     /// Process pending query subscriptions from downstream clients.
     ///
     /// For each pending subscription:
@@ -1245,350 +1640,32 @@ impl QueryManager {
             let Some(sub) = pending_by_key.remove(&key) else {
                 continue;
             };
-            let Some((schema_for_compile, subscription_context)) =
-                self.build_server_subscription_context(&sub.query)
-            else {
-                deferred.push(sub);
-                continue;
-            };
-
-            // Defence in depth: if the subscription has no session (client omitted
-            // it), fall back to the connection-level session set during JWT auth
-            // on the WebSocket handshake. This ensures the PolicyFilterNode is
-            // always present — at worst it will fail closed (zero results) rather
-            // than fail open (bypass policies).
-            let session_for_policy = sub.session.clone().or_else(|| {
-                self.sync_manager
-                    .get_client(sub.client_id)
-                    .and_then(|c| c.session.clone())
-            });
-            let existing_subscription_state = self
-                .server_subscriptions
-                .get(&(sub.client_id, sub.query_id))
-                .map(|existing| {
-                    (
-                        existing.query == sub.query
-                            && existing.session == session_for_policy
-                            && existing.required_tier == sub.required_tier
-                            && existing.propagation == sub.propagation
-                            && existing.policy_context_tables == sub.policy_context_tables,
-                        existing.sent_below_required_settled,
-                        existing.last_emitted_settled_tier,
-                        existing.last_scope.clone(),
-                        existing.settled_once,
-                    )
-                });
-            let equivalent_existing_subscription = existing_subscription_state
-                .as_ref()
-                .is_some_and(|(equivalent, ..)| *equivalent);
-
-            // A peer that was away replays the same query id, so the subscription looks
-            // equivalent and already settled. Answering from the cached scope re-derives
-            // nothing, and re-derivation is the only place that sets `force_resend` — which
-            // is why a row it never confirmed is otherwise never offered again. Decline the
-            // fast path for that one pass.
-            let owed_rows = self
-                .sync_manager
-                .client_has_undelivered_payloads(sub.client_id);
-            tracing::info!(
-                target: "jazz::conn",
-                client_id = %sub.client_id,
-                query_id = sub.query_id.0,
-                equivalent = equivalent_existing_subscription,
-                owed_rows,
-                decision = if owed_rows {
-                    "re-derive: peer is owed rows"
-                } else if equivalent_existing_subscription {
-                    "fast path: nothing re-derived"
-                } else {
-                    "re-derive: new or changed subscription"
-                },
-                "subscription registered"
-            );
-            if !owed_rows
-                && equivalent_existing_subscription
-                && existing_subscription_state
-                    .as_ref()
-                    .is_some_and(|(_, _, _, _, settled_once)| *settled_once)
-            {
-                let settled_tier = self
-                    .sync_manager
-                    .max_local_durability_tier()
-                    .unwrap_or(DurabilityTier::Local);
-                let mut emission_scope = None;
-
-                if let Some(existing) = self
-                    .server_subscriptions
-                    .get_mut(&(sub.client_id, sub.query_id))
-                    && Self::should_emit_query_settled_to_downstream(
-                        existing.required_tier,
-                        settled_tier,
-                        &mut existing.sent_below_required_settled,
-                        &mut existing.last_emitted_settled_tier,
-                        false,
-                    )
-                {
-                    emission_scope = Some(existing.last_scope.clone());
+            match self.process_one_pending_query_subscription(
+                storage,
+                sub,
+                &mut schema_warning_notifications,
+            ) {
+                RegistrationOutcome::Deferred(sub) => {
+                    deferred.push(*sub);
+                    continue;
                 }
-
-                if let Some(scope) = emission_scope.as_ref() {
-                    self.sync_manager.emit_query_settled(
-                        sub.client_id,
-                        sub.query_id,
-                        settled_tier,
-                        scope,
-                    );
-                }
-
-                continue;
+                RegistrationOutcome::FastPath | RegistrationOutcome::Rejected => continue,
+                RegistrationOutcome::Inserted { .. } => {}
             }
-
-            // Build QueryGraph with client's session for policy filtering (schema-aware)
-            let query_for_compile =
-                Self::query_for_server_compile(&sub.query, &subscription_context);
-            let compile_row_policy_mode = if self
-                .authorization_schema_for_context(
-                    &subscription_context.env,
-                    &subscription_context.user_branch,
-                )
-                .as_ref()
-                .map(|(auth_schema, _)| auth_schema.as_ref() != schema_for_compile.as_ref())
-                .unwrap_or(false)
-            {
-                crate::query_manager::types::RowPolicyMode::PermissiveLocal
-            } else {
-                self.row_policy_mode
-            };
-            let graph = Self::compile_graph(
-                &query_for_compile,
-                &schema_for_compile,
-                session_for_policy.clone(),
-                &subscription_context,
-                compile_row_policy_mode,
-            );
-
-            let Ok(mut graph) = graph else {
-                // Query compilation failed (e.g., missing table) - notify client with compiler context.
-                let compile_error = graph
-                    .err()
-                    .map(|err| err.to_string())
-                    .unwrap_or_else(|| "unknown compile error".to_string());
-                let reason = format!(
-                    "query compilation failed for query_id {}: {}",
-                    sub.query_id.0, compile_error
-                );
-                self.sync_manager.emit_query_subscription_rejected(
-                    sub.client_id,
-                    sub.query_id,
-                    "query_compilation_failed",
-                    reason,
-                );
-                continue;
-            };
-
-            let branch_schema_map = Self::branch_schema_map_for_context(&subscription_context);
-
-            // Initial settle to populate the graph
-            let storage_ref: &dyn Storage = storage;
-
-            let branches =
-                Self::resolved_server_query_branches(&query_for_compile, &subscription_context);
-            let table = sub.query.table.as_str().to_string();
-            let mut schema_warnings = SchemaWarningAccumulator::default();
-            let include_deleted = sub.query.include_deleted;
-            // Settle-cost accounting: a subscription's FIRST settle happens
-            // here, not in `settle_server_subscriptions`. It is the most
-            // expensive settle a subscription ever has (cold graph, cold
-            // authz verdict cache), so leaving it unattributed would hide the
-            // subscription-storm shape entirely.
-            let settle_started = web_time::Instant::now();
-            crate::query_manager::settle_cost::bump(
-                &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
-            );
-            {
-                let row_bytes_dedup = &self.row_bytes_dedup;
-                let row_loader =
-                    |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
-                        Self::load_visible_row_for_query(
-                            storage_ref,
-                            id,
-                            table_hint.as_ref().map(TableName::as_str),
-                            &branches,
-                            None,
-                            None,
-                            false,
-                            false,
-                            include_deleted,
-                            &subscription_context,
-                            &branch_schema_map,
-                            &table,
-                            super::graph_nodes::output::QuerySubscriptionId(sub.query_id.0),
-                            &mut schema_warnings,
-                            row_bytes_dedup,
-                        )
-                    };
-
-                let delta = graph.settle(storage_ref, row_loader);
-                crate::query_manager::settle_cost::add(
-                    &crate::query_manager::settle_cost::ROWS_EMITTED,
-                    (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
-                );
-            }
-            let mut reported_schema_warnings = HashSet::new();
-            let new_schema_warnings = Self::finalize_schema_warnings(
-                &mut reported_schema_warnings,
-                schema_warnings.warnings_for_query(sub.query_id),
-            );
-            schema_warning_notifications.extend(
-                new_schema_warnings
-                    .into_iter()
-                    .map(|warning| (sub.client_id, warning)),
-            );
-
-            // Sync the rows needed for the client to reproduce the current result
-            // locally, including any ordered prefix required by pagination.
-            let policy_context_tables =
-                Self::merged_policy_context_tables(&graph, &sub.policy_context_tables);
-            let scope = if self
-                .client_bypasses_authorization_filtering(sub.client_id, session_for_policy.as_ref())
-            {
-                let result_scope = graph.sync_scope_object_ids();
-                Some(if !policy_context_tables.is_empty() {
-                    Self::scope_with_policy_context_rows_for_tables(
-                        &result_scope,
-                        &policy_context_tables,
-                        &branches,
-                        storage_ref,
-                    )
-                } else {
-                    result_scope
-                })
-            } else {
-                let mut settlement_eval_cache = SettlementEvalCache::default();
-                self.authorized_scope_from_graph_if_available(
-                    storage_ref,
-                    &mut settlement_eval_cache,
-                    &graph,
-                    &subscription_context,
-                    &branch_schema_map,
-                    session_for_policy.as_ref(),
-                )
-            };
-            let settled_once = scope.is_some();
-            let mut sent_below_required_settled = existing_subscription_state
-                .as_ref()
-                .filter(|(equivalent, ..)| *equivalent)
-                .map(|(_, sent_below_required_settled, ..)| *sent_below_required_settled)
-                .unwrap_or(false);
-            let mut last_emitted_settled_tier = existing_subscription_state
-                .as_ref()
-                .filter(|(equivalent, ..)| *equivalent)
-                .and_then(|(_, _, last_emitted_settled_tier, _, _)| *last_emitted_settled_tier);
-
-            if let Some(scope) = scope.as_ref() {
-                // A returning peer's scope is unchanged by definition — it was away, not
-                // re-scoped — so this gate would skip the one call that re-offers rows.
-                let scope_changed = owed_rows
-                    || !equivalent_existing_subscription
-                    || existing_subscription_state
-                        .as_ref()
-                        .is_none_or(|(_, _, _, last_scope, _)| *last_scope != *scope);
-
-                if scope_changed {
-                    self.sync_manager.set_client_query_scope_with_storage(
-                        storage_ref,
-                        sub.client_id,
-                        sub.query_id,
-                        scope.clone(),
-                        session_for_policy.clone(),
-                    );
-                }
-
-                let settled_tier = self
-                    .sync_manager
-                    .max_local_durability_tier()
-                    .unwrap_or(DurabilityTier::Local);
-                if Self::should_emit_query_settled_to_downstream(
-                    sub.required_tier,
-                    settled_tier,
-                    &mut sent_below_required_settled,
-                    &mut last_emitted_settled_tier,
-                    scope_changed,
-                ) {
-                    // Keep the QuerySettled marker immediately after the rows
-                    // for this query's scope. Deferring all settlements until
-                    // after every pending subscription lets one huge query put
-                    // unrelated smaller queries' first callbacks behind its
-                    // entire row replay.
-                    self.sync_manager.emit_query_settled(
-                        sub.client_id,
-                        sub.query_id,
-                        settled_tier,
-                        scope,
-                    );
-                }
-            }
-
-            // Covers the initial graph settle AND the authorization scope
-            // computation that follows it.
-            crate::query_manager::settle_cost::note_subscription_settle(
-                Some(sub.client_id),
-                sub.query_id.0,
-                settle_started.elapsed(),
-            );
-
-            // Forward QuerySubscription to upstream servers (multi-tier forwarding)
-            // This allows hub servers to know about the query and push matching data
-            if sub.propagation == crate::sync_manager::QueryPropagation::Full {
-                tracing::trace!(
-                    %sub.client_id,
-                    query_id = sub.query_id.0,
-                    table = %sub.query.table,
-                    "jazz trace forwarding downstream query subscription upstream"
-                );
-                self.sync_manager.send_query_subscription_to_servers(
-                    sub.query_id,
-                    sub.query.clone(),
-                    session_for_policy.clone(),
-                    None,
-                    sub.propagation,
-                    sub.policy_context_tables.clone(),
-                );
-            }
-
-            // Store the server subscription for reactive updates
-            tracing::info!(
-                client_id = %sub.client_id,
-                query_id = sub.query_id.0,
-                table = %sub.query.table,
-                total = self.server_subscriptions.len() + 1,
-                "server subscription registered"
-            );
-            self.server_subscriptions.insert(
-                (sub.client_id, sub.query_id),
-                ServerQuerySubscription {
-                    query: sub.query,
-                    graph,
-                    schema_context: subscription_context,
-                    session: session_for_policy,
-                    branches,
-                    policy_context_tables: sub.policy_context_tables,
-                    required_tier: sub.required_tier,
-                    sent_below_required_settled,
-                    last_emitted_settled_tier,
-                    last_scope: scope.unwrap_or_default(),
-                    needs_recompile: false,
-                    settled_once,
-                    propagation: sub.propagation,
-                    reported_schema_warnings,
-                },
-            );
 
             if self.sync_manager.outbox().len() >= MAX_INITIAL_QUERY_REPLAY_OUTBOX_PER_PASS {
+                let mut left_behind = false;
                 for remaining_key in pending_keys.iter().skip(key_index + 1) {
                     if let Some(sub) = pending_by_key.remove(remaining_key) {
                         deferred.push(sub);
+                        left_behind = true;
                     }
+                }
+                // v18 item 6 (design v4 SF4): a limiter trip is progress with work left
+                // behind; without the flag a trip inside a write API's immediate tick
+                // strands the rest until the next external event.
+                if left_behind {
+                    self.settle_work_remains = true;
                 }
                 break;
             }
@@ -1614,6 +1691,8 @@ impl QueryManager {
         let pending = self.sync_manager.take_pending_query_unsubscriptions();
 
         for unsub in pending {
+            self.stalled
+                .remove(&UnitKey::Server(unsub.client_id, unsub.query_id));
             let propagation = self
                 .server_subscriptions
                 .remove(&(unsub.client_id, unsub.query_id))
@@ -1628,6 +1707,230 @@ impl QueryManager {
         }
     }
 
+    /// One (S) unit, or the clean cached emission for a key that is not a unit. Extracted
+    /// from the settle loop unchanged (v18 item 6).
+    pub(super) fn settle_one_server_subscription(
+        &mut self,
+        storage: &dyn Storage,
+        client_id: ClientId,
+        query_id: crate::sync_manager::QueryId,
+        schema_warning_notifications: &mut Vec<(ClientId, crate::sync_manager::SchemaWarning)>,
+    ) {
+        let Some(mut sub) = self.server_subscriptions.remove(&(client_id, query_id)) else {
+            return;
+        };
+        let branches = &sub.branches;
+        let table = sub.query.table.as_str().to_string();
+        let include_deleted = sub.query.include_deleted;
+        let branch_schema_map = Self::branch_schema_map_for_context(&sub.schema_context);
+        let mut schema_warnings = SchemaWarningAccumulator::default();
+        let had_dirty_graph = sub.graph.has_dirty_nodes();
+
+        if sub.settled_once && !had_dirty_graph && !sub.needs_recompile {
+            let settled_tier = self
+                .sync_manager
+                .max_local_durability_tier()
+                .unwrap_or(DurabilityTier::Local);
+            if Self::should_emit_query_settled_to_downstream(
+                sub.required_tier,
+                settled_tier,
+                &mut sub.sent_below_required_settled,
+                &mut sub.last_emitted_settled_tier,
+                false,
+            ) {
+                tracing::trace!(
+                    %client_id,
+                    query_id = query_id.0,
+                    tier = ?settled_tier,
+                    scope_len = sub.last_scope.len(),
+                    "jazz trace server subscription settled from clean cached scope"
+                );
+                self.sync_manager.emit_query_settled(
+                    client_id,
+                    query_id,
+                    settled_tier,
+                    &sub.last_scope,
+                );
+            }
+
+            self.server_subscriptions.insert((client_id, query_id), sub);
+            return;
+        }
+
+        // Settle-cost accounting: past the clean-cached-scope short-circuit
+        // above, so this subscription is about to do real settle work.
+        let settle_started = web_time::Instant::now();
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
+        );
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.server_settles += 1;
+        }
+
+        // Row loader for this subscription
+        let new_scope: Option<Cow<'_, HashSet<(ObjectId, BranchName)>>> = {
+            {
+                let row_bytes_dedup = &self.row_bytes_dedup;
+                let row_loader =
+                    |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
+                        Self::load_visible_row_for_query(
+                            storage,
+                            id,
+                            table_hint.as_ref().map(TableName::as_str),
+                            branches,
+                            None,
+                            None,
+                            false,
+                            false,
+                            include_deleted,
+                            &sub.schema_context,
+                            &branch_schema_map,
+                            &table,
+                            super::graph_nodes::output::QuerySubscriptionId(query_id.0),
+                            &mut schema_warnings,
+                            row_bytes_dedup,
+                        )
+                    };
+
+                let delta = sub.graph.settle(storage, row_loader);
+                crate::query_manager::settle_cost::add(
+                    &crate::query_manager::settle_cost::ROWS_EMITTED,
+                    (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+                );
+            }
+            let new_schema_warnings = Self::finalize_schema_warnings(
+                &mut sub.reported_schema_warnings,
+                schema_warnings.warnings_for_query(query_id),
+            );
+            schema_warning_notifications.extend(
+                new_schema_warnings
+                    .into_iter()
+                    .map(|warning| (client_id, warning)),
+            );
+
+            // Check if scope changed
+            let policy_context_tables =
+                Self::merged_policy_context_tables(&sub.graph, &sub.policy_context_tables);
+            if self.client_bypasses_authorization_filtering(client_id, sub.session.as_ref()) {
+                if !policy_context_tables.is_empty() {
+                    let result_scope = sub.graph.sync_scope_object_ids();
+                    Some(Cow::Owned(Self::scope_with_policy_context_rows_for_tables(
+                        &result_scope,
+                        &policy_context_tables,
+                        branches,
+                        storage,
+                    )))
+                } else if let Some(scope) = sub.graph.sync_scope_object_ids_ref() {
+                    Some(Cow::Borrowed(scope))
+                } else {
+                    Some(Cow::Owned(sub.graph.sync_scope_object_ids()))
+                }
+            } else {
+                let mut settlement_eval_cache = SettlementEvalCache::default();
+                self.authorized_scope_from_graph_if_available(
+                    storage,
+                    &mut settlement_eval_cache,
+                    &sub.graph,
+                    &sub.schema_context,
+                    &branch_schema_map,
+                    sub.session.as_ref(),
+                )
+                .map(Cow::Owned)
+            }
+        };
+        if let Some(new_scope) = new_scope {
+            let scope_changed = new_scope.as_ref() != &sub.last_scope;
+            if scope_changed {
+                let owned_scope = new_scope.into_owned();
+                self.sync_manager.set_client_query_scope_with_storage(
+                    storage,
+                    client_id,
+                    query_id,
+                    owned_scope.clone(),
+                    sub.session.clone(),
+                );
+                sub.last_scope = owned_scope;
+            }
+
+            // Emit an authoritative QuerySettled once the scope for this
+            // settled frame has been computed. A computed empty scope is
+            // authoritative; missing permissions/schema context returns None
+            // and must keep the subscription unsettled.
+            if !sub.settled_once {
+                sub.settled_once = true;
+                let settled_tier = self
+                    .sync_manager
+                    .max_local_durability_tier()
+                    .unwrap_or(DurabilityTier::Local);
+                if Self::should_emit_query_settled_to_downstream(
+                    sub.required_tier,
+                    settled_tier,
+                    &mut sub.sent_below_required_settled,
+                    &mut sub.last_emitted_settled_tier,
+                    true,
+                ) {
+                    tracing::trace!(
+                        %client_id,
+                        query_id = query_id.0,
+                        tier = ?settled_tier,
+                        scope_len = sub.last_scope.len(),
+                        "jazz trace server subscription settled"
+                    );
+                    self.sync_manager.emit_query_settled(
+                        client_id,
+                        query_id,
+                        settled_tier,
+                        &sub.last_scope,
+                    );
+                }
+            } else if scope_changed || had_dirty_graph {
+                let settled_tier = self
+                    .sync_manager
+                    .max_local_durability_tier()
+                    .unwrap_or(DurabilityTier::Local);
+                if Self::should_emit_query_settled_to_downstream(
+                    sub.required_tier,
+                    settled_tier,
+                    &mut sub.sent_below_required_settled,
+                    &mut sub.last_emitted_settled_tier,
+                    scope_changed,
+                ) {
+                    tracing::trace!(
+                        %client_id,
+                        query_id = query_id.0,
+                        tier = ?settled_tier,
+                        scope_len = sub.last_scope.len(),
+                        "jazz trace server subscription settled"
+                    );
+                    self.sync_manager.emit_query_settled(
+                        client_id,
+                        query_id,
+                        settled_tier,
+                        &sub.last_scope,
+                    );
+                }
+            }
+        }
+
+        // Covers the graph settle AND the authorization scope computation
+        // that follows it — the per-row policy work is the whole point of
+        // attributing cost to a subscription.
+        crate::query_manager::settle_cost::note_subscription_settle(
+            Some(client_id),
+            query_id.0,
+            settle_started.elapsed(),
+        );
+
+        self.server_subscriptions.insert((client_id, query_id), sub);
+    }
+
+    /// Whether a server subscription is a settle unit (design v4 § B1): it passes the
+    /// clean-cached short-circuit of the settle loop.
+    pub(super) fn server_subscription_is_unit(sub: &ServerQuerySubscription) -> bool {
+        !sub.settled_once || sub.graph.has_dirty_nodes() || sub.needs_recompile
+    }
+
     /// Settle server-side query subscriptions and update scopes.
     ///
     /// Called after local data changes to detect when new objects match
@@ -1640,209 +1943,12 @@ impl QueryManager {
         let subscription_keys: Vec<_> = self.server_subscriptions.keys().copied().collect();
 
         for (client_id, query_id) in subscription_keys {
-            let Some(mut sub) = self.server_subscriptions.remove(&(client_id, query_id)) else {
-                continue;
-            };
-            let branches = &sub.branches;
-            let table = sub.query.table.as_str().to_string();
-            let include_deleted = sub.query.include_deleted;
-            let branch_schema_map = Self::branch_schema_map_for_context(&sub.schema_context);
-            let mut schema_warnings = SchemaWarningAccumulator::default();
-            let had_dirty_graph = sub.graph.has_dirty_nodes();
-
-            if sub.settled_once && !had_dirty_graph && !sub.needs_recompile {
-                let settled_tier = self
-                    .sync_manager
-                    .max_local_durability_tier()
-                    .unwrap_or(DurabilityTier::Local);
-                if Self::should_emit_query_settled_to_downstream(
-                    sub.required_tier,
-                    settled_tier,
-                    &mut sub.sent_below_required_settled,
-                    &mut sub.last_emitted_settled_tier,
-                    false,
-                ) {
-                    tracing::trace!(
-                        %client_id,
-                        query_id = query_id.0,
-                        tier = ?settled_tier,
-                        scope_len = sub.last_scope.len(),
-                        "jazz trace server subscription settled from clean cached scope"
-                    );
-                    self.sync_manager.emit_query_settled(
-                        client_id,
-                        query_id,
-                        settled_tier,
-                        &sub.last_scope,
-                    );
-                }
-
-                self.server_subscriptions.insert((client_id, query_id), sub);
-                continue;
-            }
-
-            // Settle-cost accounting: past the clean-cached-scope short-circuit
-            // above, so this subscription is about to do real settle work.
-            let settle_started = web_time::Instant::now();
-            crate::query_manager::settle_cost::bump(
-                &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
+            self.settle_one_server_subscription(
+                storage,
+                client_id,
+                query_id,
+                &mut schema_warning_notifications,
             );
-
-            // Row loader for this subscription
-            let new_scope: Option<Cow<'_, HashSet<(ObjectId, BranchName)>>> = {
-                {
-                    let row_bytes_dedup = &self.row_bytes_dedup;
-                    let row_loader =
-                        |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
-                            Self::load_visible_row_for_query(
-                                storage,
-                                id,
-                                table_hint.as_ref().map(TableName::as_str),
-                                branches,
-                                None,
-                                None,
-                                false,
-                                false,
-                                include_deleted,
-                                &sub.schema_context,
-                                &branch_schema_map,
-                                &table,
-                                super::graph_nodes::output::QuerySubscriptionId(query_id.0),
-                                &mut schema_warnings,
-                                row_bytes_dedup,
-                            )
-                        };
-
-                    let delta = sub.graph.settle(storage, row_loader);
-                    crate::query_manager::settle_cost::add(
-                        &crate::query_manager::settle_cost::ROWS_EMITTED,
-                        (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
-                    );
-                }
-                let new_schema_warnings = Self::finalize_schema_warnings(
-                    &mut sub.reported_schema_warnings,
-                    schema_warnings.warnings_for_query(query_id),
-                );
-                schema_warning_notifications.extend(
-                    new_schema_warnings
-                        .into_iter()
-                        .map(|warning| (client_id, warning)),
-                );
-
-                // Check if scope changed
-                let policy_context_tables =
-                    Self::merged_policy_context_tables(&sub.graph, &sub.policy_context_tables);
-                if self.client_bypasses_authorization_filtering(client_id, sub.session.as_ref()) {
-                    if !policy_context_tables.is_empty() {
-                        let result_scope = sub.graph.sync_scope_object_ids();
-                        Some(Cow::Owned(Self::scope_with_policy_context_rows_for_tables(
-                            &result_scope,
-                            &policy_context_tables,
-                            branches,
-                            storage,
-                        )))
-                    } else if let Some(scope) = sub.graph.sync_scope_object_ids_ref() {
-                        Some(Cow::Borrowed(scope))
-                    } else {
-                        Some(Cow::Owned(sub.graph.sync_scope_object_ids()))
-                    }
-                } else {
-                    let mut settlement_eval_cache = SettlementEvalCache::default();
-                    self.authorized_scope_from_graph_if_available(
-                        storage,
-                        &mut settlement_eval_cache,
-                        &sub.graph,
-                        &sub.schema_context,
-                        &branch_schema_map,
-                        sub.session.as_ref(),
-                    )
-                    .map(Cow::Owned)
-                }
-            };
-            if let Some(new_scope) = new_scope {
-                let scope_changed = new_scope.as_ref() != &sub.last_scope;
-                if scope_changed {
-                    let owned_scope = new_scope.into_owned();
-                    self.sync_manager.set_client_query_scope_with_storage(
-                        storage,
-                        client_id,
-                        query_id,
-                        owned_scope.clone(),
-                        sub.session.clone(),
-                    );
-                    sub.last_scope = owned_scope;
-                }
-
-                // Emit an authoritative QuerySettled once the scope for this
-                // settled frame has been computed. A computed empty scope is
-                // authoritative; missing permissions/schema context returns None
-                // and must keep the subscription unsettled.
-                if !sub.settled_once {
-                    sub.settled_once = true;
-                    let settled_tier = self
-                        .sync_manager
-                        .max_local_durability_tier()
-                        .unwrap_or(DurabilityTier::Local);
-                    if Self::should_emit_query_settled_to_downstream(
-                        sub.required_tier,
-                        settled_tier,
-                        &mut sub.sent_below_required_settled,
-                        &mut sub.last_emitted_settled_tier,
-                        true,
-                    ) {
-                        tracing::trace!(
-                            %client_id,
-                            query_id = query_id.0,
-                            tier = ?settled_tier,
-                            scope_len = sub.last_scope.len(),
-                            "jazz trace server subscription settled"
-                        );
-                        self.sync_manager.emit_query_settled(
-                            client_id,
-                            query_id,
-                            settled_tier,
-                            &sub.last_scope,
-                        );
-                    }
-                } else if scope_changed || had_dirty_graph {
-                    let settled_tier = self
-                        .sync_manager
-                        .max_local_durability_tier()
-                        .unwrap_or(DurabilityTier::Local);
-                    if Self::should_emit_query_settled_to_downstream(
-                        sub.required_tier,
-                        settled_tier,
-                        &mut sub.sent_below_required_settled,
-                        &mut sub.last_emitted_settled_tier,
-                        scope_changed,
-                    ) {
-                        tracing::trace!(
-                            %client_id,
-                            query_id = query_id.0,
-                            tier = ?settled_tier,
-                            scope_len = sub.last_scope.len(),
-                            "jazz trace server subscription settled"
-                        );
-                        self.sync_manager.emit_query_settled(
-                            client_id,
-                            query_id,
-                            settled_tier,
-                            &sub.last_scope,
-                        );
-                    }
-                }
-            }
-
-            // Covers the graph settle AND the authorization scope computation
-            // that follows it — the per-row policy work is the whole point of
-            // attributing cost to a subscription.
-            crate::query_manager::settle_cost::note_subscription_settle(
-                Some(client_id),
-                query_id.0,
-                settle_started.elapsed(),
-            );
-
-            self.server_subscriptions.insert((client_id, query_id), sub);
         }
 
         for (client_id, warning) in schema_warning_notifications {
@@ -2616,6 +2722,291 @@ impl QueryManager {
             if let Some(state) = self.active_policy_checks.remove(&id) {
                 self.sync_manager
                     .reject_permission_check(storage, state.pending_check, reason);
+            }
+        }
+    }
+}
+
+/// v18 item 6: one unit of the settle pool.
+#[derive(Debug, Clone, Copy)]
+enum Unit {
+    Registration((ClientId, crate::sync_manager::QueryId)),
+    Server((ClientId, crate::sync_manager::QueryId)),
+    Local(QuerySubscriptionId),
+}
+
+impl Unit {
+    /// The stall key; registrations never stall (design v4 § B1).
+    fn key(self) -> Option<UnitKey> {
+        match self {
+            Unit::Registration(_) => None,
+            Unit::Server((client_id, query_id)) => Some(UnitKey::Server(client_id, query_id)),
+            Unit::Local(sub_id) => Some(UnitKey::Local(sub_id)),
+        }
+    }
+
+    fn slot(self) -> RotationSlot {
+        match self {
+            Unit::Registration((client_id, _)) | Unit::Server((client_id, _)) => {
+                RotationSlot::Client(client_id)
+            }
+            Unit::Local(_) => RotationSlot::Local,
+        }
+    }
+}
+
+impl QueryManager {
+    /// v18 item 6: the one unit pool of a bounded pass, dispatched at step 8's position
+    /// under the tick's clock (design v3 § B3/B5, v4 § B1 and SF1–SF4, v5 § B1–B3 and SF1).
+    ///
+    /// Pool = for every slot (one per downstream client, then the local pseudo-client), its
+    /// pending registrations in arrival order, then its dirty server subscriptions by query
+    /// id (the local slot: its dirty subscriptions by id); one unit per slot per round,
+    /// starting after the cursor; every non-stalled unit before every stalled one. The first
+    /// charged unit of the tick always runs; each further one only while the tick is under
+    /// its budget. A unit that ran without progress enters `stalled`; one that progressed
+    /// leaves it. Deferred registrations are requeued in pool order; deferred settles stay
+    /// dirty. `settle_work_remains` is set iff a non-stalled unit was deferred.
+    pub(super) fn dispatch_unit_pool<H: Storage>(&mut self, storage: &mut H) {
+        use std::collections::{BTreeMap, VecDeque};
+
+        // Registrations, deduped by key (last wins), first-seen order — as the loop does.
+        let pending = self.sync_manager.take_pending_query_subscriptions();
+        let mut pending_by_key: HashMap<
+            (ClientId, crate::sync_manager::QueryId),
+            crate::sync_manager::PendingQuerySubscription,
+        > = HashMap::new();
+        let mut pending_keys = Vec::new();
+        for sub in pending {
+            let key = (sub.client_id, sub.query_id);
+            if !pending_by_key.contains_key(&key) {
+                pending_keys.push(key);
+            }
+            pending_by_key.insert(key, sub);
+        }
+
+        let mut queues: BTreeMap<RotationSlot, VecDeque<Unit>> = BTreeMap::new();
+        for key in &pending_keys {
+            queues
+                .entry(RotationSlot::Client(key.0))
+                .or_default()
+                .push_back(Unit::Registration(*key));
+        }
+        // A key with a pending registration skips its dirty settle: the registration
+        // replaces the subscription (design v3 should-fix, gated on `Some(_)`).
+        let mut server_units: Vec<(ClientId, crate::sync_manager::QueryId)> = self
+            .server_subscriptions
+            .iter()
+            .filter(|(key, sub)| {
+                !pending_by_key.contains_key(key) && Self::server_subscription_is_unit(sub)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        server_units.sort();
+        for key in server_units {
+            queues
+                .entry(RotationSlot::Client(key.0))
+                .or_default()
+                .push_back(Unit::Server(key));
+        }
+        let mut local_units: Vec<QuerySubscriptionId> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, sub)| Self::local_subscription_is_unit(sub))
+            .map(|(id, _)| *id)
+            .collect();
+        local_units.sort();
+        for sub_id in local_units {
+            queues
+                .entry(RotationSlot::Local)
+                .or_default()
+                .push_back(Unit::Local(sub_id));
+        }
+
+        // Keys that are not units still get the clean cached emission the loop gives them
+        // (not charged); keys with a pending registration are left to the registration.
+        // This prologue is linear in the live subscription count and runs before the first
+        // unit — the pass bound is "budget + one unit + this prologue" (diff r1 S5) — and it
+        // walks the keys in sorted order like the pool, never in hash order.
+        let mut schema_warning_notifications = Vec::new();
+        let mut clean_keys: Vec<(ClientId, crate::sync_manager::QueryId)> = self
+            .server_subscriptions
+            .iter()
+            .filter(|(key, sub)| {
+                !pending_by_key.contains_key(key) && !Self::server_subscription_is_unit(sub)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        clean_keys.sort();
+        for (client_id, query_id) in clean_keys {
+            self.settle_one_server_subscription(
+                storage,
+                client_id,
+                query_id,
+                &mut schema_warning_notifications,
+            );
+        }
+
+        // Rotation order: the slots in sorted order, starting after the cursor (v3 § B5).
+        let slots: Vec<RotationSlot> = queues.keys().copied().collect();
+        let start = match self.rotation_cursor {
+            Some(cursor) => slots.iter().position(|slot| *slot > cursor).unwrap_or(0),
+            None => 0,
+        };
+        let order: Vec<RotationSlot> = slots[start..]
+            .iter()
+            .chain(slots[..start].iter())
+            .copied()
+            .collect();
+        let mut fair: Vec<Unit> = Vec::new();
+        loop {
+            let mut took_any = false;
+            for slot in &order {
+                if let Some(unit) = queues.get_mut(slot).and_then(VecDeque::pop_front) {
+                    fair.push(unit);
+                    took_any = true;
+                }
+            }
+            if !took_any {
+                break;
+            }
+        }
+        let (live, stalled): (Vec<Unit>, Vec<Unit>) = fair
+            .into_iter()
+            .partition(|unit| unit.key().is_none_or(|key| !self.stalled.contains(&key)));
+        let pool_len = live.len() + stalled.len();
+
+        let mut deferred_registrations = Vec::new();
+        let mut deferred_live = false;
+        let mut units_run: u64 = 0;
+        let mut units_deferred: u64 = 0;
+        let mut limiter_tripped = false;
+        for unit in live.into_iter().chain(stalled) {
+            let is_stalled = unit.key().is_some_and(|key| self.stalled.contains(&key));
+            let may_run = self
+                .tick_clock
+                .as_ref()
+                .is_none_or(SettleClock::may_run_unit)
+                && !(limiter_tripped && matches!(unit, Unit::Registration(_)));
+            if !may_run {
+                units_deferred += 1;
+                if !is_stalled {
+                    deferred_live = true;
+                }
+                if let Unit::Registration(key) = unit
+                    && let Some(sub) = pending_by_key.remove(&key)
+                {
+                    deferred_registrations.push(sub);
+                }
+                continue;
+            }
+            match unit {
+                Unit::Registration(key) => {
+                    let Some(sub) = pending_by_key.remove(&key) else {
+                        continue;
+                    };
+                    match self.process_one_pending_query_subscription(
+                        storage,
+                        sub,
+                        &mut schema_warning_notifications,
+                    ) {
+                        // Class (iii): requeued without being charged, not the first unit.
+                        RegistrationOutcome::Deferred(sub) => {
+                            deferred_registrations.push(*sub);
+                            continue;
+                        }
+                        // No compile, no settle: not a unit.
+                        RegistrationOutcome::FastPath => continue,
+                        RegistrationOutcome::Rejected => {}
+                        RegistrationOutcome::Inserted { key, settled_once } => {
+                            // Stalled from birth when the first settle produced no scope
+                            // (design v5 § B2); leaves when `settled_once` becomes true.
+                            if settled_once {
+                                self.stalled.remove(&UnitKey::Server(key.0, key.1));
+                            } else {
+                                self.stalled.insert(UnitKey::Server(key.0, key.1));
+                            }
+                            if self.sync_manager.outbox().len()
+                                >= MAX_INITIAL_QUERY_REPLAY_OUTBOX_PER_PASS
+                            {
+                                limiter_tripped = true;
+                            }
+                        }
+                    }
+                }
+                Unit::Server((client_id, query_id)) => {
+                    self.settle_one_server_subscription(
+                        storage,
+                        client_id,
+                        query_id,
+                        &mut schema_warning_notifications,
+                    );
+                    let progressed = self
+                        .server_subscriptions
+                        .get(&(client_id, query_id))
+                        .is_none_or(|sub| !Self::server_subscription_is_unit(sub));
+                    let key = UnitKey::Server(client_id, query_id);
+                    if progressed {
+                        self.stalled.remove(&key);
+                    } else {
+                        self.stalled.insert(key);
+                    }
+                }
+                Unit::Local(sub_id) => {
+                    let storage_ref: &dyn Storage = storage;
+                    self.settle_one_local_subscription(storage_ref, sub_id);
+                    let progressed = self
+                        .subscriptions
+                        .get(&sub_id)
+                        .is_none_or(|sub| !Self::local_subscription_is_unit(sub));
+                    let key = UnitKey::Local(sub_id);
+                    if progressed {
+                        self.stalled.remove(&key);
+                    } else {
+                        self.stalled.insert(key);
+                    }
+                }
+            }
+            units_run += 1;
+            if let Some(clock) = self.tick_clock.as_mut() {
+                clock.note_unit_ran();
+            }
+            #[cfg(any(test, feature = "test"))]
+            {
+                self.pool_units_run += 1;
+            }
+            self.rotation_cursor = Some(unit.slot());
+        }
+
+        for (client_id, warning) in schema_warning_notifications {
+            self.sync_manager.emit_schema_warning(client_id, warning);
+        }
+        if !deferred_registrations.is_empty() {
+            self.sync_manager
+                .requeue_pending_query_subscriptions(deferred_registrations);
+        }
+        self.settle_work_remains = deferred_live;
+        if units_deferred > 0 {
+            crate::query_manager::settle_cost::add(
+                &crate::query_manager::settle_cost::SETTLE_UNITS_DEFERRED,
+                units_deferred,
+            );
+            if deferred_live {
+                tracing::info!(
+                    pool = pool_len,
+                    units_run,
+                    units_deferred,
+                    stalled = self.stalled.len(),
+                    "settle pass deferred work for budget; continuing on the next tick"
+                );
+            } else {
+                tracing::debug!(
+                    pool = pool_len,
+                    units_run,
+                    units_deferred,
+                    stalled = self.stalled.len(),
+                    "settle pass deferred only stalled units"
+                );
             }
         }
     }

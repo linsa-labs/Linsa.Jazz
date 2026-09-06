@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures::channel::oneshot;
-
+mod staging;
+#[cfg(test)]
+mod staging_tests;
 use crate::batch_fate::BatchMode;
 use crate::object::ObjectId;
 use crate::query_manager::query::Query;
@@ -36,6 +38,9 @@ use crate::storage::Storage;
 use crate::sync_manager::{
     ClientId, DurabilityTier, InboxEntry, OutboxEntry, QueryPropagation, ServerId,
 };
+pub use staging::{
+    ClientStagingStats, InboundStaging, StagePush, StagingConfig, WaiterGuard, kib_permits,
+};
 
 // ============================================================================
 // TokioScheduler
@@ -52,24 +57,64 @@ type DirectInsertResult = (ObjectId, Vec<Value>, BatchId);
 pub struct TokioScheduler<S: Storage + Send + 'static> {
     /// Debounce flag for scheduled ticks.
     scheduled: Arc<AtomicBool>,
-    /// Weak reference back to RuntimeCore for spawned tasks.
+    /// Weak reference back to RuntimeCore for the tick thread.
     core_ref: Weak<Mutex<TokioCoreType<S>>>,
+    /// v18 item 3: frames staged by socket tasks, drained by the tick thread under the core
+    /// lock right before `batched_tick`.
+    staging: Arc<InboundStaging>,
+    /// Wakes the tick thread. The thread exits when every sender is gone.
+    wake: std::sync::mpsc::Sender<()>,
+    /// Held until `set_core_ref` spawns the thread.
+    wake_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    /// Logged once: a wake that found no thread (it exited on a poisoned core mutex).
+    wake_failed: Arc<AtomicBool>,
 }
 
 impl<S: Storage + Send + 'static> TokioScheduler<S> {
     /// Create a new TokioScheduler.
     ///
     /// Note: `core_ref` starts as empty and is set after RuntimeCore is created.
-    fn new() -> Self {
+    fn new(staging: StagingConfig) -> Self {
+        let (wake, wake_rx) = std::sync::mpsc::channel();
         Self {
             scheduled: Arc::new(AtomicBool::new(false)),
             core_ref: Weak::new(),
+            staging: Arc::new(InboundStaging::new(staging)),
+            wake,
+            wake_rx: Arc::new(Mutex::new(Some(wake_rx))),
+            wake_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Set the core reference (called after RuntimeCore is wrapped in Arc<Mutex>).
+    /// Set the core reference (called after RuntimeCore is wrapped in Arc<Mutex>) and start
+    /// the tick thread.
+    ///
+    /// The tick runs on its own std thread (`jazz-tick`), not on tokio's blocking pool: it
+    /// competes on the core mutex only, never on the pool's FIFO where handshake closures
+    /// queue (512 handshakes parked on the lock during a reconnect storm would otherwise put
+    /// the tick strictly last, keep the debounce flag high and stage every push to the cap).
+    /// The thread has no tokio context; nothing reachable from `batched_tick` needs one.
     fn set_core_ref(&mut self, core_ref: Weak<Mutex<TokioCoreType<S>>>) {
-        self.core_ref = core_ref;
+        self.core_ref = core_ref.clone();
+        let Some(wake_rx) = self
+            .wake_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let scheduled = Arc::clone(&self.scheduled);
+        let staging = Arc::clone(&self.staging);
+        std::thread::Builder::new()
+            .name("jazz-tick".to_string())
+            .spawn(move || tick_thread(wake_rx, core_ref, scheduled, staging))
+            .expect("spawn the jazz tick thread");
+    }
+
+    /// The staging shared with the runtime's push paths.
+    fn staging(&self) -> &Arc<InboundStaging> {
+        &self.staging
     }
 
     /// Check if a batched_tick is currently scheduled.
@@ -80,53 +125,73 @@ impl<S: Storage + Send + 'static> TokioScheduler<S> {
 
 impl<S: Storage + Send + 'static> Scheduler for TokioScheduler<S> {
     fn schedule_batched_tick(&self) {
-        // Debounce: only schedule if not already scheduled
-        if !self.scheduled.swap(true, Ordering::SeqCst) {
-            let core_ref = self.core_ref.clone();
-            let flag = self.scheduled.clone();
-
-            tokio::spawn(async move {
-                // Give bursty transports (notably WebSocket frames emitted back-to-back)
-                // one scheduler turn to enqueue related messages before the runtime drains.
-                // Without this, a large subscription burst can be observed as many
-                // one-message ticks, causing per-query result flushing and delayed
-                // tier-settled first deliveries.
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-
-                // Acquire the core lock FIRST, then clear the debounce flag
-                // immediately before running batched_tick.
-                //
-                // Clearing the flag before running the tick preserves the
-                // lost-wakeup fix: a message arriving while batched_tick
-                // executes finds scheduled=false and can schedule a follow-up.
-                //
-                // Clearing it only after acquiring the lock prevents task
-                // pileup: if we cleared earlier, every caller that arrived
-                // while this task was blocked on the mutex would see
-                // scheduled=false and spawn another task, all piling up
-                // behind the same lock. Holding the flag high until we
-                // actually own the core caps the queue at one pending tick.
-                let Some(core_arc) = core_ref.upgrade() else {
-                    // Core is permanently gone. Leave the flag high so any
-                    // stray scheduler clones (e.g. NativeTickNotifier) short-
-                    // circuit instead of spawning more doomed tasks.
-                    tracing::debug!("TokioScheduler: core dropped before tick could run; skipping");
-                    return;
-                };
-                let Ok(mut core) = core_arc.lock() else {
-                    // Mutex is poisoned but the core Arc still exists. Clear
-                    // the flag so we don't leave a stale "tick queued" signal
-                    // behind — callers are free to retry (and fail) on their
-                    // own terms.
-                    tracing::error!("TokioScheduler: core mutex poisoned; scheduler is unusable");
-                    flag.store(false, Ordering::SeqCst);
-                    return;
-                };
-                flag.store(false, Ordering::SeqCst);
-                core.batched_tick();
-            });
+        // Debounce: only wake the thread if a tick is not already queued. The flag stays
+        // high until the thread owns the core, so the queue is capped at one pending tick.
+        if !self.scheduled.swap(true, Ordering::SeqCst) && self.wake.send(()).is_err() {
+            // The thread is gone (it exits on a poisoned core mutex). The flag stays high
+            // so `flush()` fails loudly after its bounded wait instead of ticking a runtime
+            // whose mutex is poisoned.
+            if !self.wake_failed.swap(true, Ordering::SeqCst) {
+                tracing::error!(
+                    "TokioScheduler: the tick thread is gone; no further batched tick will run"
+                );
+            }
         }
     }
+}
+
+/// The tick thread's body. Runs until the wake channel closes (every scheduler clone
+/// dropped) or the core is gone.
+fn tick_thread<S: Storage + Send + 'static>(
+    wake_rx: std::sync::mpsc::Receiver<()>,
+    core_ref: Weak<Mutex<TokioCoreType<S>>>,
+    scheduled: Arc<AtomicBool>,
+    staging: Arc<InboundStaging>,
+) {
+    while wake_rx.recv().is_ok() {
+        // Give bursty transports (notably WebSocket frames emitted back-to-back) one
+        // scheduler turn to enqueue related messages before the runtime drains. Without
+        // this, a large subscription burst can be observed as many one-message ticks,
+        // causing per-query result flushing and delayed tier-settled first deliveries.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Acquire the core lock FIRST, then clear the debounce flag, then drain the
+        // staging, then tick. Clearing the flag before running the tick preserves the
+        // lost-wakeup fix: a frame arriving while batched_tick executes finds
+        // scheduled=false and wakes the thread again. Clearing it only after acquiring the
+        // lock caps the queue at one pending tick.
+        let Some(core_arc) = core_ref.upgrade() else {
+            tracing::debug!("TokioScheduler: core dropped before the tick could run; exiting");
+            return;
+        };
+        let Ok(mut core) = core_arc.lock() else {
+            // Poisoned: ticking is over for this process. The flag is left high on purpose
+            // (see `schedule_batched_tick`).
+            tracing::error!(
+                "TokioScheduler: core mutex poisoned; the tick thread exits and the runtime is unusable"
+            );
+            return;
+        };
+        scheduled.store(false, Ordering::SeqCst);
+        drain_staging_into(&staging, &mut core);
+        core.batched_tick();
+    }
+}
+
+/// Park every staged frame under the core lock the caller holds, then return the frames'
+/// permits to the budget. Shared by the tick thread and `flush()`.
+fn drain_staging_into<S: Storage + Send + 'static>(
+    staging: &InboundStaging,
+    core: &mut TokioCoreType<S>,
+) {
+    let drained = staging.drain();
+    if drained.is_empty() {
+        return;
+    }
+    let released_kib = drained.released_kib();
+    for entry in drained.into_entries() {
+        core.park_staged_sync_message(entry);
+    }
+    staging.release_permits(released_kib);
 }
 
 // Manual Clone: `S` is not stored by value — the Arc and Weak clones
@@ -136,6 +201,10 @@ impl<S: Storage + Send + 'static> Clone for TokioScheduler<S> {
         Self {
             scheduled: Arc::clone(&self.scheduled),
             core_ref: Weak::clone(&self.core_ref),
+            staging: Arc::clone(&self.staging),
+            wake: self.wake.clone(),
+            wake_rx: Arc::clone(&self.wake_rx),
+            wake_failed: Arc::clone(&self.wake_failed),
         }
     }
 }
@@ -203,6 +272,9 @@ impl From<CoreRuntimeError> for RuntimeError {
             CoreRuntimeError::QueryError(s) => RuntimeError::QueryError(s),
             CoreRuntimeError::WriteError(s) => RuntimeError::WriteError(s),
             CoreRuntimeError::NotFound => RuntimeError::NotFound,
+            CoreRuntimeError::QueryCancelled => {
+                RuntimeError::QueryError("query cancelled by its deadline".to_string())
+            }
             CoreRuntimeError::AnonymousWriteDenied { table, operation } => {
                 RuntimeError::WriteError(format!(
                     "anonymous session cannot {} on table {}",
@@ -231,8 +303,15 @@ pub struct TokioRuntime<S: Storage + Send + 'static> {
     /// Stored here so `connect()` can build a `NativeTickNotifier` without locking.
     scheduler: TokioScheduler<S>,
 }
-
-// Manual Clone impl — only needs Arc::clone, not S: Clone
+impl<S: Storage + Send + 'static> TokioRuntime<S> {
+    /// Test hook: look at the core under its lock. For black-box gates that need a
+    /// server-side count no wire message reports (e.g. admitted registrations).
+    #[cfg(any(test, feature = "test"))]
+    pub fn inspect_core_for_test<R>(&self, inspect: impl FnOnce(&TokioCoreType<S>) -> R) -> R {
+        let core = self.core.lock().expect("core lock");
+        inspect(&core)
+    }
+} // Manual Clone impl — only needs Arc::clone, not S: Clone
 impl<S: Storage + Send + 'static> Clone for TokioRuntime<S> {
     fn clone(&self) -> Self {
         Self {
@@ -254,7 +333,25 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
     where
         F: Fn(OutboxEntry) + Send + Sync + 'static,
     {
-        let scheduler = TokioScheduler::new();
+        Self::new_with_staging(
+            schema_manager,
+            storage,
+            sync_callback,
+            StagingConfig::from_env(),
+        )
+    }
+
+    /// `new` with explicit staging and budget knobs (the server builder's override).
+    pub fn new_with_staging<F>(
+        schema_manager: SchemaManager,
+        storage: S,
+        sync_callback: F,
+        staging: StagingConfig,
+    ) -> Self
+    where
+        F: Fn(OutboxEntry) + Send + Sync + 'static,
+    {
+        let scheduler = TokioScheduler::new(staging);
         let sync_sender = CallbackSyncSender::new(sync_callback);
 
         // Create RuntimeCore
@@ -428,6 +525,21 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
     pub async fn flush(&self) -> Result<(), RuntimeError> {
         let mut attempts = 0;
         loop {
+            // v18 item 4: a store that lost writes never flushes again until it is reopened;
+            // say so at once, on every call, instead of ticking 200 times toward a barrier
+            // that cannot succeed. Deliberate consequence (diff r21 SF3): the guard is the
+            // FIRST statement of the loop, so on a lost store `flush()` no longer runs the
+            // pending batched tick at all — a shutdown path that used `flush()` to drain
+            // outbound sync loses that drain. The store cannot persist; draining it would
+            // write nothing.
+            {
+                let core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
+                if let Some(error) = core.lost_writes() {
+                    return Err(RuntimeError::WriteError(format!(
+                        "storage flush or read-pass commit failed: {error}"
+                    )));
+                }
+            }
             // Wait for any scheduled batched_tick to complete
             loop {
                 let is_scheduled = {
@@ -456,9 +568,10 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
                     && let Some(error) = core.take_storage_flush_error()
                 {
                     return Err(RuntimeError::WriteError(format!(
-                        "storage WAL flush failed: {error}"
+                        "storage flush or read-pass commit failed: {error}"
                     )));
                 }
+                drain_staging_into(self.scheduler.staging(), &mut core);
                 core.batched_tick();
                 core.has_outbound()
                     || core.scheduler().is_scheduled()
@@ -478,7 +591,7 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
         if let Some(error) = core.take_storage_flush_error() {
             return Err(RuntimeError::WriteError(format!(
-                "storage WAL flush failed: {error}"
+                "storage flush or read-pass commit failed: {error}"
             )));
         }
         if core.has_storage_write_pending_flush() {
@@ -535,6 +648,9 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
     }
 
     /// Unsubscribe from a query.
+    ///
+    /// The core schedules a batched tick to send the unsubscription upstream; the tick runs
+    /// on the `jazz-tick` thread, so no runtime context is needed here.
     pub fn unsubscribe(&self, handle: SubscriptionHandle) -> Result<(), RuntimeError> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
         core.unsubscribe(handle);
@@ -564,15 +680,81 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         Ok(())
     }
 
-    /// Push a sync message with an explicit stream sequence (from network).
-    pub fn push_sync_inbox_with_sequence(
+    /// v18 item 3: stage a client's decoded frame outside the engine lock. Returns
+    /// `Staged` (a tick is scheduled) or `Backpressure` with the entries, the permit and a
+    /// waiter guard; the caller waits on the guard and retries with
+    /// `stage_sync_inbox_with_waiter`.
+    pub fn stage_sync_inbox(
         &self,
-        entry: InboxEntry,
-        sequence: u64,
-    ) -> Result<(), RuntimeError> {
-        let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
-        core.park_sync_message_with_sequence(entry, sequence);
-        Ok(())
+        client_id: ClientId,
+        entries: Vec<InboxEntry>,
+        bytes: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> StagePush {
+        let outcome = self
+            .scheduler
+            .staging()
+            .push(client_id, entries, bytes, permit);
+        if matches!(outcome, StagePush::Staged) {
+            self.scheduler.schedule_batched_tick();
+        }
+        outcome
+    }
+
+    /// The retry of a refused `stage_sync_inbox`.
+    pub fn stage_sync_inbox_with_waiter(
+        &self,
+        waiter: WaiterGuard,
+        client_id: ClientId,
+        entries: Vec<InboxEntry>,
+        bytes: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> StagePush {
+        let outcome = self
+            .scheduler
+            .staging()
+            .push_with(waiter, client_id, entries, bytes, permit);
+        if matches!(outcome, StagePush::Staged) {
+            self.scheduler.schedule_batched_tick();
+        }
+        outcome
+    }
+
+    /// The exit path of a socket that still holds an admitted frame: staged regardless of
+    /// the caps, then a tick is scheduled.
+    pub fn stage_sync_inbox_uncapped(
+        &self,
+        waiter: Option<WaiterGuard>,
+        client_id: ClientId,
+        entries: Vec<InboxEntry>,
+        bytes: usize,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        self.scheduler
+            .staging()
+            .push_uncapped(waiter, client_id, entries, bytes, permit);
+        self.scheduler.schedule_batched_tick();
+    }
+
+    /// The in-flight decoded-bytes budget (KiB permits) a socket acquires before decoding.
+    pub fn inflight_budget(&self) -> Arc<tokio::sync::Semaphore> {
+        self.scheduler.staging().budget()
+    }
+    pub fn staging_config(&self) -> StagingConfig {
+        self.scheduler.staging().config().clone()
+    }
+
+    /// Per-client staging counters. Internal on purpose: gates for the staging's own
+    /// accounting, which no client API exposes.
+    #[cfg(any(test, feature = "test"))]
+    pub fn staging_stats_for_test(&self, client_id: ClientId) -> ClientStagingStats {
+        self.scheduler.staging().stats(client_id)
+    }
+
+    /// Clients with a live staging entry (staged or waiting). Internal on purpose.
+    #[cfg(any(test, feature = "test"))]
+    pub fn staging_live_clients_for_test(&self) -> usize {
+        self.scheduler.staging().live_clients()
     }
 
     /// Set the next expected stream sequence for a server.
@@ -716,6 +898,17 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
     /// Returns `Ok(true)` if removed, `Ok(false)` if skipped due to
     /// unprocessed inbox entries (caller should retry later).
     pub fn remove_client(&self, client_id: ClientId) -> Result<bool, RuntimeError> {
+        // A client with a staged frame or a paused socket is not gone: its entries have not
+        // been parked yet, and removing it now would make the drain log them as "unknown
+        // client". This takes and releases the STAGING lock, before the core lock and never
+        // under it — so the two are not atomic and this line alone does not enforce that
+        // invariant. What enforces it is the ordering at both ends: the socket-exit path stages
+        // its held frame BEFORE `ws_cleanup` inserts the reap candidate (`websocket.rs`), and
+        // the sweep re-checks `has_connection` immediately before reaping (`server/mod.rs`).
+        // This check is the cheap early out for the common case, not the guarantee.
+        if self.scheduler.staging().blocks_removal(client_id) {
+            return Ok(false);
+        }
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
         Ok(core.remove_client(client_id))
     }
@@ -1094,6 +1287,47 @@ mod tests {
         assert!(
             flush_wal_calls <= 2,
             "persistent WAL flush failures should not be retried in a tight loop, got {flush_wal_calls} attempts"
+        );
+    }
+
+    /// G-C15. Once the store has lost writes, every later `flush()` returns THAT error at
+    /// once — no 200-attempt spin, no ticks, and not the generic "storage WAL flush did not
+    /// complete" the spin ends with. A flush is an explicit ask and deserves the true answer;
+    /// the tick path stays once-only (G-C14), because a tick is a timer.
+    ///
+    /// Internal on purpose: the assertion is about how many `flush_wal` calls the spin made,
+    /// which only the injected store counts.
+    #[tokio::test]
+    async fn flush_after_a_lost_write_returns_the_loss_without_spinning() {
+        let schema = test_schema();
+        let app_id = AppId::from_name("test-wal-lost-writes");
+        let sync_manager = SyncManager::new();
+        let schema_manager =
+            SchemaManager::new(sync_manager, schema, app_id, "dev", "main").unwrap();
+        let storage = MemoryStorage::new().with_flush_wal_error(StorageError::LostWrites {
+            detail: "the write transaction was ended behind the store's back".to_string(),
+        });
+        let runtime = TokioRuntime::new(schema_manager, storage, |_| {});
+        runtime
+            .insert("users", user_insert_values(ObjectId::new(), "Alice"), None)
+            .unwrap();
+        for attempt in 1..=3 {
+            let error = runtime
+                .flush()
+                .await
+                .expect_err("a store that lost writes can never flush");
+            assert!(
+                error.to_string().contains("ended behind the store's back"),
+                "attempt {attempt}: the flush must carry the loss itself, got: {error}"
+            );
+        }
+        let flush_wal_calls = runtime
+            .with_storage(|storage| storage.flush_wal_call_count())
+            .expect("inspect storage calls");
+        assert!(
+            flush_wal_calls <= 2,
+            "a lost store must not be flushed again on every call, got {flush_wal_calls} \
+             attempts across three flushes"
         );
     }
 

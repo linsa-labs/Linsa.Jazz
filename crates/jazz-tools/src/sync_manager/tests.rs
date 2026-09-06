@@ -441,6 +441,8 @@ fn push_query_subscription(
     sm.take_pending_query_subscriptions()
 }
 
+mod admission;
+
 /// On client reconnect, the client replays its entire OPFS row history to the
 /// server as `RowBatchCreated`, including rows originally authored by *other*
 /// users. If the server re-runs permission checks classifying these as

@@ -194,3 +194,62 @@ fn rc_batched_tick_skips_flush_wal_for_query_settled_only_message() {
         "query-settled notifications alone should not flush the WAL"
     );
 }
+
+/// G-C14. A `LostWrites` is reported to the host EXACTLY ONCE, and it does not re-arm the
+/// barrier. Every other storage error keeps today's behaviour: overwrite the carrier on each
+/// occurrence and schedule a retry. The distinction is the point — a transient failure is
+/// worth retrying, a store that cannot persist is not, and a host that is told about it on
+/// every tick forever cannot tell the two apart.
+///
+/// Three writes and three barriers, each of which fails: the host sees the loss on the first
+/// and nothing after it, while the core's own latch stays set.
+///
+/// Internal on purpose: the carrier, the latch and the scheduler count are internal, and the
+/// injected failure has no public route — `MemoryStorage`'s failure hooks are `#[cfg(test)]`.
+#[test]
+fn rc_a_lost_writes_barrier_failure_is_reported_once_and_does_not_rearm() {
+    let detail = "the write transaction was ended behind the store's back".to_string();
+    let scheduler = CountingScheduler::default();
+    let app_id = AppId::from_name("row-lost-writes-once");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let storage = MemoryStorage::new().with_transient_flush_wal_failures(
+        StorageError::LostWrites {
+            detail: detail.clone(),
+        },
+        3,
+    );
+    let mut core = new_test_core(schema_manager, storage, scheduler.clone());
+
+    for tick in 1..=3 {
+        core.insert("users", user_insert_values(ObjectId::new(), "Alice"), None)
+            .unwrap();
+        let scheduled_after_write = scheduler.schedule_count();
+
+        core.batched_tick();
+
+        let taken = core.take_storage_flush_error();
+        if tick == 1 {
+            assert!(
+                matches!(taken, Some(StorageError::LostWrites { .. })),
+                "the first lost-writes barrier must hand the host the loss, got {taken:?}"
+            );
+        } else {
+            assert!(
+                taken.is_none(),
+                "tick {tick}: a store that already reported its loss must not report it \
+                 again; the host cannot distinguish that from a fresh failure"
+            );
+        }
+        assert!(
+            core.lost_writes_barrier_reported_for_test(),
+            "tick {tick}: the core's own latch must stay set once the barrier reported"
+        );
+        assert_eq!(
+            scheduler.schedule_count(),
+            scheduled_after_write,
+            "tick {tick}: a lost-writes barrier must not schedule a retry — the retry cannot \
+             succeed, and the tick it costs is paid under the core lock"
+        );
+    }
+}

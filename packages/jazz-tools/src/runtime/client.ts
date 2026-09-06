@@ -153,6 +153,14 @@ export interface QueryExecutionOptions {
   localUpdates?: LocalUpdatesMode;
   propagation?: QueryPropagation;
   visibility?: QueryVisibility;
+  /**
+   * Deadline for a one-shot read (`query`, `db.all`, `db.one`), in milliseconds. When it
+   * elapses the native runtime rejects the read AND cancels it inside the engine (its
+   * temporary subscription is released and the server is told), so an abandoned read stops
+   * costing settle passes. Must be a positive finite number. Ignored by the wasm and
+   * React Native runtimes, and by `subscribe()` (a subscription has no deadline).
+   */
+  timeoutMs?: number;
 }
 
 type InternalQueryExecutionOptions = QueryExecutionOptions & {
@@ -165,6 +173,7 @@ export interface ResolvedQueryExecutionOptions {
   localUpdates: LocalUpdatesMode;
   propagation: QueryPropagation;
   visibility: QueryVisibility;
+  timeoutMs?: number;
 }
 
 type ResolvedInternalQueryExecutionOptions = ResolvedQueryExecutionOptions & {
@@ -302,12 +311,16 @@ export function resolveEffectiveQueryExecutionOptions(
   context: QueryExecutionDefaultsContext,
   options?: QueryExecutionOptions,
 ): ResolvedQueryExecutionOptions {
-  return {
+  const resolved: ResolvedQueryExecutionOptions = {
     tier: options?.tier ?? resolveDefaultDurabilityTier(context),
     localUpdates: options?.localUpdates ?? "immediate",
     propagation: options?.propagation ?? "full",
     visibility: options?.visibility ?? "public",
   };
+  if (options?.timeoutMs !== undefined) {
+    resolved.timeoutMs = options.timeoutMs;
+  }
+  return resolved;
 }
 
 function resolveQueryJson(query: string | QueryInput): string {
@@ -365,6 +378,7 @@ function encodeQueryExecutionOptions(options: InternalQueryExecutionOptions): st
     propagation?: QueryPropagation;
     local_updates?: LocalUpdatesMode;
     transaction_batch_id?: string;
+    timeout_ms?: number;
   } = {};
   if ((options.propagation ?? "full") !== "full") {
     payload.propagation = options.propagation;
@@ -375,8 +389,21 @@ function encodeQueryExecutionOptions(options: InternalQueryExecutionOptions): st
   if (options.transactionBatchId) {
     payload.transaction_batch_id = options.transactionBatchId;
   }
+  if (options.timeoutMs !== undefined) {
+    if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+      throw new RangeError(
+        `timeoutMs must be a positive finite number of milliseconds, got ${String(options.timeoutMs)}`,
+      );
+    }
+    payload.timeout_ms = Math.ceil(options.timeoutMs);
+  }
 
-  if (!payload.propagation && !payload.local_updates && !payload.transaction_batch_id) {
+  if (
+    !payload.propagation &&
+    !payload.local_updates &&
+    !payload.transaction_batch_id &&
+    payload.timeout_ms === undefined
+  ) {
     return undefined;
   }
 

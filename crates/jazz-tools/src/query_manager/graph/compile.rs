@@ -559,9 +559,24 @@ impl QueryGraph {
         // Settle-cost accounting: the innermost compile, so nested include
         // plans are counted individually.
         crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::PLAN_COMPILES);
-        // Build branch -> schema hash map for column translation.
-        // Use full hashes from SchemaContext (do not re-parse branch strings, which only encode
-        // a shortened hash prefix).
+        let branch_schema_map = Self::branch_schema_map_for_shared_context(schema_context);
+        Self::compile_execution_plan_with_branch_map(
+            plan,
+            schema,
+            session,
+            schema_context,
+            row_policy_mode,
+            &branch_schema_map,
+        )
+    }
+
+    /// Branch -> schema hash map for column translation, from the full hashes in the
+    /// `SchemaContext` (branch strings only encode a shortened hash prefix). A function of
+    /// the context alone; v18 item 7 builds it once per subquery template instead of once
+    /// per instance (§ Symptom: 12.6 % of the compile).
+    pub(crate) fn branch_schema_map_for_shared_context(
+        schema_context: &Arc<SchemaContext>,
+    ) -> HashMap<String, SchemaHash> {
         let mut branch_schema_map: HashMap<String, SchemaHash> = HashMap::new();
         for schema_hash in schema_context.all_live_hashes() {
             let branch_name = ComposedBranchName::new(
@@ -572,7 +587,18 @@ impl QueryGraph {
             .to_branch_name();
             branch_schema_map.insert(branch_name.as_str().to_string(), schema_hash);
         }
+        branch_schema_map
+    }
 
+    /// The compile proper, with the branch map supplied by the caller (v18 item 7).
+    pub(crate) fn compile_execution_plan_with_branch_map(
+        plan: &ExecutionQueryPlan,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+        branch_schema_map: &HashMap<String, SchemaHash>,
+    ) -> Option<Self> {
         // Expand branches to include all live schema branches if not specified
         let branches: Vec<String> = if plan.branches.is_empty() {
             schema_context
@@ -592,6 +618,7 @@ impl QueryGraph {
                 session.clone(),
                 schema_context,
                 row_policy_mode,
+                branch_schema_map,
             );
         }
 
@@ -1004,6 +1031,26 @@ impl QueryGraph {
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
     ) -> Result<Self, QueryCompileError> {
+        let plan = Self::lower_query_with_schema_context_shared(query, schema, schema_context)?;
+        Self::compile_plan_with_schema_context_shared(
+            &plan,
+            schema,
+            session,
+            schema_context,
+            row_policy_mode,
+        )
+    }
+
+    /// v18 item 7: the value-independent half of a compile — the relation IR lowered to an
+    /// execution plan, with the table and descriptor checks that need only the schema.
+    /// `SubgraphTemplate` runs this once per template and binds the correlation value into
+    /// the plan per instance; `try_compile_with_schema_context_shared` is this followed by
+    /// `compile_plan_with_schema_context_shared`.
+    pub(crate) fn lower_query_with_schema_context_shared(
+        query: &Query,
+        schema: &Arc<Schema>,
+        schema_context: &Arc<SchemaContext>,
+    ) -> Result<ExecutionQueryPlan, QueryCompileError> {
         let branches: Vec<String> = if query.branches.is_empty() {
             schema_context
                 .all_branch_names()
@@ -1030,13 +1077,47 @@ impl QueryGraph {
         })?;
 
         validate_execution_plan(&plan, schema.as_ref())?;
+        Ok(plan)
+    }
 
-        Self::compile_execution_plan_with_schema_context_shared(
-            &plan,
+    /// v18 item 7: the value-dependent half — a lowered plan compiled into a graph. Counted
+    /// per call in `settle_cost::PLAN_COMPILES` (the control for `SHAPE_LOWERINGS`).
+    pub(crate) fn compile_plan_with_schema_context_shared(
+        plan: &ExecutionQueryPlan,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+    ) -> Result<Self, QueryCompileError> {
+        let branch_schema_map = Self::branch_schema_map_for_shared_context(schema_context);
+        Self::compile_plan_with_branch_map(
+            plan,
             schema,
             session,
             schema_context,
             row_policy_mode,
+            &branch_schema_map,
+        )
+    }
+
+    /// v18 item 7: the compile with a caller-owned branch map (built once per template).
+    /// Counted per call in `settle_cost::PLAN_COMPILES` (the control for `SHAPE_LOWERINGS`).
+    pub(crate) fn compile_plan_with_branch_map(
+        plan: &ExecutionQueryPlan,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+        branch_schema_map: &HashMap<String, SchemaHash>,
+    ) -> Result<Self, QueryCompileError> {
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::PLAN_COMPILES);
+        Self::compile_execution_plan_with_branch_map(
+            plan,
+            schema,
+            session,
+            schema_context,
+            row_policy_mode,
+            branch_schema_map,
         )
         .ok_or_else(|| {
             QueryCompileError::InvalidPlan(
@@ -1339,18 +1420,11 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
+        // v18 item 7: the caller's branch -> schema-hash map (cached per template for a
+        // subgraph instance, built once per compile otherwise) — join-shaped plans no longer
+        // rebuild it per call.
+        branch_schema_map: &HashMap<String, SchemaHash>,
     ) -> Option<Self> {
-        let mut branch_schema_map: HashMap<String, SchemaHash> = HashMap::new();
-        for schema_hash in schema_context.all_live_hashes() {
-            let branch_name = ComposedBranchName::new(
-                &schema_context.env,
-                schema_hash,
-                &schema_context.user_branch,
-            )
-            .to_branch_name();
-            branch_schema_map.insert(branch_name.as_str().to_string(), schema_hash);
-        }
-
         let base_table_schema = schema.get(&plan.table)?;
         let base_descriptor = base_table_schema.columns.clone();
         let mut graph = QueryGraph::new(plan.table, base_descriptor.clone());

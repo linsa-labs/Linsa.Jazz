@@ -17,58 +17,15 @@
 //! `SqliteStorage`, because `MemoryStorage` keeps visible entries as structs and never
 //! executes the ladder at all.
 
+use super::support::{docs_v1, docs_v2, runtime_over};
 use super::*;
 use crate::storage::SqliteStorage;
-
-fn docs_v1() -> Schema {
-    SchemaBuilder::new()
-        .table(
-            TableSchema::builder("docs")
-                .column("owner", ColumnType::Text)
-                .column("body", ColumnType::Text),
-        )
-        .build()
-}
-
-fn docs_v2() -> Schema {
-    SchemaBuilder::new()
-        .table(
-            TableSchema::builder("docs")
-                .column("owner", ColumnType::Text)
-                .column("body", ColumnType::Text),
-        )
-        .table(TableSchema::builder("tags").column("label", ColumnType::Text))
-        .build()
-}
-
-fn runtime_over(
-    schema: Schema,
-    app_name: &str,
-    storage: SqliteStorage,
-) -> RuntimeCore<SqliteStorage, NoopScheduler> {
-    let app_id = AppId::from_name(app_name);
-    let mut schema_manager =
-        SchemaManager::new(SyncManager::new(), schema, app_id, "dev", "main").unwrap();
-    crate::schema_manager::rehydrate_schema_manager_from_catalogue(
-        &mut schema_manager,
-        &storage,
-        app_id,
-    )
-    .expect("rehydrate from the persisted catalogue");
-    let mut core = new_test_core(schema_manager, storage, NoopScheduler);
-    core.immediate_tick();
-    core
-}
-
-fn recoveries() -> u64 {
-    crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES
-        .load(std::sync::atomic::Ordering::Relaxed)
+/// Ladder walks this store served (per store since v18 item 5; see `locator_warmth.rs`).
+fn recoveries(core: &RuntimeCore<SqliteStorage, NoopScheduler>) -> u64 {
+    core.storage().visible_ladder_recoveries_for_test()
 }
 
 #[test]
-#[ignore = "open defect: the locator ladder recovers a split row on every read \
-            and never writes the exact locator back, so the walk repeats forever. Every \
-            consumer of the fallback is on a write path."]
 fn a_split_row_is_walked_once_and_then_healed() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let path = dir.path().join("heal.sqlite");
@@ -110,12 +67,12 @@ fn a_split_row_is_walked_once_and_then_healed() {
     core.immediate_tick();
 
     // First read: the ladder is allowed to fire — that is what it is for.
-    let before = recoveries();
+    let before = recoveries(&core);
     let first = core
         .storage()
         .load_visible_region_row("docs", branch_a.as_str(), row_id)
         .expect("visible row readable");
-    let after_first = recoveries();
+    let after_first = recoveries(&core);
     assert!(
         first.is_some(),
         "fixture precondition: branch A must still serve a head for the row, else there is \
@@ -133,8 +90,7 @@ fn a_split_row_is_walked_once_and_then_healed() {
         .storage()
         .load_visible_region_row("docs", branch_a.as_str(), row_id)
         .expect("visible row readable");
-    let after_second = recoveries();
-
+    let after_second = recoveries(&core);
     eprintln!(
         "ladder walks: first read {}, second read {}",
         after_first - before,

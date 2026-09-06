@@ -19,7 +19,7 @@ pub enum OutputMode {
 }
 
 /// Query subscription identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct QuerySubscriptionId(pub u64);
 
 /// Output node - terminal node that delivers results to subscribers.

@@ -10,7 +10,12 @@ use std::time::Duration;
 
 pub const SYNC_PROTOCOL_VERSION: u32 = 3;
 const MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME: usize = 256;
-
+/// v18 item 3: encoded payload bytes a client puts in one frame. The server bounds the
+/// DECODED size of a client frame (`JAZZ_MAX_WS_DECODED_FRAME_BYTES`, 288 MiB by default for
+/// old clients that coalesced 256 file parts of 1 MiB); a client built with this split never
+/// approaches it. A single payload larger than this goes alone in its own frame; it is never
+/// held back.
+pub(crate) const MAX_OUTBOUND_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub trait TickNotifier: 'static {
     fn notify(&self);
 }
@@ -452,6 +457,9 @@ pub struct TransportManager<W: StreamAdapter, T: TickNotifier> {
     pub url: String,
     pub auth: AuthConfig,
     outbox_rx: mpsc::UnboundedReceiver<OutboxEntry>,
+    /// An outbox entry taken from the channel that did not fit the frame being built; it
+    /// opens the next frame.
+    held_outbound: Option<OutboxEntry>,
     inbound_tx: mpsc::UnboundedSender<TransportInbound>,
     pub tick: T,
     reconnect: ReconnectState,
@@ -520,6 +528,7 @@ pub fn create_with_retry_config<W: StreamAdapter, T: TickNotifier>(
         url,
         auth,
         outbox_rx,
+        held_outbound: None,
         inbound_tx,
         tick,
         reconnect: ReconnectState::new(),
@@ -552,10 +561,51 @@ pub(crate) fn frame_decode(data: &[u8]) -> Option<Vec<u8>> {
     frame_decode_capped(data, usize::MAX)
 }
 
-/// Decode a frame, rejecting one whose LZ4 header declares an uncompressed size
-/// larger than `max_decompressed` — used on the pre-auth handshake path so a
-/// decompression bomb can't be expanded before the peer is authenticated.
-pub(crate) fn frame_decode_capped(data: &[u8], max_decompressed: usize) -> Option<Vec<u8>> {
+/// Collect the payloads of one outbound frame. `first` opens the frame; `next` yields the
+/// entries behind it (the held-back one first, then the channel) until it returns `None`.
+/// The frame closes at `MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME` payloads or when the next
+/// entry would push the encoded size over `MAX_OUTBOUND_FRAME_BYTES`; that entry is
+/// returned so the caller holds it back for the next frame. A single payload over the cap
+/// still travels alone: the split never drops, duplicates or reorders an entry. Residual:
+/// one payload over the SERVER's decoded cap (a `Value` the engine allows but the wire
+/// refuses) is refused by name on every reconnect and replays forever — the split cannot
+/// halve a single value; that needs a protocol change (backlog).
+fn collect_outbound_frame(
+    first: SyncPayload,
+    mut next: impl FnMut() -> Option<OutboxEntry>,
+) -> (Vec<SyncPayload>, Option<OutboxEntry>) {
+    let mut payloads = Vec::with_capacity(MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME);
+    let mut bytes = encoded_payload_size(&first);
+    payloads.push(first);
+    while payloads.len() < MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME {
+        let Some(entry) = next() else { break };
+        let size = encoded_payload_size(&entry.payload);
+        if bytes + size > MAX_OUTBOUND_FRAME_BYTES {
+            return (payloads, Some(entry));
+        }
+        bytes += size;
+        payloads.push(entry.payload);
+    }
+    (payloads, None)
+}
+
+/// The size a payload takes on the wire inside a batch frame (postcard, before lz4). Used
+/// by the client split; a payload that fails to size is treated as empty (it will fail to
+/// encode later on the same path it does today). Residual: for such a payload the
+/// client-side cap is advisory — none exists today, every variant is sizeable.
+fn encoded_payload_size(payload: &SyncPayload) -> usize {
+    postcard::experimental::serialized_size(payload).unwrap_or(0)
+}
+
+/// The decoded size a frame's lz4 header declares, read before any allocation. `None` for
+/// a frame too short to carry the two length prefixes.
+pub(crate) fn frame_declared_size(data: &[u8]) -> Option<usize> {
+    let compressed = frame_compressed_body(data)?;
+    Some(u32::from_le_bytes(compressed[0..4].try_into().unwrap()) as usize)
+}
+
+/// The lz4 block (with its size prefix) inside a frame.
+fn frame_compressed_body(data: &[u8]) -> Option<&[u8]> {
     if data.len() < 4 {
         return None;
     }
@@ -567,13 +617,28 @@ pub(crate) fn frame_decode_capped(data: &[u8], max_decompressed: usize) -> Optio
     if compressed.len() < 4 {
         return None;
     }
+    Some(compressed)
+}
+
+/// Decode a frame whose declared size the caller has already checked and charged. The
+/// caller compares the result's length with the declaration (a lying header is a malformed
+/// frame).
+pub(crate) fn frame_decode_body(data: &[u8]) -> Option<Vec<u8>> {
+    let compressed = frame_compressed_body(data)?;
+    lz4_flex::decompress_size_prepended(compressed).ok()
+}
+
+/// Decode a frame, rejecting one whose LZ4 header declares an uncompressed size
+/// larger than `max_decompressed` — used on the pre-auth handshake path so a
+/// decompression bomb can't be expanded before the peer is authenticated.
+pub(crate) fn frame_decode_capped(data: &[u8], max_decompressed: usize) -> Option<Vec<u8>> {
     // lz4_flex prepends the uncompressed size as a little-endian u32. Reject an
     // oversized declaration before it can size the output buffer.
-    let declared = u32::from_le_bytes(compressed[0..4].try_into().unwrap()) as usize;
+    let declared = frame_declared_size(data)?;
     if declared > max_decompressed {
         return None;
     }
-    lz4_flex::decompress_size_prepended(compressed).ok()
+    frame_decode_body(data)
 }
 
 /// Outcome of the auth handshake.
@@ -629,21 +694,23 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
     }
 
     fn drain_outbound_payload_batch(&mut self, first: OutboxEntry) -> Vec<SyncPayload> {
-        self.trace_outbound_payload(&first.payload);
-        let mut payloads = Vec::with_capacity(MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME);
-        payloads.push(first.payload);
-
-        while payloads.len() < MAX_OUTBOUND_SYNC_PAYLOADS_PER_FRAME {
-            match self.outbox_rx.try_recv() {
-                Ok(entry) => {
-                    self.trace_outbound_payload(&entry.payload);
-                    payloads.push(entry.payload);
-                }
-                Err(_) => break,
-            }
+        let held = &mut self.held_outbound;
+        let rx = &mut self.outbox_rx;
+        let (payloads, overflow) =
+            collect_outbound_frame(first.payload, || held.take().or_else(|| rx.try_recv().ok()));
+        // Opens the next frame; the loops take it before they wait on the channel.
+        self.held_outbound = overflow;
+        for payload in &payloads {
+            self.trace_outbound_payload(payload);
         }
 
         payloads
+    }
+
+    /// The entry a previous frame could not fit, if any. The loops take it before they
+    /// wait on the outbox channel, so a held-back entry never waits for the next write.
+    fn take_held_outbound(&mut self) -> Option<OutboxEntry> {
+        self.held_outbound.take()
     }
 
     fn encode_outbound_payload_batch(&self, payloads: Vec<SyncPayload>) -> Option<Vec<u8>> {
@@ -1067,11 +1134,24 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
     async fn run_connected(&mut self, ws: &mut W) -> ConnectedExit {
         use futures::StreamExt as _;
         loop {
+            // A held-back entry (the one the previous frame could not fit) opens the next
+            // frame: the outbox arm is disabled while one is held so the order stays FIFO,
+            // and the held arm is one arm among the others, so a long outbound backlog
+            // (a 100 MB video, ~64 frames) still lets inbound and control through between
+            // frames.
+            let held = self.held_outbound.is_some();
             tokio::select! {
-                out = self.outbox_rx.next() => {
+                out = self.outbox_rx.next(), if !held => {
                     // outbox closed = handle dropped; control_rx will also return None shortly.
                     // Route to Shutdown so the same clean-exit path is taken.
                     let Some(entry) = out else { return ConnectedExit::Shutdown; };
+                    let payloads = self.drain_outbound_payload_batch(entry);
+                    let Some(bytes) = self.encode_outbound_payload_batch(payloads) else { continue; };
+                    let frame = frame_encode(&bytes);
+                    if ws.send(&frame).await.is_err() { return ConnectedExit::NetworkError; }
+                }
+                _ = std::future::ready(()), if held => {
+                    let Some(entry) = self.take_held_outbound() else { continue; };
                     let payloads = self.drain_outbound_payload_batch(entry);
                     let Some(bytes) = self.encode_outbound_payload_batch(payloads) else { continue; };
                     let frame = frame_encode(&bytes);
@@ -1256,11 +1336,37 @@ impl<W: StreamAdapter + 'static, T: TickNotifier + 'static> TransportManager<W, 
     async fn wasm_run_connected(&mut self, ws: &mut W) -> WasmConnectedExit {
         use futures::{FutureExt as _, StreamExt as _};
         loop {
+            // See the tokio loop: the held-back entry is an arm, the outbox arm sleeps while
+            // one is held, so inbound and control are polled between the frames of a
+            // backlog. `futures::select!` has no preconditions, so the two arms swap a
+            // pending future in and out.
+            let held = self.held_outbound.is_some();
+            let mut held_ready = if held {
+                futures::future::Either::Left(futures::future::ready(()))
+            } else {
+                futures::future::Either::Right(futures::future::pending::<()>())
+            }
+            .fuse();
+            let mut out_next = if held {
+                futures::future::Either::Left(futures::future::pending::<Option<OutboxEntry>>())
+            } else {
+                futures::future::Either::Right(self.outbox_rx.next())
+            }
+            .fuse();
             futures::select! {
-                out = self.outbox_rx.next().fuse() => {
+                out = out_next => {
                     // outbox closed = handle dropped; control_rx will also return None shortly.
                     // Route to Shutdown so the same clean-exit path is taken.
                     let Some(entry) = out else { return WasmConnectedExit::Shutdown; };
+                    drop(held_ready);
+                    let payloads = self.drain_outbound_payload_batch(entry);
+                    let Some(bytes) = self.encode_outbound_payload_batch(payloads) else { continue; };
+                    let frame = frame_encode(&bytes);
+                    if ws.send(&frame).await.is_err() { return WasmConnectedExit::NetworkError; }
+                }
+                _ = held_ready => {
+                    drop(out_next);
+                    let Some(entry) = self.take_held_outbound() else { continue; };
                     let payloads = self.drain_outbound_payload_batch(entry);
                     let Some(bytes) = self.encode_outbound_payload_batch(payloads) else { continue; };
                     let frame = frame_encode(&bytes);
@@ -1296,6 +1402,74 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+    #[test]
+    fn five_near_mebibyte_payloads_drain_as_two_frames_in_order() {
+        // G-split (v18 item 3). Internal on purpose: the boundary a client draws between
+        // two outbound frames is not observable through a public builder — the server
+        // re-batches on its side — and the split is a pure function of the outbox order and
+        // the payloads' encoded sizes, so it is tested as that function.
+        use crate::query_manager::types::SchemaHash;
+        use crate::sync_manager::types::{Destination, QueryId, SchemaWarning, ServerId};
+
+        let just_under_a_mebibyte = |id: u64| {
+            SyncPayload::SchemaWarning(SchemaWarning {
+                query_id: QueryId(id),
+                table_name: "x".repeat((1 << 20) - 1024),
+                row_count: 0,
+                from_hash: SchemaHash::from_bytes([0u8; 32]),
+                to_hash: SchemaHash::from_bytes([1u8; 32]),
+            })
+        };
+        let tag = |payload: &SyncPayload| match payload {
+            SyncPayload::SchemaWarning(warning) => warning.query_id.0,
+            other => panic!("unexpected payload {other:?}"),
+        };
+        let mut queue: VecDeque<OutboxEntry> = (1..=4)
+            .map(|id| OutboxEntry {
+                destination: Destination::Server(ServerId::new()),
+                payload: just_under_a_mebibyte(id),
+            })
+            .collect();
+
+        let (first, overflow) =
+            collect_outbound_frame(just_under_a_mebibyte(0), || queue.pop_front());
+        let first_bytes: usize = first.iter().map(encoded_payload_size).sum();
+        assert!(
+            first_bytes <= MAX_OUTBOUND_FRAME_BYTES,
+            "the first frame encodes to {first_bytes} bytes, over the {MAX_OUTBOUND_FRAME_BYTES} cap"
+        );
+        assert_eq!(
+            first.iter().map(tag).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "four payloads fit under the cap, in outbox order"
+        );
+        let overflow = overflow.expect("the fifth payload opens the next frame");
+        assert_eq!(tag(&overflow.payload), 4);
+        assert!(queue.is_empty(), "the split took every entry it could see");
+
+        let (second, overflow) = collect_outbound_frame(overflow.payload, || queue.pop_front());
+        assert_eq!(second.iter().map(tag).collect::<Vec<_>>(), vec![4]);
+        assert!(overflow.is_none());
+
+        // A single payload over the cap still travels, alone, and the next opens a new frame.
+        let five_mebibytes = SyncPayload::SchemaWarning(SchemaWarning {
+            query_id: QueryId(99),
+            table_name: "y".repeat(5 << 20),
+            row_count: 0,
+            from_hash: SchemaHash::from_bytes([0u8; 32]),
+            to_hash: SchemaHash::from_bytes([1u8; 32]),
+        });
+        let mut queue: VecDeque<OutboxEntry> = VecDeque::from([OutboxEntry {
+            destination: Destination::Server(ServerId::new()),
+            payload: just_under_a_mebibyte(100),
+        }]);
+        let (alone, overflow) = collect_outbound_frame(five_mebibytes, || queue.pop_front());
+        assert_eq!(alone.iter().map(tag).collect::<Vec<_>>(), vec![99]);
+        assert_eq!(
+            tag(&overflow.expect("the next payload is held back").payload),
+            100
+        );
+    }
 
     #[test]
     fn handshake_decode_rejects_oversized_frame() {

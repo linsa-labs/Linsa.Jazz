@@ -2,7 +2,6 @@
 
 //! HTTP routes for the Jazz server.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
@@ -26,14 +25,16 @@ pub(super) fn parse_schema_hash_param(hash_text: &str) -> Result<SchemaHash, Str
     Ok(SchemaHash::from_bytes(hash_bytes))
 }
 
-pub(super) fn connection_schema_diagnostics_from_handshake(
-    state: &Arc<ServerState>,
-    handshake: &crate::transport_manager::AuthHandshake,
+/// The handshake's schema diagnostics from the declared hash alone, so the WebSocket
+/// handshake can compute them on the blocking pool with owned values.
+pub(super) fn connection_schema_diagnostics_for_declared_hash(
+    state: &ServerState,
+    client_schema_hash: Option<crate::query_manager::types::SchemaHash>,
 ) -> Result<
     Option<crate::sync_manager::ConnectionSchemaDiagnostics>,
     crate::runtime_tokio::RuntimeError,
 > {
-    let Some(client_schema_hash) = handshake.declared_schema_hash() else {
+    let Some(client_schema_hash) = client_schema_hash else {
         return Ok(None);
     };
 

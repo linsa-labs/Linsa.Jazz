@@ -12,7 +12,7 @@ jazz_tools = { package = "jazz-tools", path = "../jazz-tools", version = "2.0.0-
   "transport-websocket",
   "otel-core",
 ] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 base64 = "0.22"
 napi = { version = "3", features = ["napi5", "serde-json", "async"] }
 napi-derive = "3"

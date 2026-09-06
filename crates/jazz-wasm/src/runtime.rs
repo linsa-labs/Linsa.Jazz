@@ -206,7 +206,7 @@ fn parse_subscription_inputs(
 > {
     let query = parse_query(query_json).map_err(|e| JsError::new(&e))?;
     let session = parse_session_json(session_json)?;
-    let (durability, propagation, _transaction_batch_id) =
+    let (durability, propagation, _transaction_batch_id, _timeout_ms) =
         parse_read_durability_options(settled_tier.as_deref(), options_json.as_deref())
             .map_err(|err| JsError::new(&err))?;
     Ok((query, session, durability, propagation))
@@ -1673,7 +1673,7 @@ impl WasmRuntime {
         let query = parse_query(query_json).map_err(|e| JsError::new(&e))?;
         let session = parse_session_json(session_json)?;
 
-        let (durability, propagation, transaction_batch_id) =
+        let (durability, propagation, transaction_batch_id, _timeout_ms) =
             parse_read_durability_options(settled_tier.as_deref(), options_json.as_deref())
                 .map_err(|err| JsError::new(&err))?;
 

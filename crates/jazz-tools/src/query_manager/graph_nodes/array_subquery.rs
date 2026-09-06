@@ -164,6 +164,18 @@ struct ArrayInstanceState {
 }
 
 impl ArraySubqueryNode {
+    /// v18 item 7: the compiled instances this node holds, for the nested-include gate.
+    #[cfg(any(test, feature = "test"))]
+    pub fn cached_subgraph_instances_for_test(&self) -> impl Iterator<Item = &SubgraphInstance> {
+        self.subgraph_cache.values().map(|cached| &cached.instance)
+    }
+
+    /// v18 item 7: the template behind this node's instances, for the shape gates.
+    #[cfg(any(test, feature = "test"))]
+    pub fn subgraph_template_for_test(&self) -> &SubgraphTemplate {
+        &self.subgraph_template
+    }
+
     /// Create a new ArraySubqueryNode.
     ///
     /// # Arguments

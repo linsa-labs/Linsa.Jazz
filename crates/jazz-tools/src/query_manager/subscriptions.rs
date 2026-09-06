@@ -38,6 +38,16 @@ pub(crate) struct SubscriptionExecutionOptions {
 }
 
 impl QueryManager {
+    /// Number of live local subscriptions (one-shot reads included until they settle).
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Number of subscriptions registered by downstream clients on this node.
+    pub fn server_subscription_count(&self) -> usize {
+        self.server_subscriptions.len()
+    }
+
     pub(crate) fn policy_context_tables_for_graph(graph: &super::graph::QueryGraph) -> Vec<String> {
         let mut tables: Vec<String> = graph
             .policy_filter_tables
@@ -350,17 +360,22 @@ impl QueryManager {
     /// 1. Removes the local subscription
     /// 2. Sends a QueryUnsubscription to all connected servers
     pub fn unsubscribe_with_sync(&mut self, id: QuerySubscriptionId) {
-        let propagation = self
-            .subscriptions
-            .get(&id)
-            .map(|sub| sub.propagation)
-            .unwrap_or(QueryPropagation::Full);
-        self.subscriptions.remove(&id);
         // Subscription ids are never recycled, so a left-behind entry can never poison a
         // later reader — it is pure leak. On a node whose reads are one-shot that is one
         // entry per READ for the process lifetime, which is the same shape of unbounded
         // in-memory map this whole family was split to end.
         self.authoritative_snapshot_pass.remove(&QueryId(id.0));
+        // v18 item 6 (diff r1 S4): the stall key goes with the subscription — same leak shape
+        // as the line above otherwise.
+        self.stalled.remove(&super::manager::UnitKey::Local(id));
+
+        // Only a subscription that was still registered here owes the servers an
+        // unsubscription. A second call for the same id (a cancelled one-shot racing a
+        // rejection or a recompile failure) must not send a second one.
+        let Some(removed) = self.subscriptions.remove(&id) else {
+            return;
+        };
+        let propagation = removed.propagation;
 
         if self.should_send_local_subscription_upstream(propagation) {
             let query_id = QueryId(id.0);

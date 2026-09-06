@@ -48,7 +48,7 @@ use crate::query_manager::types::{
 use crate::row_format::decode_row;
 use crate::row_histories::BatchId;
 use crate::schema_manager::{Lens, SchemaManager};
-use crate::storage::{Storage, StorageError};
+use crate::storage::{PassOutcome, Storage, StorageError};
 use crate::sync_manager::{ClientId, DurabilityTier, InboxEntry, OutboxEntry, ServerId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +95,12 @@ pub(crate) struct RuntimeBatchContext {
 /// No `Send` bound — WASM types (`Rc`, `Function`) are `!Send`.
 /// Tokio enforces `Send` at the point of use (`Arc<Mutex<...>>`).
 pub trait Scheduler {
+    /// Must NOT re-enter the core synchronously (v18 item 6, diff r4 S2). The mandate holds
+    /// at all thirteen call sites; the sharpest is the re-arm one (`ticks.rs`), where the
+    /// caller holds the core's lock and has already released the settle clock, so a
+    /// synchronous `batched_tick` would begin a fresh clock inside the same hold, defer
+    /// again, re-arm again — unbounded recursion (diff r5). Every implementation defers to
+    /// the platform's event loop (a worker, a spawned thread, a channel, `setTimeout`).
     fn schedule_batched_tick(&self);
 
     fn schedule_mutation_error_delivery(&self) {}
@@ -168,6 +174,8 @@ pub enum RuntimeError {
     QueryError(String),
     WriteError(String),
     NotFound,
+    /// A one-shot query was cancelled by its caller's deadline before it settled.
+    QueryCancelled,
     AnonymousWriteDenied {
         table: crate::query_manager::types::TableName,
         operation: crate::query_manager::policy::Operation,
@@ -180,6 +188,7 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::QueryError(s) => write!(f, "Query error: {}", s),
             RuntimeError::WriteError(s) => write!(f, "Write error: {}", s),
             RuntimeError::NotFound => write!(f, "Not found"),
+            RuntimeError::QueryCancelled => write!(f, "Query cancelled by its deadline"),
             RuntimeError::AnonymousWriteDenied { table, operation } => {
                 write!(
                     f,
@@ -314,10 +323,25 @@ pub struct RuntimeCore<S: Storage, Sch: Scheduler> {
     scheduler: Sch,
     /// True when storage was mutated since the last WAL flush barrier.
     storage_write_pending_flush: bool,
+    /// v18 item 6 (tests only): re-arms scheduled for deferred settle work by this core —
+    /// one per lock hold that left the flag set (design v8, gates G6-7(e)/(f)/(g)).
+    #[cfg(any(test, feature = "test"))]
+    settle_rearms: u64,
     /// True after scheduling one retry for the current failed WAL flush barrier.
     storage_flush_retry_scheduled: bool,
     /// Last storage flush error recorded by a durability barrier.
     storage_flush_error: Option<StorageError>,
+    /// v18 item 4 (flag 2): the first `LostWrites` was logged at `error!`; later reports of
+    /// the same loss are `trace!`. Never cleared.
+    lost_writes_logged: bool,
+    /// v18 item 4 (flag 3): the durability barrier reported a `LostWrites`. Set in one place
+    /// (`flush_wal_barrier`'s `Err` arm), never cleared; gates only the STORAGE arm of the
+    /// immediate tick's tail test and the barrier retry, so a node whose store lost a
+    /// transaction does not schedule itself forever for a barrier that can never succeed.
+    lost_writes_barrier_reported: bool,
+    /// v18 item 4: the first `LostWrites` the store reported, kept apart from the carrier
+    /// (`storage_flush_error`, which hosts take) for `TokioRuntime::flush`.
+    lost_writes: Option<StorageError>,
     /// Schema generations this store holds visible rows under that the schema
     /// manager did not know at construction — see
     /// [`RuntimeCore::unknown_store_schema_generations`].
@@ -660,8 +684,13 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             storage,
             scheduler,
             storage_write_pending_flush: false,
+            #[cfg(any(test, feature = "test"))]
+            settle_rearms: 0,
             storage_flush_retry_scheduled: false,
             storage_flush_error: None,
+            lost_writes_logged: false,
+            lost_writes_barrier_reported: false,
+            lost_writes: None,
             unknown_store_schema_generations,
             transport: None,
             transport_catalogue_state_hash_dirty: false,
@@ -829,6 +858,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.storage_flush_retry_scheduled = false;
     }
 
+    /// v18 item 6 (tests only): settle re-arms scheduled by this core.
+    #[cfg(any(test, feature = "test"))]
+    pub fn settle_rearms_for_test(&self) -> u64 {
+        self.settle_rearms
+    }
     pub(crate) fn has_storage_write_pending_flush(&self) -> bool {
         self.storage_write_pending_flush
     }
@@ -855,12 +889,74 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         true
     }
 
+    /// v18 item 4 (design v14, the carrier rule): a `LostWrites` is logged once at `error!`
+    /// and snapshotted; later reports are `trace!` and leave the carrier AS IT IS — the first
+    /// report is the one a host takes, and a host that already took it must not be handed a
+    /// second copy of the same loss every tick. Every other error overwrites the carrier as
+    /// before.
     pub(crate) fn record_storage_flush_error(&mut self, error: StorageError) {
+        if let StorageError::LostWrites { detail } = &error {
+            if self.lost_writes_logged {
+                // `trace`, not `debug` (diff r21 SF4): both pass boundaries of every tick
+                // reach here on a dead store. The first report was `error!`; this arm exists
+                // to show the repeat when someone is watching, not to fill the log.
+                tracing::trace!(detail, "storage lost writes (already reported)");
+                return;
+            }
+            self.lost_writes_logged = true;
+            tracing::error!(
+                detail,
+                "storage lost writes: the transaction was ended behind the store's back"
+            );
+            self.lost_writes = Some(error.clone());
+        }
         self.storage_flush_error = Some(error);
     }
 
     pub fn take_storage_flush_error(&mut self) -> Option<StorageError> {
         self.storage_flush_error.take()
+    }
+
+    /// v18 item 4: the first `LostWrites` this core's store reported, if any. Unlike the
+    /// carrier it is never taken: a store that lost writes never flushes again until it is
+    /// reopened, and every later `flush()` must say so.
+    pub fn lost_writes(&self) -> Option<&StorageError> {
+        self.lost_writes.as_ref()
+    }
+    #[cfg(any(test, feature = "test"))]
+    pub fn lost_writes_barrier_reported_for_test(&self) -> bool {
+        self.lost_writes_barrier_reported
+    }
+    #[cfg(any(test, feature = "test"))]
+    pub fn lost_writes_for_test(&self) -> Option<&StorageError> {
+        self.lost_writes.as_ref()
+    }
+
+    /// v18 item 4 (C1): a settle pass begins — the store opens its pass transaction (SQLite)
+    /// or does nothing. A failed begin is recorded and the pass runs autocommit; the store
+    /// counted it.
+    pub(crate) fn begin_read_pass_in_tick(&mut self) {
+        if let Err(error) = self.storage.begin_read_pass() {
+            self.record_storage_flush_error(error);
+        }
+    }
+
+    /// v18 item 4 (design v14): end the pass at this site. `Ok(wrote)` hands a dirty
+    /// transaction to the barrier; `Err` records the error (`LostWrites` logs once, flag 2)
+    /// and marks the barrier pending so the barrier runs and reports; flag 3 is set by the
+    /// barrier alone, on `LostWrites` alone.
+    pub(crate) fn end_read_pass_in_tick(&mut self) {
+        match self.storage.end_read_pass() {
+            Ok(PassOutcome { wrote }) => {
+                if wrote {
+                    self.mark_storage_write_pending_flush();
+                }
+            }
+            Err(error) => {
+                self.record_storage_flush_error(error);
+                self.mark_storage_write_pending_flush();
+            }
+        }
     }
 
     pub(crate) fn flush_wal_barrier(&mut self) -> Result<(), StorageError> {
@@ -871,6 +967,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             }
             Err(error) => {
                 self.record_storage_flush_error(error.clone());
+                if matches!(error, StorageError::LostWrites { .. }) {
+                    self.lost_writes_barrier_reported = true;
+                }
                 Err(error)
             }
         }
@@ -974,6 +1073,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.schema_manager.persist_lens(&mut self.storage, &lens);
         self.refresh_transport_catalogue_state_hash();
         Ok(())
+    }
+
+    /// Number of one-shot queries still waiting for their first settled snapshot.
+    pub fn pending_one_shot_query_count(&self) -> usize {
+        self.pending_one_shot_queries.len()
     }
 
     /// Get access to the underlying SchemaManager.

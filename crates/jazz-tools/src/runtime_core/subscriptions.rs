@@ -65,6 +65,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             },
         );
         self.subscription_reverse.insert(query_sub_id, handle);
+        // v18 item 3 (half B): the registration leaves in this call, not on the next batched
+        // tick, which would have to win the engine lock behind whatever pass is running.
+        self.flush_runtime_outbox("flushing the registration from the subscribe call");
         self.immediate_tick();
     }
 
@@ -274,6 +277,12 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             self.schema_manager
                 .query_manager_mut()
                 .unsubscribe_with_sync(state.query_sub_id);
+            // The unsubscription is in the outbox; nothing else is obliged to tick, and a
+            // server holds the registration (and counts it against the client) until the
+            // frame lands.
+            if self.has_outbound() {
+                self.scheduler.schedule_batched_tick();
+            }
         }
     }
 
@@ -299,6 +308,74 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         propagation: QueryPropagation,
     ) -> QueryFuture {
         self.query_with_overlay_rows(query, session, durability, propagation, HashMap::new())
+            .1
+    }
+
+    /// Like [`Self::query_with_local_batch`], but also hands back the handle of the
+    /// one-shot entry so the caller can cancel it with
+    /// [`Self::cancel_one_shot_query`] when its own deadline fires.
+    pub fn query_with_local_batch_tracked(
+        &mut self,
+        query: Query,
+        session: Option<Session>,
+        durability: ReadDurabilityOptions,
+        propagation: QueryPropagation,
+        batch_id: Option<BatchId>,
+    ) -> Result<(SubscriptionHandle, QueryFuture), RuntimeError> {
+        let Some(batch_id) = batch_id else {
+            return Ok(self.query_with_overlay_rows(
+                query,
+                session,
+                durability,
+                propagation,
+                HashMap::new(),
+            ));
+        };
+
+        self.ensure_batch_is_open(batch_id)?;
+
+        match self.batch_query_overlay(batch_id)? {
+            Some(overlay) => Ok(self.query_with_local_overlay_tracked(
+                query,
+                session,
+                durability,
+                propagation,
+                overlay,
+            )),
+            None => Ok(self.query_with_overlay_rows(
+                query,
+                session,
+                durability,
+                propagation,
+                HashMap::new(),
+            )),
+        }
+    }
+
+    /// Cancel a one-shot query that has not settled yet.
+    ///
+    /// Returns `true` when an entry was still pending and has now been released;
+    /// `false` when the query already completed or failed (nothing to release).
+    pub fn cancel_one_shot_query(&mut self, handle: SubscriptionHandle) -> bool {
+        let Some(mut pending) = self.pending_one_shot_queries.remove(&handle) else {
+            return false;
+        };
+        if let Some(sender) = pending.sender.take() {
+            let _ = sender.send(Err(RuntimeError::QueryCancelled));
+        }
+        self.subscription_reverse.remove(&pending.subscription_id);
+        // Tolerates a subscription the query manager already dropped (rejection or
+        // recompile failure between its `process` and the tick that would have cleaned
+        // this entry): `unsubscribe_with_sync` only tells the servers when it removed
+        // something.
+        self.schema_manager
+            .query_manager_mut()
+            .unsubscribe_with_sync(pending.subscription_id);
+        debug!(handle = handle.0, "cancelled pending one-shot query");
+        if self.has_outbound() {
+            self.scheduler.schedule_batched_tick();
+        }
+        true
     }
 
     pub fn query_with_local_batch(
@@ -309,20 +386,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         propagation: QueryPropagation,
         batch_id: Option<BatchId>,
     ) -> Result<QueryFuture, RuntimeError> {
-        let Some(batch_id) = batch_id else {
-            return Ok(self.query_with_propagation(query, session, durability, propagation));
-        };
-
-        self.ensure_batch_is_open(batch_id)?;
-
-        match self.batch_query_overlay(batch_id)? {
-            Some(overlay) => {
-                Ok(self.query_with_local_overlay(query, session, durability, propagation, overlay))
-            }
-            None => Ok(self.query_with_propagation(query, session, durability, propagation)),
-        }
+        self.query_with_local_batch_tracked(query, session, durability, propagation, batch_id)
+            .map(|(_, future)| future)
     }
 
+    /// The untracked form, used only by `runtime_core/tests.rs`, which wants the future and not
+    /// the handle. `#[cfg(test)]` rather than a bare `pub(crate)`: a plain `cargo build` warns it
+    /// is never used — which is true of a shipping build and was very nearly why I deleted it.
+    #[cfg(test)]
     pub(crate) fn query_with_local_overlay(
         &mut self,
         query: Query,
@@ -331,6 +402,18 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         propagation: QueryPropagation,
         overlay: QueryLocalOverlay,
     ) -> QueryFuture {
+        self.query_with_local_overlay_tracked(query, session, durability, propagation, overlay)
+            .1
+    }
+
+    fn query_with_local_overlay_tracked(
+        &mut self,
+        query: Query,
+        session: Option<Session>,
+        durability: ReadDurabilityOptions,
+        propagation: QueryPropagation,
+        overlay: QueryLocalOverlay,
+    ) -> (SubscriptionHandle, QueryFuture) {
         let local_overlay_rows = if overlay.row_ids.is_empty() {
             HashMap::new()
         } else {
@@ -359,7 +442,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         durability: ReadDurabilityOptions,
         propagation: QueryPropagation,
         local_overlay_rows: HashMap<ObjectId, crate::sync_manager::RowBatchKey>,
-    ) -> QueryFuture {
+    ) -> (SubscriptionHandle, QueryFuture) {
         let _span = debug_span!(
             "query",
             table = query.table.as_str(),
@@ -385,7 +468,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             Ok(id) => id,
             Err(e) => {
                 let _ = sender.send(Err(RuntimeError::QueryError(e.to_string())));
-                return QueryFuture::new(receiver);
+                let handle = SubscriptionHandle(self.next_subscription_handle);
+                self.next_subscription_handle += 1;
+                return (handle, QueryFuture::new(receiver));
             }
         };
 
@@ -401,7 +486,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         );
         self.subscription_reverse.insert(sub_id, handle);
 
+        // v18 item 3 (half B): see `activate_subscription`.
+        self.flush_runtime_outbox("flushing the registration from the query call");
         self.immediate_tick();
-        QueryFuture::new(receiver)
+        (handle, QueryFuture::new(receiver))
     }
 }

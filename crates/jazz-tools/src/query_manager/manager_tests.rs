@@ -1312,6 +1312,8 @@ mod misc;
 mod policies;
 mod recursive_queries;
 mod server_subscriptions;
+mod settle_budget;
+mod shape_once;
 mod subscription_output_oracle;
 mod subscriptions;
 mod updates;

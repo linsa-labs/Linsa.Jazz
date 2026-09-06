@@ -27,6 +27,9 @@ use clock::MonotonicClock;
 mod tests;
 
 // Re-export all public types
+pub mod admission;
+pub mod wire_depth;
+pub use admission::{Principal, SubscriptionCaps};
 pub use types::*;
 
 /// How long an installed transport may sit in `pending_servers` before callers
@@ -192,9 +195,13 @@ pub struct SyncManager {
 
     pub(super) servers: HashMap<ServerId, ServerState>,
     pub(super) pending_servers: HashMap<ServerId, Instant>,
+    /// v18 item 6: clients whose role actually changed since the query manager last drained
+    /// this list (an un-stalling event for their server subscriptions).
+    pub(super) role_changed: Vec<ClientId>,
     pub(super) pending_server_query_subscriptions: HashSet<(ServerId, QueryId)>,
     pub(super) clients: HashMap<ClientId, ClientState>,
-
+    /// Admission control for downstream registrations (item 2 / defect #31).
+    pub(super) admission: admission::Admission,
     pub(super) inbox: Vec<InboxEntry>,
     pub(super) outbox: Vec<OutboxEntry>,
 
@@ -441,8 +448,12 @@ impl SyncManager {
             allow_unprivileged_schema_catalogue_writes: false,
             servers: HashMap::new(),
             pending_servers: HashMap::new(),
+            role_changed: Vec::new(),
             pending_server_query_subscriptions: HashSet::new(),
+            // No cap bites on a node that is not a server; the server builder installs the
+            // production caps (`with_subscription_caps`).
             clients: HashMap::new(),
+            admission: admission::Admission::new(admission::SubscriptionCaps::unlimited()),
             inbox: Vec::new(),
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
@@ -482,6 +493,39 @@ impl SyncManager {
     pub fn with_durability_tier(mut self, tier: DurabilityTier) -> Self {
         self.my_tiers.insert(tier);
         self
+    }
+
+    /// Caps applied to registrations from downstream clients.
+    pub fn with_subscription_caps(mut self, caps: SubscriptionCaps) -> Self {
+        self.admission.set_caps(caps);
+        self
+    }
+
+    pub fn subscription_caps(&self) -> &SubscriptionCaps {
+        self.admission.caps()
+    }
+
+    /// Standing registrations charged to a principal (exact; see `admission`).
+    pub fn admitted_subscription_count(&self, principal: &Principal) -> usize {
+        self.admission.admitted_count(principal)
+    }
+
+    /// Standing registrations on this node, every principal together.
+    pub fn total_admitted_subscriptions(&self) -> usize {
+        self.admission.total_admitted()
+    }
+
+    /// A registration this node admitted has ended without an unsubscription from the client
+    /// (compile failure, recompile failure): release its admission and its settled-relay
+    /// origin, so a refused-or-failed query leaves nothing behind.
+    pub fn forget_client_query(&mut self, client_id: ClientId, query_id: QueryId) {
+        self.admission.release(client_id, query_id);
+        if let Some(clients) = self.query_origin.get_mut(&query_id) {
+            clients.remove(&client_id);
+            if clients.is_empty() {
+                self.query_origin.remove(&query_id);
+            }
+        }
     }
 
     /// Allow authenticated user clients to publish structural schema catalogue
@@ -705,10 +749,15 @@ impl SyncManager {
         self.pending_servers.insert(server_id, Instant::now());
     }
 
+    /// A connection attempt failed. The transport keeps its outbox across attempts, so every
+    /// registration pushed while the upstream was pending is still buffered there and will be
+    /// delivered on the next connection. The `pending_server_query_subscriptions` markers say
+    /// exactly that — "the transport holds this registration" — and must survive here; only
+    /// `remove_server`, which tears the transport down, may clear them. Clearing them on a
+    /// failed attempt made a later cancellation skip the unsubscription for that server, and
+    /// the buffered registration then landed with nothing to withdraw it.
     pub fn remove_pending_server(&mut self, server_id: ServerId) {
         self.pending_servers.remove(&server_id);
-        self.pending_server_query_subscriptions
-            .retain(|(id, _)| *id != server_id);
     }
 
     pub fn server_ids(&self) -> impl Iterator<Item = ServerId> + '_ {
@@ -843,6 +892,7 @@ impl SyncManager {
         // scratch on the next connection.
         self.pending_client_deliveries.remove(&client_id);
         self.missing_answers.remove(&client_id);
+        self.admission.release_client(client_id);
         self.clients.remove(&client_id);
         // Clean up interest map
         self.row_batch_interest.retain(|_, clients| {
@@ -910,8 +960,26 @@ impl SyncManager {
     /// Set the role for a client.
     pub fn set_client_role(&mut self, client_id: ClientId, role: ClientRole) {
         if let Some(client) = self.clients.get_mut(&client_id) {
+            if client.role != role {
+                self.role_changed.push(client_id);
+            }
             client.role = role;
         }
+    }
+
+    /// v18 item 6: drain the clients whose role changed since the last drain.
+    pub fn take_role_changes(&mut self) -> Vec<ClientId> {
+        std::mem::take(&mut self.role_changed)
+    }
+
+    /// v18 item 6: whether an installed transport still sits in `pending_servers` within
+    /// `PENDING_SERVER_TIMEOUT` — the same test `has_servers_or_pending_servers` applies to
+    /// the pending half. Polled once per pass; its true→false flip un-stalls local units.
+    pub fn has_live_pending_servers(&self) -> bool {
+        let now = Instant::now();
+        self.pending_servers
+            .values()
+            .any(|since| now.duration_since(*since) < PENDING_SERVER_TIMEOUT)
     }
 
     // ========================================================================
@@ -1365,12 +1433,45 @@ impl SyncManager {
     ///
     /// Called by QueryManager when a client unsubscribes from a synced query.
     pub fn send_query_unsubscription_to_servers(&mut self, query_id: QueryId) {
-        for server_id in self.outbound_server_ids() {
+        // Every server a registration for this query could have reached — not only the ones
+        // `outbound_server_ids` would still write to. A registration pushed while the
+        // upstream was pending sits in the transport's outbox and is delivered on the next
+        // connection however long that takes, so an unsubscription filtered by the pending
+        // age would leave that registration alive at the server with nothing local left to
+        // withdraw it (v18 item 1, diff review). An unsubscription for a query the server
+        // never registered is a no-op there.
+        let mut server_ids: HashSet<ServerId> = self.servers.keys().copied().collect();
+        server_ids.extend(self.pending_servers.keys().copied());
+        server_ids.extend(
+            self.pending_server_query_subscriptions
+                .iter()
+                .filter(|(_, pending_query_id)| *pending_query_id == query_id)
+                .map(|(server_id, _)| *server_id),
+        );
+        for server_id in server_ids {
             self.outbox.push(OutboxEntry {
                 destination: Destination::Server(server_id),
                 payload: SyncPayload::QueryUnsubscription { query_id },
             });
+        } // The marker only spares a replay for a subscription that still exists.
+        self.pending_server_query_subscriptions
+            .retain(|(_, pending_query_id)| *pending_query_id != query_id);
+    }
+
+    /// Test hook: make a pending upstream look older than it is, so the
+    /// `PENDING_SERVER_TIMEOUT` branches can be exercised without sleeping.
+    #[cfg(any(test, feature = "test"))]
+    pub fn age_pending_server_for_test(&mut self, server_id: ServerId, by: Duration) {
+        if let Some(since) = self.pending_servers.get_mut(&server_id)
+            && let Some(older) = since.checked_sub(by)
+        {
+            *since = older;
         }
+    }
+
+    #[cfg(any(test, feature = "test"))]
+    pub fn pending_server_query_subscription_count_for_test(&self) -> usize {
+        self.pending_server_query_subscriptions.len()
     }
 
     /// Take pending QuerySettled notifications for QueryManager to process.

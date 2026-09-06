@@ -1649,6 +1649,146 @@ decides only once all prerequisites are present", and write-policy authorization
 that. There is no path there on which a policy input is computed for a unit whose parents
 are absent.
 
+## 31. Any authenticated client can stall the sync server for everyone: transport ingestion under the engine lock, no admission control on subscriptions, no budget on a settle pass
+
+**Severity: availability of the whole product, from one account; found by our own worker
+doing it by accident.** On 2026-09-04 19:08 UTC every read the rpc-server issued through
+its embedded engine timed out at the facade's 5 s (`jazz read 'one' timed out after
+5000ms`), and every RPC endpoint — sign-up included — answered 503. Nothing was attacking;
+four ai-reply workers were reading chats with 100+ messages.
+
+Measured on prod (Loki/Prometheus), on the prod-store stand, and natively:
+
+```text
+  prod, 19:08:05–19:08:45
+    registration reaches jazz-sync after read start     0.7–4.7 s
+    jazz-sync answers a registration within             50–100 ms
+    heaviest jazz-sync pass                             1,206,701 µs  subscriptions=64  plan_compiles=1,183
+    one NEW subscription alone (subscriptions=1)          463,485 µs  subquery_instantiations=1,182  index_reads=5,915
+    passes > 500 ms in the window                       2, both hot_client=01a00b59… (a mobile client)
+    rpc-server container CPU                            0.26 → 0.56 core   (never saturated)
+    jazz-sync container CPU                             0.32 core, flat
+    logged jazz-sync passes overlap slow-read spans     ~10 %  (5.4 s of 54 s)
+  stand, jazz-sync throttled to the prod pace (cpus 0.15), rpc-server native on an M-series Mac
+    every read, every table                             1.5–5.0 s   local engine 2–3 % busy, mutex wait 0
+  same, jazz-sync unthrottled
+    per read                                            130–210 ms  0 reads ≥ 300 ms  loopMax p50 21 ms
+```
+
+The last two rows are the decisive pair: with the server slow, a backend read waits the
+full budget while its own engine idles; with the server fast the same read costs 0.2 s.
+A backend one-shot read is a round trip — subscribe → registration parked in the outbox →
+next `batched_tick` flushes it → server pass → `QuerySettled` → local apply → resolve —
+so read latency is the sum of both engines' queues, and the server's queue is whatever the
+loudest client makes it.
+
+The mechanism, verified in source (`c9ec20fb0`, linsa-v17.7 + tests):
+
+1. **Every WebSocket frame takes the engine lock inside the socket task.** The select loop in
+   `server/routes/websocket.rs` calls `ServerState::process_ws_client_frame`
+   (`server/mod.rs:632`), which calls `runtime.push_sync_inbox`, which is
+   `self.core.lock()` on a `std::sync::Mutex` over the whole `RuntimeCore`
+   (`runtime_tokio.rs:550`). While a settle pass holds the lock, every connection's frames
+   wait — registrations, acks, writes, all of them, for all clients.
+2. **A settle pass has no budget.** `batched_tick` (`runtime_core/ticks.rs`) runs
+   `handle_transport_messages → immediate_tick → flush_runtime_outbox →
+handle_sync_messages → immediate_tick → flush → WAL barrier` under the lock;
+   `QueryManager::process` (`manager.rs:1658`) settles every pending subscription
+   (`server_queries.rs:1230`) and every dirty server subscription (`:1636`) to completion.
+   No yield, no bound, no fairness between clients. A new subscription's first settle
+   instantiates and compiles a subgraph per outer row (`graph_nodes/subgraph.rs:72`,
+   `:178`); the per-node reuse cache (`8a5730f42`) keys on the outer row inside one live
+   graph and cannot help a first settle.
+3. **Nothing bounds what a client may register.** `Query` (`query_manager/query.rs:571`)
+   carries `limit: Option<usize>` and include trees of any depth; registration validates
+   none of size, depth, count per client or rate. The only per-client cap is connections
+   (`PER_CLIENT_CONNECTION_CAP = 4`, ours, `e91047266`).
+4. **The consumer's timeout does not cancel.** `withReadTimeout` in the rpc-server facade
+   is a `Promise.race`; the napi future and its subscription live on. Under a storm the
+   abandoned reads keep costing passes on both engines.
+
+So one account with four connections, subscribing with deep includes over the largest
+rows its policy admits and re-registering in a loop, holds the server's lock for
+0.5–1.2 s per registration on prod hardware and, through (1) and the backend round trip,
+converts that into 5 s timeouts and 503s for every user. The incident is the same shape
+with our worker in the attacker's chair.
+
+Fix, in `linsa-v18` (design and threat model: workspace
+`docs-internal/superpowers/designs/2026-09-sync-server-dos.md`; status per control):
+
+- **The facade deadline cancels the engine-side query** — implemented. `timeout_ms` on the
+  one-shot read; on expiry the napi binding calls `RuntimeCore::cancel_one_shot_query`, which
+  fails the future, drops the subscription, and sends the unsubscription to every upstream
+  that holds or buffers the registration (connected, pending of any age, or marked in
+  `pending_server_query_subscriptions`); the server withdraws a registration still parked in
+  the same pass. Gates G5–G5e; the delivery differential re-based on writer-side writes.
+- **Admission control at registration** — implemented. Caps over the wire query as received
+  (include depth and node count, `limit`, relation-IR node/join/union/gather-depth counts,
+  branch count, predicate leaves), per-principal standing-subscription count (user by
+  session, backend, or anonymous by client id), a global ceiling from which the backend is
+  exempt (self-signed identities are accepted without any flag and cost nothing, so
+  per-principal caps alone are evadable; the ceiling must not let filling it take the
+  product's own backend down), and a registration-rate window per user that charges every
+  new derivation — a held id re-registered with a changed query included, only a
+  byte-identical replay is free; refused before any work with a `QuerySubscriptionRejected`
+  frame whose reason is `subscription_over_cap: <cap> <value> > <cap value>`. Released
+  exactly on unsubscription, on compile failure (the replaced subscription and its upstream
+  forward end with it), and on disconnect. Underneath the caps, a nesting bound at decode
+  (`sync_manager/wire_depth.rs`, 128 levels): postcard has no recursion limit and every
+  recursive wire type is a derived deserializer, so a ~12 KB frame of nested `Not` overflowed
+  a worker's 2 MiB stack — a `SIGABRT` for the whole server — before admission saw it.
+  Gates: `tests/admission_control.rs` (black box) and `sync_manager/tests/admission.rs`.
+- **Transport off the lock, both directions** — planned (item 3 of the v18 plan): socket
+  tasks push frames to a per-connection FIFO drained under the tick, never `core.lock()`;
+  a client's registration is sent as soon as its subscription exists instead of on the next
+  batched tick. Gate: one client's registration ack and frame ingestion are independent of
+  another client's pass.
+- **A budget on the settle pass** — planned (item 6): bounded work per lock hold, round-robin
+  across clients' pending subscriptions, `QuerySettled` only for a complete subscription.
+  Gate: pass length bounded under a hostile subscription; differential oracle over random
+  subscription mixes shows results identical to the unbudgeted settle.
+
+Detection, in place: LogQL `{container="linsa-prod-jazz-sync-1"} |= "settle_cost" | regexp
+"micros=(?P<micros>[0-9]+)" | micros > 500000` with `hot_client` naming the offender —
+2 hits on the incident window, 0 on two control windows.
+
+What this does NOT fix: the per-pass cost itself (per-row plan compile, one SQLite statement
+per row with no read transaction across a pass, the locator ladder, the WAL checkpoint
+under the lock each tick) — those are performance entries of the same release, not this
+defect; and the backend's dependence on the server round trip for reads its own store could
+answer, which is a consistency design, open.
+
+Attribution: UPSTREAM-INHERITED. `push_sync_inbox` under the core lock from the socket
+task, the unbudgeted `settle_server_subscriptions`, and a `Query` with an optional limit and
+unchecked includes are all present verbatim at `e84d84a6`; the connection cap that exists
+is ours. Groove (`origin/main` @ `d80e653e7`, 2026-09-04): the new transport
+(`crates/jazz-native-transport`) has a per-connection inbound byte budget
+(`WS_CLIENT_MAX_QUEUED_BYTES`) and handshake deadlines; no subscription cost cap, per-client
+fairness or settle budget was found by search.
+
+## 32. A node's own update or delete of a row already in a client's scope is never forwarded to that client
+
+**Severity: none in our deployment; a limitation to know before writing a harness or a
+server-side writer.** `forward_update_to_clients*` (`sync_manager/forwarding.rs`) is called
+only from the inbox (and the permissions reject path), i.e. for rows that ARRIVED from a peer.
+A row the node writes itself is sealed upstream (`runtime_core/writes.rs`) and never enters
+that path. An insert still reaches downstream standing subscriptions, because their next
+settle sees the row enter the scope and offers it as scope growth; an update or a delete of a
+row the scope already holds has no path at all — nothing re-offers a row the scope contains.
+
+Where it bites: only a node that both writes locally and serves clients. In production
+jazz-sync never writes locally (every write arrives from a client and is forwarded) and the
+rpc-server's embedded engine has no downstream clients, so no product path crosses it. Found
+on 2026-09-05 by the delivery differential in `runtime_core/tests/delivery_convergence_differential.rs`:
+its "server-side writes" converged only because the harness's own measurement reads left a
+zombie subscription per op whose first settle re-offered every row; withdrawing those (item 1
+of v18) exposed the gap. The harness now writes from a peer.
+`a_deleted_row_never_reaches_a_subscribed_peer` (same file, `#[ignore]`) pins the delete
+variant of the same absence — it is this entry, not a delete-specific defect.
+
+Attribution: present at c9ec20fb0 (linsa-v17.7); not checked at the merge base `e84d84a6`.
+Not verified on the groove line.
+
 ## Groove line: verification summary (2026-08-15)
 
 Upstream's Thursday publishes are cut from the integration branch

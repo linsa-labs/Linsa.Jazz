@@ -778,7 +778,25 @@ impl RnRuntime {
                 core.scheduler_mut().clear_scheduled();
                 core.batched_tick();
                 if let Some(error) = core.take_storage_flush_error() {
-                    return Err(runtime_err(format!("storage WAL flush failed: {error}")));
+                    return Err(runtime_err(format!(
+                        "storage flush or read-pass commit failed: {error}"
+                    )));
+                }
+                // v18 item 4 (diff r20 SF6): the carrier reports ONCE. A store that lost
+                // writes is dead until it is reopened, so every later tick must say so too
+                // — the rule `TokioRuntime::flush` follows. Without this the RN host, the
+                // mandate's primary target, gets one error and then `Ok(())` forever on a
+                // store that persists nothing.
+                //
+                // The host must REPORT AND KEEP TICKING (diff r21 SF2): `clear_scheduled()`
+                // above runs before the tick, so a host that stops calling `batched_tick` on
+                // this error leaves `RnScheduler.scheduled` set forever and every later
+                // `schedule_batched_tick()` is deduped away — sync included. The error is a
+                // durability report, not a stop signal.
+                if let Some(error) = core.lost_writes() {
+                    return Err(runtime_err(format!(
+                        "storage flush or read-pass commit failed: {error}"
+                    )));
                 }
             }
             Ok(())
@@ -1139,7 +1157,7 @@ impl RnRuntime {
         with_async_panic_boundary("query", || async move {
             let query = parse_query(&query_json)?;
             let session = parse_session(session_json)?;
-            let (durability, propagation, transaction_batch_id) =
+            let (durability, propagation, transaction_batch_id, _timeout_ms) =
                 parse_read_durability_options(tier.as_deref(), options_json.as_deref())
                     .map_err(|message| JazzRnError::InvalidJson { message })?;
 

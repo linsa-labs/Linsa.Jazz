@@ -39,6 +39,9 @@ pub struct JazzServerBuilder {
     jwks_url: Option<String>,
     auth_clock: Option<crate::middleware::auth::AuthClock>,
     sync_tracer: Option<crate::sync_tracer::SyncTracer>,
+    subscription_caps: Option<crate::sync_manager::SubscriptionCaps>,
+    staging_config: Option<crate::runtime_tokio::StagingConfig>,
+    max_ws_decoded_frame_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for JazzServerBuilder {
@@ -123,6 +126,25 @@ impl JazzServerBuilder {
 
     pub fn with_auth_clock(mut self, clock: crate::middleware::auth::TestClock) -> Self {
         self.auth_clock = Some(clock.into());
+        self
+    }
+
+    /// Caps for downstream registrations (admission control). Tests set them here so the
+    /// verdicts do not depend on the environment.
+    pub fn with_subscription_caps(mut self, caps: crate::sync_manager::SubscriptionCaps) -> Self {
+        self.subscription_caps = Some(caps);
+        self
+    }
+
+    /// v18 item 3: staging caps and the in-flight decoded-bytes budget for gates.
+    pub fn with_staging_config(mut self, config: crate::runtime_tokio::StagingConfig) -> Self {
+        self.staging_config = Some(config);
+        self
+    }
+
+    /// v18 item 3: the decoded-frame cap for gates.
+    pub fn with_max_ws_decoded_frame_bytes(mut self, bytes: usize) -> Self {
+        self.max_ws_decoded_frame_bytes = Some(bytes);
         self
     }
 
@@ -278,6 +300,9 @@ impl JazzServer {
             jwks_url,
             auth_clock,
             sync_tracer,
+            subscription_caps,
+            staging_config,
+            max_ws_decoded_frame_bytes,
         } = builder;
 
         let app_id = app_id.unwrap_or_else(Self::default_app_id);
@@ -327,6 +352,19 @@ impl JazzServer {
         if let Some(tracer) = sync_tracer {
             server_builder = server_builder.with_sync_tracer(tracer);
         }
+        // Tests of other things run without caps; a test of the caps sets them. This also
+        // keeps a developer's `JAZZ_MAX_*` shell exports out of unrelated tests.
+        server_builder = server_builder.with_subscription_caps(
+            subscription_caps.unwrap_or_else(crate::sync_manager::SubscriptionCaps::unlimited),
+        );
+        // Same reason: a developer's `JAZZ_MAX_*` exports stay out of unrelated tests.
+        server_builder = server_builder.with_staging_config(staging_config.unwrap_or_default());
+        // Same reason again: the decoded-frame cap is pinned to the default unless the test
+        // sets it, so `JAZZ_MAX_WS_DECODED_FRAME_BYTES` from a shell never reaches a gate.
+        server_builder = server_builder.with_max_ws_decoded_frame_bytes(
+            max_ws_decoded_frame_bytes
+                .unwrap_or(crate::server::builder::DEFAULT_MAX_WS_DECODED_FRAME_BYTES),
+        );
         let built = server_builder.build().await.expect("build test server");
 
         let mut server =

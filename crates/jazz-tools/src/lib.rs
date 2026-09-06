@@ -179,13 +179,23 @@ pub struct SubscriptionHandle(pub u64);
 #[cfg(feature = "client")]
 pub struct SubscriptionStream {
     receiver: tokio::sync::mpsc::UnboundedReceiver<OrderedRowDelta>,
+    handle: SubscriptionHandle,
 }
 
 #[cfg(feature = "client")]
 impl SubscriptionStream {
     /// Create a new subscription stream.
-    pub(crate) fn new(receiver: tokio::sync::mpsc::UnboundedReceiver<OrderedRowDelta>) -> Self {
-        Self { receiver }
+    pub(crate) fn new(
+        receiver: tokio::sync::mpsc::UnboundedReceiver<OrderedRowDelta>,
+        handle: SubscriptionHandle,
+    ) -> Self {
+        Self { receiver, handle }
+    }
+
+    /// The handle `JazzClient::unsubscribe` takes for this stream. Dropping the stream does
+    /// not end the subscription; only an explicit unsubscribe does.
+    pub fn handle(&self) -> SubscriptionHandle {
+        self.handle
     }
 
     /// Get the next delta, waiting if necessary.

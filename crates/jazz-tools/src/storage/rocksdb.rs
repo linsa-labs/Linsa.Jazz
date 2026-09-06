@@ -41,6 +41,9 @@ pub struct RocksDBStorage {
     /// that the probe's cost does not track how deep the history is.
     #[cfg(test)]
     prefix_scans: std::cell::Cell<usize>,
+    /// v18 item 5: ladder walks this store served (bumped by `note_visible_locator_recovery`
+    /// from the read ladder; unconditional, like `SqliteStorage`'s counters).
+    visible_ladder_recoveries: std::sync::atomic::AtomicU64,
 }
 
 impl RocksDBStorage {
@@ -125,6 +128,7 @@ impl RocksDBStorage {
             cache_namespace: super::next_storage_cache_namespace(),
             #[cfg(test)]
             prefix_scans: std::cell::Cell::new(0),
+            visible_ladder_recoveries: std::sync::atomic::AtomicU64::new(0),
             inner: RefCell::new(Some(RocksDBInner {
                 db,
                 ensured_raw_table_headers: HashSet::new(),
@@ -153,6 +157,13 @@ impl RocksDBStorage {
             .as_mut()
             .ok_or_else(|| StorageError::IoError("rocksdb storage already closed".to_string()))?;
         f(inner)
+    }
+
+    /// v18 item 5: ladder walks this store served (per store, unlike the process-global).
+    #[cfg(any(test, feature = "test"))]
+    pub fn visible_ladder_recoveries_for_test(&self) -> u64 {
+        self.visible_ladder_recoveries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Compute the lexicographic successor of a byte prefix for use as an
@@ -690,79 +701,77 @@ impl Storage for RocksDBStorage {
         index_mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
         self.with_inner_mut(|inner| {
+            // v18 item 4 (design v4 § B2(a)): header names and locator pointers written by
             let txn = RefCell::new(inner.db.transaction());
+            // this transaction join the caches only after `commit_txn` succeeded — a failed
+            // commit must not leave the set claiming a header that was never written.
+            let mut ensured: Vec<String> = Vec::new();
+            let mut locators: Vec<((String, ObjectId), super::ExactRowTableLocator)> = Vec::new();
             let mut seen_row_raw_tables = std::collections::HashSet::new();
-            for row in encoded_history_rows {
-                if seen_row_raw_tables.insert(row.row_raw_table.clone())
-                    && inner
-                        .ensured_raw_table_headers
-                        .insert(row.row_raw_table.clone())
+            // diff r21 B2: the header is ENCODED lazily here too. The tree's
+            // `seen.insert(..) && ensured.insert(..)` short-circuited before the encode, and
+            // the rewrite must not put a `row_raw_table_header` + `encode_raw_table_header` on
+            // every write call per raw table — least of all on RocksDB, the store the stand
+            // measures.
+            let mut ensure_header = |name: &str,
+                                     header: &dyn Fn() -> Result<Vec<u8>, StorageError>|
+             -> Result<(), StorageError> {
+                if inner.ensured_raw_table_headers.contains(name)
+                    || ensured.iter().any(|seen| seen == name)
                 {
-                    let header = super::encode_raw_table_header(&super::row_raw_table_header(
-                        &row.row_raw_table_id,
-                        &row.user_descriptor,
-                    ))?;
-                    raw_table_put_core(
-                        super::RAW_TABLE_HEADER_TABLE,
-                        row.row_raw_table.as_str(),
-                        &header,
-                        |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
-                    )?;
+                    return Ok(());
+                }
+                let header = header()?;
+                raw_table_put_core(
+                    super::RAW_TABLE_HEADER_TABLE,
+                    name,
+                    &header,
+                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                )?;
+                ensured.push(name.to_string());
+                Ok(())
+            };
+            for row in encoded_history_rows {
+                if seen_row_raw_tables.insert(row.row_raw_table.clone()) {
+                    ensure_header(row.row_raw_table.as_str(), &|| {
+                        super::encode_raw_table_header(&super::row_raw_table_header(
+                            &row.row_raw_table_id,
+                            &row.user_descriptor,
+                        ))
+                    })?;
                 }
             }
             for row in encoded_visible_rows {
-                if seen_row_raw_tables.insert(row.row_raw_table.clone())
-                    && inner
-                        .ensured_raw_table_headers
-                        .insert(row.row_raw_table.clone())
-                {
-                    let header = super::encode_raw_table_header(&super::row_raw_table_header(
-                        &row.row_raw_table_id,
-                        &row.user_descriptor,
-                    ))?;
-                    raw_table_put_core(
-                        super::RAW_TABLE_HEADER_TABLE,
-                        row.row_raw_table.as_str(),
-                        &header,
-                        |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
-                    )?;
+                if seen_row_raw_tables.insert(row.row_raw_table.clone()) {
+                    ensure_header(row.row_raw_table.as_str(), &|| {
+                        super::encode_raw_table_header(&super::row_raw_table_header(
+                            &row.row_raw_table_id,
+                            &row.user_descriptor,
+                        ))
+                    })?;
                 }
             }
             if encoded_history_rows
                 .iter()
                 .any(|row| row.needs_exact_locator)
-                && inner
-                    .ensured_raw_table_headers
-                    .insert(super::HISTORY_ROW_BATCH_TABLE_LOCATOR_TABLE.to_string())
             {
-                let header = super::encode_raw_table_header(&super::RawTableHeader::system(
-                    super::STORAGE_KIND_HISTORY_ROW_BATCH_TABLE_LOCATOR,
-                    1,
-                ))?;
-                raw_table_put_core(
-                    super::RAW_TABLE_HEADER_TABLE,
-                    super::HISTORY_ROW_BATCH_TABLE_LOCATOR_TABLE,
-                    &header,
-                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
-                )?;
+                ensure_header(super::HISTORY_ROW_BATCH_TABLE_LOCATOR_TABLE, &|| {
+                    super::encode_raw_table_header(&super::RawTableHeader::system(
+                        super::STORAGE_KIND_HISTORY_ROW_BATCH_TABLE_LOCATOR,
+                        1,
+                    ))
+                })?;
             }
             if encoded_visible_rows
                 .iter()
                 .any(|row| row.needs_exact_locator)
-                && inner
-                    .ensured_raw_table_headers
-                    .insert(super::VISIBLE_ROW_TABLE_LOCATOR_TABLE.to_string())
             {
-                let header = super::encode_raw_table_header(&super::RawTableHeader::system(
-                    super::STORAGE_KIND_VISIBLE_ROW_TABLE_LOCATOR,
-                    1,
-                ))?;
-                raw_table_put_core(
-                    super::RAW_TABLE_HEADER_TABLE,
-                    super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
-                    &header,
-                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
-                )?;
+                ensure_header(super::VISIBLE_ROW_TABLE_LOCATOR_TABLE, &|| {
+                    super::encode_raw_table_header(&super::RawTableHeader::system(
+                        super::STORAGE_KIND_VISIBLE_ROW_TABLE_LOCATOR,
+                        1,
+                    ))
+                })?;
             }
             let borrowed_history_rows = encoded_history_rows
                 .iter()
@@ -820,7 +829,12 @@ impl Storage for RocksDBStorage {
                     schema_hash: row.row_raw_table_id.schema_hash,
                 };
                 let cache_key = (row.branch.clone(), row.row_id);
-                if inner.visible_row_table_locators.get(&cache_key) != Some(&locator) {
+                let already_written = inner.visible_row_table_locators.get(&cache_key)
+                    == Some(&locator)
+                    || locators
+                        .iter()
+                        .any(|(key, seen)| key == &cache_key && seen == &locator);
+                if !already_written {
                     let locator_bytes = super::encode_exact_row_table_locator(&locator)?;
                     raw_table_put_core(
                         super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
@@ -828,11 +842,14 @@ impl Storage for RocksDBStorage {
                         &locator_bytes,
                         |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
                     )?;
-                    inner.visible_row_table_locators.insert(cache_key, locator);
+                    locators.push((cache_key, locator));
                 }
             }
             Self::apply_index_mutations_on_txn(&txn, index_mutations)?;
-            Self::commit_txn(txn.into_inner())
+            Self::commit_txn(txn.into_inner())?;
+            inner.ensured_raw_table_headers.extend(ensured);
+            inner.visible_row_table_locators.extend(locators);
+            Ok(())
         })
     }
 
@@ -921,6 +938,58 @@ impl Storage for RocksDBStorage {
         )
     }
 
+    /// v18 item 5 (D2): persist the exact locator the ladder recovered, in its own
+    /// transaction (RocksDB has no pass transaction: every call commits). The header is
+    /// ensured the way the write path does it; its name joins the cache after the commit.
+    fn record_visible_row_table_locator_recovery(
+        &self,
+        branch: &str,
+        row_id: ObjectId,
+        locator: &super::ExactRowTableLocator,
+    ) -> Result<(), StorageError> {
+        self.with_inner_mut(|inner| {
+            let txn = RefCell::new(inner.db.transaction());
+            let needs_header = !inner
+                .ensured_raw_table_headers
+                .contains(super::VISIBLE_ROW_TABLE_LOCATOR_TABLE);
+            if needs_header {
+                let header = super::encode_raw_table_header(&super::RawTableHeader::system(
+                    super::STORAGE_KIND_VISIBLE_ROW_TABLE_LOCATOR,
+                    super::EXACT_ROW_TABLE_LOCATOR_STORAGE_FORMAT_V1,
+                ))?;
+                raw_table_put_core(
+                    super::RAW_TABLE_HEADER_TABLE,
+                    super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
+                    &header,
+                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                )?;
+            }
+            let locator_bytes = super::encode_exact_row_table_locator(locator)?;
+            raw_table_put_core(
+                super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
+                &super::visible_row_table_locator_key(branch, row_id),
+                &locator_bytes,
+                |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+            )?;
+            Self::commit_txn(txn.into_inner())?;
+            // v18 item 5 (diff r22 B2): the same eviction the SQLite hook pays, for the same
+            // reason — this is a direct write to the pointer the write path dedups against.
+            inner
+                .visible_row_table_locators
+                .remove(&(branch.to_string(), row_id));
+            if needs_header {
+                inner
+                    .ensured_raw_table_headers
+                    .insert(super::VISIBLE_ROW_TABLE_LOCATOR_TABLE.to_string());
+            }
+            Ok(())
+        })
+    }
+
+    fn note_visible_locator_recovery(&self) {
+        self.visible_ladder_recoveries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     fn flush(&self) -> Result<(), StorageError> {
         self.with_inner(|inner| {
             inner
@@ -951,6 +1020,58 @@ impl Storage for RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// G-D1r (v18 item 5). Internal on purpose: whether the ladder walked is a count only
+    /// the store keeps (`visible_ladder_recoveries_for_test`), and whether the recovered
+    /// pointer was persisted is a question to the store's locator table; no client API
+    /// exposes either. The RocksDB twin of the SQLite gates — the stand (jazz-sync) runs on
+    /// RocksDB, and its "216 walks per pass" is the number this pins at the unit level.
+    #[test]
+    #[cfg(feature = "test-utils")] // the shared fixture lives in `crate::test_support` (diff r21 SF8)
+    fn a_recovered_visible_locator_is_persisted_and_survives_a_reopen() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("recover.rocksdb");
+        let mut storage = RocksDBStorage::open(&db_path, 8 * 1024 * 1024).unwrap();
+        let (branch, row_id, schema_hash) = crate::test_support::poisoned_split_row(&mut storage);
+        let honest_family = super::super::visible_row_raw_table_id("users", schema_hash)
+            .raw_table_name()
+            .to_string();
+
+        let first = storage
+            .load_visible_region_row_bytes("users", branch.as_str(), row_id)
+            .expect("read succeeds")
+            .expect("fixture precondition: the poisoned row must be readable through the ladder");
+        assert_eq!(
+            storage.visible_ladder_recoveries_for_test(),
+            1,
+            "fixture precondition: the first read must walk the ladder exactly once"
+        );
+        let pointer = storage
+            .load_visible_row_table_locator(branch.as_str(), row_id)
+            .expect("locator readable")
+            .expect("the ladder must persist the exact locator it recovered");
+        assert_eq!(
+            pointer.row_raw_table.to_string(),
+            honest_family,
+            "the persisted pointer must name the family that holds the bytes"
+        );
+
+        storage.close().unwrap();
+        let reopened = RocksDBStorage::open(&db_path, 8 * 1024 * 1024).unwrap();
+        let again = reopened
+            .load_visible_region_row_bytes("users", branch.as_str(), row_id)
+            .expect("read succeeds")
+            .expect("the row must still be readable after the reopen");
+        assert_eq!(
+            again, first,
+            "the same bytes must be served after the reopen"
+        );
+        assert_eq!(
+            reopened.visible_ladder_recoveries_for_test(),
+            0,
+            "after a reopen the read must answer from the persisted pointer, not walk the \
+             families again"
+        );
+    }
 
     #[test]
     fn open_and_close() {

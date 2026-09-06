@@ -57,7 +57,19 @@ const SEEDS: [u64; 6] = [
 
 const OPS_PER_SEED: usize = 90;
 const ROW_POOL: usize = 6;
-
+/// The peer that plays the sender: every "sender-side" write is issued here and reaches the
+/// server through its inbox, which is the only path a write takes in production. A write made
+/// on the server node itself is sealed upstream and is NOT forwarded to the node's own clients
+/// (`forward_update_to_clients*` in `sync_manager/forwarding.rs` is called only from the inbox).
+/// An insert still arrives at the peers, because the next settle of their standing subscription
+/// sees the row enter its scope and offers it as a scope growth; an update of a row already in
+/// scope does not, since nothing re-offers a row the scope already holds. Until linsa-v18 this
+/// oracle converged on such updates anyway, because its own measurement reads (then one-shot
+/// queries, which an identity-less node registers upstream even as LocalOnly) left a zombie
+/// subscription at the server on every op, and each zombie's first settle re-offered every
+/// row. Withdrawing a parked registration on its own unsubscription (v18 item 1) halved the
+/// zombies and exposed this; the measurement now reads storage and registers nothing.
+const WRITER: usize = 0;
 struct Xorshift(u64);
 
 impl Xorshift {
@@ -100,29 +112,25 @@ struct ModelRow {
 type Snapshot = Vec<(ObjectId, String, String, i64)>;
 
 fn visible_docs(core: &mut Node) -> Snapshot {
-    let query = core
-        .schema_manager_mut()
-        .query_manager_mut()
-        .query("docs")
-        .build();
-    let waker = noop_waker();
-    let mut cx = std::task::Context::from_waker(&waker);
-    // LocalOnly: this is a measurement, and a measurement must not itself move the scope it
-    // is measuring.
-    let mut future = core.query_with_propagation(
-        query,
-        None,
-        ReadDurabilityOptions::default(),
-        crate::sync_manager::QueryPropagation::LocalOnly,
-    );
-    let rows = match Pin::new(&mut future).poll(&mut cx) {
-        Poll::Ready(Ok(results)) => results,
-        Poll::Ready(Err(err)) => panic!("local query should succeed: {err:?}"),
-        Poll::Pending => panic!("a local-only query must resolve immediately"),
-    };
+    // A measurement must not move what it measures: a query, even LocalOnly, is a subscription
+    // that an identity-less node registers upstream, and its first settle at the server
+    // re-offers rows. So read the visible rows straight from storage, on the composed branch.
+    let branch = core.schema_manager().branch_name().to_string();
+    let descriptor = docs_schema()
+        .get(&"docs".into())
+        .expect("docs table")
+        .columns
+        .clone();
+    let rows = core
+        .storage()
+        .scan_visible_region("docs", &branch)
+        .expect("visible docs should scan");
     let mut out: Snapshot = rows
         .into_iter()
-        .map(|(id, values)| {
+        .filter(|row| row.state.is_visible() && !row.is_deleted)
+        .map(|row| {
+            let values = crate::row_format::decode_row(&descriptor, &row.data)
+                .expect("a stored docs row should decode");
             let owner = match values.first() {
                 Some(Value::Text(text)) => text.clone(),
                 other => panic!("owner should be text, got {other:?}"),
@@ -135,7 +143,7 @@ fn visible_docs(core: &mut Node) -> Snapshot {
                 Some(Value::BigInt(count)) => *count,
                 other => panic!("hits should be a bigint, got {other:?}"),
             };
-            (id, owner, body, hits)
+            (row.row_id, owner, body, hits)
         })
         .collect();
     out.sort();
@@ -421,8 +429,11 @@ fn run_seed(seed: u64) {
     let mut model: BTreeMap<ObjectId, ModelRow> = BTreeMap::new();
     let mut pool: Vec<ObjectId> = Vec::new();
     let mut history: Vec<String> = Vec::new();
-
-    for op_index in 0..OPS_PER_SEED {
+    let ops = std::env::var("DIFF_OPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(OPS_PER_SEED);
+    for op_index in 0..ops {
         let op = choose_and_apply(
             &mut rng,
             &mut server,
@@ -448,7 +459,7 @@ fn run_seed(seed: u64) {
             assert_eq!(
                 peer_view,
                 server_view,
-                "seed {seed:#x} op {op_index}: peer {index} did not converge with the sender. \
+                "seed {seed:#x} op {op_index}: peer {index} did not converge with the server. \
                  A receiver that cannot relate an arrival to the history it already holds \
                  treats every delivery as a new root: tips accumulate instead of collapsing, \
                  counters sum instead of superseding, and a soft delete has nothing left that \
@@ -469,16 +480,39 @@ fn run_seed(seed: u64) {
         // their ancestry stripped. Collapsing either of those would destroy a real write. What
         // must never happen is ACCUMULATION — one more tip for every delivery, unbounded, which
         // is the defect: measured in a real client store at 460 tips on one `users` row.
-        // One un-superseded tip per author, plus one authority snapshot that no local write has
-        // named yet, plus a tip of headroom. Measured across these six seeds: peak 4 with the
-        // rule armed, 23 with it disarmed; the field reached 460, because without the rule
-        // nothing bounds the count at all. The headroom is deliberate — a bound sitting exactly
-        // on the observed peak is not a gate, it is a coincidence waiting for the next seed —
-        // and it costs nothing here, since the value it must separate is five times larger.
-        let author_bound = peers.len() + 3;
+        // One un-superseded tip per writing author — every peer writes here, the writer peer
+        // for the sender-side arms and any peer for the receiver arm; the server authors
+        // nothing — plus one authority snapshot that no local write has named yet, plus
+        // headroom. Measured across these six seeds with the writes routed through the peers
+        // and the measurement reading storage (v18): peak 6 (seed 1), 5 and 4 on the others,
+        // at `OPS_PER_SEED` = 90, two peers, so the bound is 7. With the rule disarmed the count is unbounded: 23 within 90 ops on the
+        // original harness, 460 in the field. The headroom is deliberate — a bound sitting
+        // exactly on the observed peak is not a gate, it is a coincidence waiting for the next
+        // seed.
+        //
+        // Open finding, recorded and not gated here: a 300-op run reaches 9 tips on the server
+        // (seeds 1–6: 7, 6, 8, 9, 8, 6; peers stay at ≤ 6), and the base engine at c9ec20fb0
+        // gives the same numbers with this harness, so the drift predates v18. It was invisible
+        // while the measurement itself re-delivered every row through a zombie subscription
+        // each op. Slow growth is not the accumulation-per-delivery this oracle was built for,
+        // but it is growth; see `archive/v18/PLAN.md` (decisions log, item 1 round 2). Probe it
+        // with `DIFF_OPS=300 DIFF_TIP_SERIES=1 … -- delivered_rows_converge --nocapture`,
+        // which lifts the bound and prints the peak after every op instead of asserting.
+        let writing_authors = peers.len();
+        let probe = std::env::var("DIFF_TIP_SERIES").is_ok();
+        let author_bound = if probe {
+            usize::MAX
+        } else {
+            writing_authors + 5
+        };
         for (row_id, _, _, _) in &server_view {
             let branch = server_branch.clone();
             let server_tips = tip_count(&mut server, *row_id, &branch);
+            if probe {
+                eprintln!(
+                    "tip-series seed={seed:#x} op={op_index} row={row_id} server_tips={server_tips}"
+                );
+            }
             assert!(
                 server_tips <= author_bound,
                 "seed {seed:#x} op {op_index}: the sender holds {server_tips} tips for row \
@@ -533,9 +567,10 @@ fn choose_and_apply(
             ("body".to_string(), Value::Text(body.clone())),
             ("hits".to_string(), Value::BigInt(0)),
         ]);
-        let ((row_id, _), _) = server
+        let ((row_id, _), _) = peers[WRITER]
+            .core
             .insert("docs", values, None)
-            .expect("the server may insert");
+            .expect("the writer may insert");
         pool.push(row_id);
         model.insert(
             row_id,
@@ -546,14 +581,15 @@ fn choose_and_apply(
                 deleted: false,
             },
         );
-        return format!("insert(server, {row_id})");
+        return format!("insert(writer, {row_id})");
     }
 
     let row_id = pool[rng.below(pool.len())];
     let entry = model.get_mut(&row_id).expect("pooled rows are modelled");
 
     match rng.below(10) {
-        // Sender-side update — the plain delivery case.
+        // Sender-side update — the plain delivery case: the writer's batch reaches the server
+        // and is forwarded to every other client whose scope holds the row.
         0..=2 => {
             let body = format!("s{op_index}");
             entry.body = body.clone();
@@ -561,9 +597,10 @@ fn choose_and_apply(
             let hits = entry.hits;
             let deleted = entry.deleted;
             if deleted {
-                return format!("update(server, {row_id}) skipped: row is deleted");
+                return format!("update(writer, {row_id}) skipped: row is deleted");
             }
-            server
+            peers[WRITER]
+                .core
                 .update(
                     row_id,
                     vec![
@@ -572,8 +609,8 @@ fn choose_and_apply(
                     ],
                     None,
                 )
-                .expect("the server may update a live row");
-            format!("update(server, {row_id}, hits={hits})")
+                .expect("the writer may update a live row");
+            format!("update(writer, {row_id}, hits={hits})")
         }
         // A receiver writes on top of a row it was delivered, and that write travels back.
         3..=5 => {
@@ -609,7 +646,8 @@ fn choose_and_apply(
             entry.body = body.clone();
             entry.hits += 1;
             let hits = entry.hits;
-            server
+            peers[WRITER]
+                .core
                 .update(
                     row_id,
                     vec![
@@ -618,8 +656,8 @@ fn choose_and_apply(
                     ],
                     None,
                 )
-                .expect("the server may update a live row");
-            format!("update(server, {row_id}, hits={hits})")
+                .expect("the writer may update a live row");
+            format!("update(writer, {row_id}, hits={hits})")
         }
         // Reconnect. The delivered-frontier cursor is per-peer, so a reconnect is exactly the
         // state where stamping must fall back to clearing rather than claim from memory.

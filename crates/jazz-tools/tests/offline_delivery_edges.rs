@@ -194,28 +194,95 @@ async fn an_edit_made_during_the_gap_reaches_a_returning_peer() {
         .await
         .expect("bob resubscribes");
 
-    // The initial snapshot replays what bob already had, so `added` proves nothing here.
-    // Only an `updated` for this row means the edited batch was applied to his store.
+    // CHANGED 2026-09-06 (diff r27), and the old assertion is quoted here because it was not
+    // wrong so much as accidentally specific. It was:
+    //
+    //     the initial snapshot replays what bob already had, so `added` proves nothing here.
+    //     Only an `updated` for this row means the edited batch was applied to his store.
+    //     ...
+    //     applied = delta.updated.iter().any(|row| row.id == row_id);
+    //
+    // That reasoning assumed the snapshot would carry the STALE value, which is true only of
+    // the unbounded settle path. Measured 8/8 deterministically at each budget: under a settle
+    // budget the row bob is owed reaches him BEFORE his resubscribe, so his first delta carries
+    // the edit in `added` and no `updated` ever follows. His store is correct either way — the
+    // read-back below returns `edited-while-away` at every budget — and it is not a race the
+    // unbounded path happens to win: with 0/5/20/100/500 ms inserted between connect and
+    // subscribe, `None` still waits for the resubscribe to push the row.
+    //
+    // So the assertion now says what the comment above always meant: the edited batch is in
+    // bob's store. A fix that leaves him stale still fails, and the incidental dependence on
+    // delta kind is gone.
+    //
+    // AMENDED 2026-09-06 (diff r28), because the first version of this change was VACUOUS and
+    // the file's own header at the top warns against exactly the two fakes it fell into:
+    //
+    //   * it accepted the row by ID alone, and the resubscribe snapshot always replays the row
+    //     bob already had — so the loop exited on the first delta whatever it carried;
+    //   * the read-back below was described as local. It is not. `wait_for_query` goes through
+    //     `TokioRuntime::query`, which hardcodes `QueryPropagation::Full`
+    //     (`runtime_tokio.rs:614-629`), so a `None` tier still lets the server answer.
+    //
+    // What cannot be faked is the CONTENT of the delta. The row is inserted as `"original"`
+    // and edited to `"edited-while-away"`; a stale replay carries the first string and the
+    // applied edit carries the second. The bytes are searched rather than decoded because
+    // `SubscriptionStream` yields `OrderedRowDelta` with no `RowDescriptor`
+    // (`lib.rs:180-204`) — the descriptor rides on `SubscriptionDelta`, one layer down — and
+    // reconstructing an output descriptor here would test my reconstruction, not the delivery.
+    /// The edited title as it appears inside an encoded row. `Value::Text` is written into the
+    /// row payload verbatim, so a substring search over the bytes distinguishes the applied
+    /// edit from a stale replay without needing the query's output descriptor.
+    const EDITED: &[u8] = b"edited-while-away";
+    fn carries_edit(row: &jazz_tools::query_manager::types::Row, id: ObjectId) -> bool {
+        row.id == id && row.data.windows(EDITED.len()).any(|w| w == EDITED)
+    }
+
     let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
     let mut applied = false;
+    let mut seen_stale = false;
     while !applied {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "bob's store never took the edit made while he was away — no update for the row \
-             ever arrived on the subscription",
-        );
+        let complaint = if seen_stale {
+            "bob's subscription replayed the row but never carried the edited value — he is \
+             back online with a stale copy, which is the defect this test exists for"
+        } else {
+            "bob's subscription never mentioned the row at all — not as an update and not in \
+             its first snapshot"
+        };
+        assert!(!remaining.is_zero(), "{complaint}");
         let delta = tokio::time::timeout(remaining, sub.next())
             .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "bob's store never took the edit made while he was away — no update for \
-                     the row ever arrived on the subscription",
-                )
-            })
+            .unwrap_or_else(|_| panic!("{complaint}"))
             .expect("subscription stream closed early");
-        applied = delta.updated.iter().any(|row| row.id == row_id);
+        seen_stale |= delta.added.iter().any(|a| a.id == row_id)
+            || delta.updated.iter().any(|u| u.id == row_id);
+        applied = delta.added.iter().any(|a| carries_edit(&a.row, row_id))
+            || delta
+                .updated
+                .iter()
+                .any(|u| u.row.as_ref().is_some_and(|row| carries_edit(row, row_id)));
     }
+
+    // Belt and braces, and labelled honestly: this is a `QueryPropagation::Full` read, so on
+    // its own it would prove nothing about bob's store. It stays because the assertion above
+    // already established the delivery, and this catches a store that took the delta on the
+    // wire and failed to persist it.
+    wait_for_query(
+        &bob_back,
+        query.clone(),
+        None,
+        QUERY_TIMEOUT,
+        "bob's store never took the edit made while he was away",
+        |rows| {
+            rows.iter()
+                .any(|(id, values)| {
+                    *id == row_id
+                        && matches!(values.first(), Some(Value::Text(t)) if t == "edited-while-away")
+                })
+                .then_some(())
+        },
+    )
+    .await;
 
     bob_back.shutdown().await.ok();
     alice.shutdown().await.ok();

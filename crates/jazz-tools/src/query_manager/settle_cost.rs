@@ -77,10 +77,29 @@ pub static SUBQUERY_INSTANCE_EVALS: AtomicU64 = AtomicU64::new(0);
 pub static SUBQUERY_INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Query plans compiled —
-/// `QueryGraph::compile_execution_plan_with_schema_context_shared` calls. A
-/// superset of [`SUBQUERY_INSTANTIATIONS`]: every instantiation compiles one
-/// plan, and nested includes inside it compile more.
+/// `QueryGraph::compile_execution_plan_with_schema_context_shared` calls and, since
+/// v18 item 7, `compile_plan_with_branch_map` calls (the template's bound-plan path
+/// bumps it there). A superset of [`SUBQUERY_INSTANTIATIONS`]: every instantiation
+/// compiles one plan, and nested includes inside it compile more.
 pub static PLAN_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 7: include shapes lowered to an execution plan — every `lower_query`
+/// call under `SubgraphTemplate` (`lower_shape` for the cached shape, the uncached
+/// per-instance lowering, and the `RecursiveRelationNode` path), attempts included.
+/// One per template after item 7 (one per instance before it); a template whose shape
+/// cannot be cached (`uncacheable`) counts its failed attempt plus one per instance —
+/// N + 1 for N instances. [`PLAN_COMPILES`] stays per instance and is the control.
+pub static SHAPE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 6: settle units a pass left behind because the tick's budget was spent (a
+/// registration, a dirty server subscription or a dirty local subscription). Under an
+/// unbounded budget this never moves.
+pub static SETTLE_UNITS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 6: batched ticks re-armed by the settle flag — a pass that deferred
+/// NON-stalled work under a budget, or an outbox-limiter trip that left registrations
+/// behind under any budget. One per lock hold whose re-arm call RETURNED (diff r5).
+pub static SETTLE_TICKS_REARMED: AtomicU64 = AtomicU64::new(0);
 
 /// Per-row policy evaluations — `PolicyEvaluator::evaluate_row_access` calls,
 /// counting recursive descent through referencing/inherited policies, since
@@ -160,6 +179,83 @@ pub static HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
 /// count converging to zero, and 1,200 identical INFO lines answer it only to whoever
 /// thinks to count them.
 pub static LOCATOR_LADDER_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 5: the history twin of [`LOCATOR_LADDER_RECOVERIES`] — the history ladder's last
+/// arm (`load_history_row_batch_row_bytes_with_storage`). Kept apart because the history walk
+/// has no D2 hook: nothing heals it, and a count that never converges is the signal.
+pub static HISTORY_LOCATOR_LADDER_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 4: read statements that ran OUTSIDE a pass transaction on a store with
+/// statement-level transaction cost (SQLite). With C1 a settle pass's reads run inside one
+/// deferred transaction; this counts the ones that did not — direct `&self` reads, or a pass
+/// whose `BEGIN` failed.
+pub static AUTOCOMMIT_READS: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 4: pass `BEGIN`s that failed (that pass ran autocommit; see [`AUTOCOMMIT_READS`]).
+pub static READ_PASS_BEGIN_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 8: explicit WAL checkpoints that DRAINED the log. Before item 8 the engine ran one
+/// on every durability barrier, so a settle-heavy node paid a checkpoint per pass; this is how
+/// the stand reads whether that stopped, rather than inferring it from latency.
+///
+/// It lives here, and not on `SqliteStorage`, because the shipped storage is a
+/// `Box<dyn Storage>`: an inherent accessor on the concrete type is unreachable from the
+/// runtime no matter how public it is (diff r25 B4).
+pub static CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 8: checkpoints that ran and moved nothing because a reader still pinned the WAL.
+///
+/// SQLite reports this as SUCCESS — for a PASSIVE checkpoint it deliberately resets `SQLITE_BUSY`
+/// to OK rather than "report a checkpoint failure just because there are active readers"
+/// (`sqlite3.c:67453-67457`). So the only honest discriminator is the frame columns, and without
+/// this counter every blocked attempt would be indistinguishable from a drained one.
+pub static CHECKPOINTS_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
+/// v18 item 8: explicit checkpoints that returned an error. Never a barrier failure — the
+/// commit already made the writes durable — but on a full or failing disk the checkpoint is
+/// what fails FIRST, while commits keep appending to a WAL nothing is draining. This is the
+/// number that says so.
+pub static CHECKPOINT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// The three checkpoint counters read together, for the one caller that must read them OUTSIDE
+/// a settle pass.
+///
+/// The barrier that runs the checkpoint (`runtime_core/ticks.rs`, `flush_wal_barrier`) executes
+/// AFTER `QueryManager::process` has closed its `SettlePass`, so the `checkpoints=` field on a
+/// settle line is structurally always zero — measured on the stand, 175 passes, 0 every time,
+/// while the policy underneath was working. A counter that cannot be non-zero where it is
+/// printed is not an instrument, so the barrier reports its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointCounts {
+    pub checkpoints: u64,
+    pub blocked: u64,
+    pub failures: u64,
+}
+
+impl CheckpointCounts {
+    pub fn read() -> Self {
+        Self {
+            checkpoints: CHECKPOINTS.load(Ordering::Relaxed),
+            blocked: CHECKPOINTS_BLOCKED.load(Ordering::Relaxed),
+            failures: CHECKPOINT_FAILURES.load(Ordering::Relaxed),
+        }
+    }
+
+    /// What happened between `base` and `self`. Saturating for the same reason the settle line
+    /// is: these are process-global counters and another runtime in the same process may have
+    /// advanced them, which must read as zero here rather than as an enormous number.
+    pub fn since(self, base: Self) -> Self {
+        Self {
+            checkpoints: self.checkpoints.saturating_sub(base.checkpoints),
+            blocked: self.blocked.saturating_sub(base.blocked),
+            failures: self.failures.saturating_sub(base.failures),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
 
 /// History entries decoded — counted at `decode_history_row_bytes_in_table`,
 /// the choke point every scan path funnels through. Divided by
@@ -321,6 +417,9 @@ pub struct SettleCounts {
     pub instance_evals: u64,
     pub subquery_instantiations: u64,
     pub plan_compiles: u64,
+    pub shape_lowerings: u64,
+    pub units_deferred: u64,
+    pub ticks_rearmed: u64,
     pub policy_row_evals: u64,
     pub scope_authz_checks: u64,
     pub scope_authz_evals: u64,
@@ -328,6 +427,12 @@ pub struct SettleCounts {
     pub index_reads: u64,
     pub rows_emitted: u64,
     pub locator_ladder_recoveries: u64,
+    pub history_locator_ladder_recoveries: u64,
+    pub autocommit_reads: u64,
+    pub read_pass_begin_failures: u64,
+    pub checkpoints: u64,
+    pub checkpoints_blocked: u64,
+    pub checkpoint_failures: u64,
     pub history_scans: u64,
     pub history_entries: u64,
     pub history_bytes: u64,
@@ -358,6 +463,9 @@ impl SettleCounts {
             instance_evals: SUBQUERY_INSTANCE_EVALS.load(Ordering::Relaxed),
             subquery_instantiations: SUBQUERY_INSTANTIATIONS.load(Ordering::Relaxed),
             plan_compiles: PLAN_COMPILES.load(Ordering::Relaxed),
+            shape_lowerings: SHAPE_LOWERINGS.load(Ordering::Relaxed),
+            units_deferred: SETTLE_UNITS_DEFERRED.load(Ordering::Relaxed),
+            ticks_rearmed: SETTLE_TICKS_REARMED.load(Ordering::Relaxed),
             policy_row_evals: POLICY_ROW_EVALS.load(Ordering::Relaxed),
             scope_authz_checks: SCOPE_AUTHZ_CHECKS.load(Ordering::Relaxed),
             scope_authz_evals: SCOPE_AUTHZ_EVALS.load(Ordering::Relaxed),
@@ -365,6 +473,13 @@ impl SettleCounts {
             index_reads: INDEX_READS.load(Ordering::Relaxed),
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
             locator_ladder_recoveries: LOCATOR_LADDER_RECOVERIES.load(Ordering::Relaxed),
+            history_locator_ladder_recoveries: HISTORY_LOCATOR_LADDER_RECOVERIES
+                .load(Ordering::Relaxed),
+            autocommit_reads: AUTOCOMMIT_READS.load(Ordering::Relaxed),
+            read_pass_begin_failures: READ_PASS_BEGIN_FAILURES.load(Ordering::Relaxed),
+            checkpoints: CHECKPOINTS.load(Ordering::Relaxed),
+            checkpoints_blocked: CHECKPOINTS_BLOCKED.load(Ordering::Relaxed),
+            checkpoint_failures: CHECKPOINT_FAILURES.load(Ordering::Relaxed),
             history_scans: HISTORY_SCANS.load(Ordering::Relaxed),
             history_entries: HISTORY_ENTRIES.load(Ordering::Relaxed),
             history_bytes: HISTORY_BYTES.load(Ordering::Relaxed),
@@ -395,6 +510,9 @@ impl SettleCounts {
                 .subquery_instantiations
                 .saturating_sub(base.subquery_instantiations),
             plan_compiles: self.plan_compiles.saturating_sub(base.plan_compiles),
+            shape_lowerings: self.shape_lowerings.saturating_sub(base.shape_lowerings),
+            units_deferred: self.units_deferred.saturating_sub(base.units_deferred),
+            ticks_rearmed: self.ticks_rearmed.saturating_sub(base.ticks_rearmed),
             policy_row_evals: self.policy_row_evals.saturating_sub(base.policy_row_evals),
             scope_authz_checks: self
                 .scope_authz_checks
@@ -408,6 +526,20 @@ impl SettleCounts {
             locator_ladder_recoveries: self
                 .locator_ladder_recoveries
                 .saturating_sub(base.locator_ladder_recoveries),
+            history_locator_ladder_recoveries: self
+                .history_locator_ladder_recoveries
+                .saturating_sub(base.history_locator_ladder_recoveries),
+            autocommit_reads: self.autocommit_reads.saturating_sub(base.autocommit_reads),
+            read_pass_begin_failures: self
+                .read_pass_begin_failures
+                .saturating_sub(base.read_pass_begin_failures),
+            checkpoints: self.checkpoints.saturating_sub(base.checkpoints),
+            checkpoints_blocked: self
+                .checkpoints_blocked
+                .saturating_sub(base.checkpoints_blocked),
+            checkpoint_failures: self
+                .checkpoint_failures
+                .saturating_sub(base.checkpoint_failures),
             history_scans: self.history_scans.saturating_sub(base.history_scans),
             history_entries: self.history_entries.saturating_sub(base.history_entries),
             history_bytes: self.history_bytes.saturating_sub(base.history_bytes),
@@ -497,6 +629,9 @@ impl Drop for SettlePass {
             instance_evals = cost.instance_evals,
             subquery_instantiations = cost.subquery_instantiations,
             plan_compiles = cost.plan_compiles,
+            shape_lowerings = cost.shape_lowerings,
+            units_deferred = cost.units_deferred,
+            ticks_rearmed = cost.ticks_rearmed,
             policy_row_evals = cost.policy_row_evals,
             scope_authz_checks = cost.scope_authz_checks,
             scope_authz_evals = cost.scope_authz_evals,
@@ -504,6 +639,12 @@ impl Drop for SettlePass {
             index_reads = cost.index_reads,
             rows_emitted = cost.rows_emitted,
             locator_ladder_recoveries = cost.locator_ladder_recoveries,
+            history_locator_ladder_recoveries = cost.history_locator_ladder_recoveries,
+            autocommit_reads = cost.autocommit_reads,
+            read_pass_begin_failures = cost.read_pass_begin_failures,
+            checkpoints = cost.checkpoints,
+            checkpoints_blocked = cost.checkpoints_blocked,
+            checkpoint_failures = cost.checkpoint_failures,
             history_scans = cost.history_scans,
             history_entries = cost.history_entries,
             history_bytes = cost.history_bytes,

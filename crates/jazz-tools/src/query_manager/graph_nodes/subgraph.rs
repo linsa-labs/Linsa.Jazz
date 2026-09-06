@@ -5,13 +5,33 @@
 //! a SubgraphInstance with its own state.
 
 use crate::query_manager::graph::QueryGraph;
-use crate::query_manager::query::{Query, QueryBuilder};
+use crate::query_manager::query::{Condition, Query, QueryBuildError, QueryBuilder};
+use crate::query_manager::relation_ir_query_plan::ExecutionQueryPlan;
 use crate::query_manager::session::Session;
-use crate::query_manager::types::{RowDescriptor, RowPolicyMode, Schema, Value};
+use crate::query_manager::types::{RowDescriptor, RowPolicyMode, Schema, SchemaHash, Value};
 use crate::schema_manager::SchemaContext;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// v18 item 7: a template's inner shape, lowered once.
+///
+/// `plan` is `lower(instance_query(Null))`: the rebuilt query with `Null` in the correlation
+/// slot, lowered to an execution plan with the table and descriptor checks done. Lowering is
+/// value-neutral (every step clones the value; the value-dependent work — index-scan choice,
+/// scan-value normalisation — is in the compile, which stays per instance), so the plan of
+/// any instance is this plan with its value in the slot.
+#[derive(Debug, Clone)]
+struct CachedShape {
+    /// The schema the plan was lowered against; an `instantiate` with another schema lowers
+    /// afresh instead of trusting the cache.
+    schema: Arc<Schema>,
+    plan: ExecutionQueryPlan,
+    /// The correlation column as the lowering left it at position 0 of every conjunction
+    /// (`_id` for a row-id correlation).
+    bound_column: String,
+}
 
 /// Template for creating subgraph instances.
 ///
@@ -35,6 +55,28 @@ pub struct SubgraphTemplate {
     session: Option<Session>,
     /// Policy mode inherited from the parent graph compile.
     row_policy_mode: RowPolicyMode,
+    /// v18 item 7: how many times this template's shape was lowered to an execution plan.
+    /// Shared by every clone of the template, so a gate can read it through the node.
+    shape_lowerings: Arc<std::sync::atomic::AtomicU64>,
+    /// v18 item 7: the shape lowered once. Set only on success: a shape that does not fit the
+    /// position-0 invariant is not cached (every instance then lowers uncached, and
+    /// `shape_lowerings` shows it). A clone of the template copies the cell, populated or
+    /// not; both are correct because the plan is a function of the immutable fields above —
+    /// and no clone exists on the hot path (`instantiate` takes `&self`).
+    shape: OnceLock<CachedShape>,
+    /// v18 item 7: set when the shape could not be lowered or cached (a build or lowering
+    /// failure, or a shape outside the position-0 invariant): every later instance goes
+    /// straight to the uncached lowering — one lowering per instance, today's cost — instead
+    /// of retrying the shape first. The first instance pays the failed attempt plus its own.
+    /// Set on every `None`-after-attempt exit of `bound_plan`, under whichever schema (not
+    /// keyed by schema). A clone copies the cell, like `shape`: a template retired stays
+    /// retired in its clones.
+    uncacheable: OnceLock<()>,
+    /// v18 item 7: the branch -> schema hash map of `schema_context`, built once per template
+    /// and handed to every instance's compile (today's compile rebuilt it per instance).
+    branch_schema_map: OnceLock<HashMap<String, SchemaHash>>,
+    /// v18 item 7: how many times the branch map was built (a gate reads it: once).
+    branch_map_builds: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SubgraphTemplate {
@@ -62,23 +104,69 @@ impl SubgraphTemplate {
             schema_context,
             session,
             row_policy_mode,
+            shape_lowerings: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            shape: OnceLock::new(),
+            uncacheable: OnceLock::new(),
+            branch_schema_map: OnceLock::new(),
+            branch_map_builds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// v18 item 7: lowerings of this template's shape so far (one per instance today).
+    #[cfg(any(test, feature = "test"))]
+    pub fn shape_lowerings_for_test(&self) -> u64 {
+        self.shape_lowerings
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a subgraph instance with a bound correlation value.
     ///
-    /// This compiles a fresh query graph with the correlation value as an
-    /// equality filter on the inner column.
+    /// The shape — the rebuilt inner query lowered to an execution plan — is lowered once
+    /// per template (`lower_shape`); each instance binds its value into a clone of that plan
+    /// and compiles it.
     pub fn instantiate(
         &self,
         correlation_value: Value,
         schema: &Arc<Schema>,
     ) -> Option<SubgraphInstance> {
-        // Settle-cost accounting: counted on entry, because the query rebuild
-        // below runs whether or not the compile ultimately succeeds.
+        // Settle-cost accounting: counted on entry, because the binding and compile
+        // below run whether or not the compile ultimately succeeds.
         crate::query_manager::settle_cost::bump(
             &crate::query_manager::settle_cost::SUBQUERY_INSTANTIATIONS,
         );
+        // Fail closed on a shape miss: today's per-instance lowering, counted as a lowering
+        // so the stand shows a template that never caches.
+        let plan = match self.bound_plan(&correlation_value, schema) {
+            Some(plan) => plan,
+            None => self.uncached_plan(&correlation_value, schema)?,
+        };
+        let branch_schema_map = self.branch_schema_map.get_or_init(|| {
+            self.branch_map_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QueryGraph::branch_schema_map_for_shared_context(&self.schema_context)
+        });
+        let graph = QueryGraph::compile_plan_with_branch_map(
+            &plan,
+            schema,
+            self.session.clone(),
+            &self.schema_context,
+            self.row_policy_mode,
+            branch_schema_map,
+        )
+        .ok()?;
+
+        Some(SubgraphInstance {
+            graph,
+            correlation_value,
+            current_results: Vec::new(),
+        })
+    }
+
+    /// The inner query for one correlation value, rebuilt through the builder exactly as
+    /// every instance was built before item 7: correlation `Eq` first, then the base
+    /// conditions, order, limit, offset, select and nested subqueries. The cache lowers
+    /// this with `Value::Null`; the uncached test path lowers it with the real value.
+    fn instance_query(&self, value: &Value) -> Result<Query, QueryBuildError> {
         // Build query with correlation filter
         let mut query_builder = QueryBuilder::new(self.base_query.table);
         if self.base_query.branches.is_empty() {
@@ -102,7 +190,7 @@ impl SubgraphTemplate {
         }
 
         // Add correlation filter: inner_column = correlation_value
-        query_builder = query_builder.filter_eq(&self.inner_column, correlation_value.clone());
+        query_builder = query_builder.filter_eq(&self.inner_column, value.clone());
 
         // Apply original filters from base query
         for disjunct in &self.base_query.disjuncts {
@@ -174,21 +262,200 @@ impl SubgraphTemplate {
             query_builder = query_builder.result_element_index(index);
         }
 
-        let query = query_builder.try_build().ok()?;
-        let graph = QueryGraph::try_compile_with_schema_context_shared(
+        query_builder.try_build()
+    }
+
+    /// A shape miss: the cache is not used for this template, and every instance falls back
+    /// to today's per-instance lowering (`uncacheable` remembers it). A `warn!` and, on the
+    /// stand, `shape_lowerings` ≈ instances instead of ≈ templates. Not an assert: a miss is
+    /// survivable, and one injected condition ahead of the correlation (a future implicit
+    /// predicate) must not panic every debug build.
+    fn shape_miss(what: &str) -> Option<CachedShape> {
+        tracing::warn!(
+            what,
+            "subgraph shape miss: the include lowers uncached per instance"
+        );
+        None
+    }
+
+    /// Count one lowering of this template's shape (cached or uncached).
+    fn note_lowering(&self) {
+        self.shape_lowerings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::SHAPE_LOWERINGS,
+        );
+    }
+
+    /// Today's per-instance lowering, `lower(instance_query(value))` — the fallback of a
+    /// shape miss. Counted as a lowering.
+    fn uncached_plan(&self, value: &Value, schema: &Arc<Schema>) -> Option<ExecutionQueryPlan> {
+        self.note_lowering();
+        let query = self.instance_query(value).ok()?;
+        QueryGraph::lower_query_with_schema_context_shared(&query, schema, &self.schema_context)
+            .ok()
+    }
+
+    /// Lower the shape once: `lower(instance_query(Null))`. Counted on this template and in
+    /// `settle_cost::SHAPE_LOWERINGS`. Fails closed: if the correlation is not the `Eq` at
+    /// position 0 of every conjunction the shape is not cacheable — a `Null` left in the slot
+    /// would compile as `IS NULL` — and `instantiate` lowers the instance uncached instead.
+    fn lower_shape(&self, schema: &Arc<Schema>) -> Option<CachedShape> {
+        self.note_lowering();
+        let query = match self.instance_query(&Value::Null) {
+            Ok(query) => query,
+            Err(error) => {
+                tracing::warn!(
+                    table = self.table(),
+                    column = %self.inner_column,
+                    %error,
+                    "subgraph shape miss: the include's instance query does not build"
+                );
+                return None;
+            }
+        };
+        let plan = match QueryGraph::lower_query_with_schema_context_shared(
             &query,
             schema,
-            self.session.clone(),
             &self.schema_context,
-            self.row_policy_mode,
-        )
-        .ok()?;
-
-        Some(SubgraphInstance {
-            graph,
-            correlation_value,
-            current_results: Vec::new(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    table = self.table(),
+                    column = %self.inner_column,
+                    %error,
+                    "subgraph shape miss: the include's shape does not lower under this schema"
+                );
+                return None;
+            }
+        };
+        let Some(first_conjunction) = plan.disjuncts.first() else {
+            return Self::shape_miss("the lowering has no conjunction");
+        };
+        let bound_column = match first_conjunction.conditions.first() {
+            Some(Condition::Eq {
+                column,
+                value: Value::Null,
+            }) => column.clone(),
+            other => {
+                return Self::shape_miss(&format!(
+                    "the correlation must lower to position 0 of the first conjunction, found {other:?}"
+                ));
+            }
+        };
+        let every_conjunction_leads_with_it = plan.disjuncts.iter().all(|conjunction| {
+            matches!(
+                conjunction.conditions.first(),
+                Some(Condition::Eq { column, value: Value::Null }) if *column == bound_column
+            )
+        });
+        if !every_conjunction_leads_with_it {
+            return Self::shape_miss(&format!(
+                "every conjunction must lead with the correlation column {bound_column}"
+            ));
+        }
+        Some(CachedShape {
+            schema: Arc::clone(schema),
+            plan,
+            bound_column,
         })
+    }
+
+    /// The cached shape bound to one correlation value: the value replaces the `Null` at
+    /// position 0 of every conjunction — by position and column, never by searching for a
+    /// `Null` (base conditions may carry `Null` values of their own).
+    fn bound_plan(&self, value: &Value, schema: &Arc<Schema>) -> Option<ExecutionQueryPlan> {
+        if self.uncacheable.get().is_some() {
+            return None;
+        }
+        let fresh;
+        let shape = match self.shape.get() {
+            Some(shape) if Arc::ptr_eq(&shape.schema, schema) => shape,
+            // Another schema than the cached one: lower afresh for this instance and keep
+            // the cache (the node's own schema is the one that recurs). A failed lowering
+            // here marks the template too: `uncacheable` is not keyed by schema (a miss
+            // under any schema retires the cache for good; this arm is unreachable in
+            // production — the node's schema is the one that recurs).
+            Some(_) => {
+                let Some(lowered) = self.lower_shape(schema) else {
+                    let _ = self.uncacheable.set(());
+                    return None;
+                };
+                fresh = lowered;
+                &fresh
+            }
+            // Not cached yet: lower, and cache only a success; a miss is remembered so the
+            // next instance does not pay the attempt again.
+            None => {
+                let Some(lowered) = self.lower_shape(schema) else {
+                    let _ = self.uncacheable.set(());
+                    return None;
+                };
+                let _ = self.shape.set(lowered);
+                match self.shape.get() {
+                    Some(shape) if Arc::ptr_eq(&shape.schema, schema) => shape,
+                    // Unreachable by construction (`&mut` reaches `instantiate`, no clone
+                    // site between the set and this read); marked all the same so every
+                    // `None`-after-attempt exit retires the cache (diff r4 SF1).
+                    _ => {
+                        let _ = self.uncacheable.set(());
+                        return None;
+                    }
+                }
+            }
+        };
+        let mut plan = shape.plan.clone();
+        for conjunction in &mut plan.disjuncts {
+            match conjunction.conditions.first_mut() {
+                Some(Condition::Eq {
+                    column,
+                    value: slot,
+                }) if *column == shape.bound_column && *slot == Value::Null => {
+                    *slot = value.clone();
+                }
+                other => {
+                    Self::shape_miss(&format!(
+                        "the cached shape lost its correlation slot: {other:?}"
+                    ));
+                    let _ = self.uncacheable.set(());
+                    return None;
+                }
+            }
+        }
+        Some(plan)
+    }
+
+    /// v18 item 7, test only: today's per-instance lowering, `lower(instance_query(value))`,
+    /// for the plan-equality gates. The same rebuild the cache uses, so it duplicates no
+    /// production lowering.
+    #[cfg(any(test, feature = "test"))]
+    pub(crate) fn instantiate_plan_uncached_for_test(
+        &self,
+        value: &Value,
+        schema: &Arc<Schema>,
+    ) -> Option<ExecutionQueryPlan> {
+        let query = self.instance_query(value).ok()?;
+        QueryGraph::lower_query_with_schema_context_shared(&query, schema, &self.schema_context)
+            .ok()
+    }
+
+    /// v18 item 7, test only: how many times this template built its branch map.
+    #[cfg(any(test, feature = "test"))]
+    pub fn branch_map_builds_for_test(&self) -> u64 {
+        self.branch_map_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// v18 item 7, test only: the cached shape bound to `value`, the plan `instantiate`
+    /// compiles.
+    #[cfg(any(test, feature = "test"))]
+    pub(crate) fn bind_for_test(
+        &self,
+        value: &Value,
+        schema: &Arc<Schema>,
+    ) -> Option<ExecutionQueryPlan> {
+        self.bound_plan(value, schema)
     }
 
     /// Get the inner table name.

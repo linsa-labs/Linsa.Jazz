@@ -59,10 +59,17 @@ mod test_override {
     /// The embedded mutex guard serialises every test that forces a mode, so
     /// force-users cannot observe each other's override. Tests that do NOT
     /// force a mode may still observe a forced-OFF window from a parallel
-    /// force-user — that window reverts to the legacy path, which every
-    /// pre-existing suite is green under; tests that DEPEND on precise
-    /// behavior must hold a `force_precise_dirty(true)` guard. Dropping
-    /// restores the unforced default.
+    /// force-user; tests that DEPEND on precise behavior must hold a
+    /// `force_precise_dirty(true)` guard. Dropping restores the unforced default.
+    ///
+    /// The reassurance this doc used to offer — "that window reverts to the legacy path, which
+    /// every pre-existing suite is green under" — is FALSE for any test the window only partly
+    /// covers, and that is the dangerous case. A write inside the window marks a graph node
+    /// dirty without buffering instance dirt (`array_subquery::note_inner_rows_changed` returns
+    /// early when precise is off); a settle after the window consults the instance dirt and
+    /// finds none. Neither half is a legacy run — the signal is simply lost between two
+    /// mechanisms. `manager_tests/settle_budget.rs` lost twenty subscriptions this way and read
+    /// as an intermittent liveness bug in an unrelated feature for two oracle rounds.
     pub struct PreciseDirtyMode {
         _serialised: MutexGuard<'static, ()>,
     }

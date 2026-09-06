@@ -2189,12 +2189,17 @@ mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
 mod locator_ladder_heal;
+mod locator_persistence_differential;
+mod locator_warmth;
 mod query_subscription;
+mod read_pass;
 mod rejected_write_retires_tracking;
 mod schema_catalogue;
 mod sealed_batch_cost;
+mod settle_budget_ticks;
 mod subscription_fanout_cost;
 mod subscription_registration_cost;
+mod support;
 mod sync_replay;
 mod unappliable_row_logging;
 mod write_batch;
@@ -6755,4 +6760,588 @@ fn an_owner_updates_their_split_family_row_under_the_permissions_head() {
         Some(&carol_ctx),
     )
     .expect("a same-world update still applies");
+}
+
+/// Gate G5 (linsa-v18, item 1): a one-shot read whose caller gave up must be
+/// cancellable, and cancelling must release the engine's subscription and tell the
+/// server, so an abandoned read stops costing settle passes on both engines.
+///
+/// Internal-level test, on purpose: the observable is "the engine no longer holds a
+/// subscription for a read the consumer abandoned", which no public client API exposes
+/// (there is no live-subscription count on `JazzClient`, and the black-box variant would
+/// need a server with blocked messages plus a Rust-level query deadline that does not
+/// exist).
+#[test]
+fn cancelled_one_shot_query_releases_its_subscription_and_unsubscribes_upstream() {
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::{QueryId, QueryPropagation};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    let app_id = AppId::from_name("cancel-one-shot");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.add_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let baseline = core.schema_manager().query_manager().subscription_count();
+    // A tiered read: it resolves only on the server's QuerySettled, which never comes
+    // here — exactly the read a facade times out on.
+    let (handle, mut future) = core
+        .query_with_local_batch_tracked(
+            Query::new("users"),
+            None,
+            ReadDurabilityOptions {
+                tier: Some(DurabilityTier::EdgeServer),
+                local_updates: LocalUpdates::Immediate,
+            },
+            QueryPropagation::Full,
+            None,
+        )
+        .expect("query setup");
+    core.batched_tick();
+    let registered = core.sync_sender().take();
+    assert_eq!(
+        count_query_subscriptions_to_server(&registered, server_id),
+        1,
+        "the one-shot read registers a subscription at the server"
+    );
+    let registered_query_id = registered
+        .iter()
+        .find_map(|entry| match &entry.payload {
+            SyncPayload::QuerySubscription { query_id, .. } => Some(*query_id),
+            _ => None,
+        })
+        .expect("registration carries the query id");
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        matches!(Pin::new(&mut future).poll(&mut cx), Poll::Pending),
+        "without the server's settle the read is still pending"
+    );
+    assert_eq!(
+        core.schema_manager().query_manager().subscription_count(),
+        baseline + 1
+    );
+    assert_eq!(core.pending_one_shot_query_count(), 1);
+    // The caller's deadline fires.
+    let released = core.cancel_one_shot_query(handle);
+    assert_eq!(
+        core.schema_manager().query_manager().subscription_count(),
+        baseline,
+        "cancelling releases the engine's subscription for the abandoned read"
+    );
+    assert!(
+        released,
+        "a pending one-shot query reports that it was released"
+    );
+    assert_eq!(core.pending_one_shot_query_count(), 0);
+    match Pin::new(&mut future).poll(&mut cx) {
+        Poll::Ready(Err(RuntimeError::QueryCancelled)) => {}
+        other => panic!("the abandoned read must resolve as cancelled, got {other:?}"),
+    }
+    core.batched_tick();
+    let after = core.sync_sender().take();
+    let unsubscribed: Vec<QueryId> = after
+        .iter()
+        .filter(|entry| entry.destination == Destination::Server(server_id))
+        .filter_map(|entry| match &entry.payload {
+            SyncPayload::QueryUnsubscription { query_id } => Some(*query_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unsubscribed,
+        vec![registered_query_id],
+        "the server is told to drop exactly that registration, once: {after:?}"
+    );
+    assert!(
+        !core.cancel_one_shot_query(handle),
+        "a second cancel finds nothing to release"
+    );
+}
+
+/// Gate G5b: the deadline can fire before the registration ever left the node. What
+/// leaves then is the subscribe followed by its unsubscribe, in that order, on one tick —
+/// the pair the server must collapse (see `an_unsubscription_withdraws_a_registration_parked_in_the_same_pass`).
+#[test]
+fn cancelling_before_the_registration_left_sends_subscribe_then_unsubscribe_in_order() {
+    // Internal on purpose: the observable is the ORDER of two frames on the sync sender
+    // within one tick, which no public surface exposes.
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::QueryPropagation;
+    let app_id = AppId::from_name("cancel-one-shot-early");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.add_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let baseline = core.schema_manager().query_manager().subscription_count();
+    let (handle, _future) = core
+        .query_with_local_batch_tracked(
+            Query::new("users"),
+            None,
+            ReadDurabilityOptions {
+                tier: Some(DurabilityTier::EdgeServer),
+                local_updates: LocalUpdates::Immediate,
+            },
+            QueryPropagation::Full,
+            None,
+        )
+        .expect("query setup");
+    assert!(core.cancel_one_shot_query(handle));
+    assert_eq!(
+        core.schema_manager().query_manager().subscription_count(),
+        baseline
+    );
+    core.batched_tick();
+    let kinds: Vec<&'static str> = core
+        .sync_sender()
+        .take()
+        .iter()
+        .filter(|entry| entry.destination == Destination::Server(server_id))
+        .filter_map(|entry| match &entry.payload {
+            SyncPayload::QuerySubscription { .. } => Some("subscribe"),
+            SyncPayload::QueryUnsubscription { .. } => Some("unsubscribe"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, vec!["subscribe", "unsubscribe"]);
+}
+
+/// Server-side half of gate G5: a subscribe and its unsubscribe parked in the same pass
+/// must leave no server subscription behind. The query manager drains unsubscriptions
+/// before subscriptions, so without the withdrawal in the inbox the registration would be
+/// created AFTER its own unsubscription and live until the client disconnects.
+#[test]
+fn an_unsubscription_withdraws_a_registration_parked_in_the_same_pass() {
+    let app_id = AppId::from_name("withdraw-parked-registration");
+    let sync_manager = SyncManager::new().with_durability_tier(DurabilityTier::EdgeServer);
+    let schema_manager =
+        SchemaManager::new(sync_manager, test_schema(), app_id, "dev", "main").unwrap();
+    let mut server = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    server.immediate_tick();
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("reader")));
+    server.batched_tick();
+    server.sync_sender().take();
+    let query = server
+        .schema_manager_mut()
+        .query_manager_mut()
+        .query("users")
+        .build();
+    let query_id = crate::sync_manager::QueryId(7);
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id,
+            query: Box::new(query),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QueryUnsubscription { query_id },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    server.batched_tick();
+    assert_eq!(
+        server
+            .schema_manager()
+            .query_manager()
+            .server_subscription_count(),
+        0,
+        "a registration withdrawn in the same pass must not outlive its unsubscription"
+    );
+}
+
+/// Gate G5c: the deadline fires while the upstream is still pending — and has been for
+/// longer than `PENDING_SERVER_TIMEOUT`. The registration was handed to the transport while
+/// the upstream was young enough to write to, and the transport delivers it on the next
+/// connection however late that is; the unsubscription must reach that server too, or the
+/// registration outlives everything local that could withdraw it. This is the incident
+/// shape: jazz-sync stalls, the socket drops, reads time out, the socket comes back.
+#[test]
+fn cancelling_a_read_registered_at_an_upstream_whose_connection_attempt_failed_still_unsubscribes_it()
+ {
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::{QueryId, QueryPropagation};
+    // Internal on purpose: `remove_pending_server` is the core's own arm for `ConnectFailed`
+    // and the registration marker it must forget is core state.
+    // G5e. The transport buffers a registration pushed at a pending upstream and keeps it
+    // across failed connection attempts; `ConnectFailed` reaches the core as
+    // `remove_pending_server`. If that call forgets the registration marker, a cancellation
+    // in the backoff window sends no unsubscription, and the registration lands at the
+    // server on the next attempt with nothing to withdraw it.
+    let app_id = AppId::from_name("cancel-one-shot-connect-failed");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_pending_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let (handle, _future) = core
+        .query_with_local_batch_tracked(
+            Query::new("users"),
+            None,
+            ReadDurabilityOptions {
+                tier: Some(DurabilityTier::EdgeServer),
+                local_updates: LocalUpdates::Immediate,
+            },
+            QueryPropagation::Full,
+            None,
+        )
+        .expect("query setup");
+    core.batched_tick();
+    let registered = core.sync_sender().take();
+    let registered_query_id = registered
+        .iter()
+        .find_map(|entry| match (&entry.destination, &entry.payload) {
+            (Destination::Server(id), SyncPayload::QuerySubscription { query_id, .. })
+                if *id == server_id =>
+            {
+                Some(*query_id)
+            }
+            _ => None,
+        })
+        .expect("a young pending upstream still receives the registration");
+    // The connection attempt fails; the transport still holds the registration.
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .remove_pending_server(server_id);
+    assert!(core.cancel_one_shot_query(handle));
+    core.batched_tick();
+    let unsubscribed: Vec<QueryId> = core
+        .sync_sender()
+        .take()
+        .iter()
+        .filter(|entry| entry.destination == Destination::Server(server_id))
+        .filter_map(|entry| match &entry.payload {
+            SyncPayload::QueryUnsubscription { query_id } => Some(*query_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unsubscribed,
+        vec![registered_query_id],
+        "the registration the transport still buffers for the failed upstream must be \
+         withdrawn by an unsubscription addressed to that same upstream"
+    );
+    assert!(
+        core.schema_manager()
+            .query_manager()
+            .sync_manager()
+            .pending_server_query_subscription_count_for_test()
+            == 0,
+        "no registration marker may survive the cancellation"
+    );
+}
+
+#[test]
+fn a_registration_that_fails_to_compile_is_released_from_admission() {
+    // Internal on purpose: a pending upstream (`add_pending_server`) and the frames the core
+    // buffers for it are core state with no public observer.
+    use crate::sync_manager::{QueryId, QueryPropagation, SubscriptionCaps};
+    // Admission charges the principal when the frame is accepted, before the pass compiles
+    // the query; a compile failure must give the charge back, or a client could be walled off
+    // by its own typos (and an attacker could fill the ceiling with queries that cost nothing).
+    // Internal on purpose: the observable is the admitted count on the sync manager, which no
+    // public surface exposes — a client only sees its own rejection frame.
+    let app_id = AppId::from_name("admission-compile-failure");
+    let sync = SyncManager::new()
+        .with_durability_tier(DurabilityTier::EdgeServer)
+        .with_subscription_caps(SubscriptionCaps::default());
+    let schema_manager = SchemaManager::new(sync, test_schema(), app_id, "dev", "main").unwrap();
+    let mut server = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    server.immediate_tick();
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("reader")));
+    server.batched_tick();
+    let query_id = QueryId(11);
+    server.park_sync_message(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id,
+            query: Box::new(Query::new("no_such_table")),
+            session: Some(Session::new("reader")),
+            required_tier: None,
+            propagation: QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    server.batched_tick();
+    server.immediate_tick();
+    server.batched_tick();
+    let rejected = server.sync_sender().take().iter().any(|entry| {
+        matches!(
+            &entry.payload,
+            SyncPayload::Error(crate::sync_manager::SyncError::QuerySubscriptionRejected { query_id: id, .. }) if *id == query_id
+        )
+    });
+    assert!(rejected, "a query on an unknown table is rejected");
+    assert_eq!(
+        server
+            .schema_manager()
+            .query_manager()
+            .sync_manager()
+            .total_admitted_subscriptions(),
+        0,
+        "the charge for a registration that never compiled must be released"
+    );
+}
+
+#[test]
+fn a_tiered_read_hands_its_registration_to_the_transport_inside_the_query_call() {
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::QueryPropagation;
+    // GB (v18 item 3, half B). Internal on purpose: the observable is "the sync sender
+    // received the registration before any tick ran", which only the captured sender can
+    // see. Today the registration sits in the outbox until the next batched tick, and that
+    // tick must win the engine lock behind whatever pass is running.
+    let app_id = AppId::from_name("registration-leaves-in-the-query-call");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_pending_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let (_handle, _future) = core
+        .query_with_local_batch_tracked(
+            Query::new("users"),
+            None,
+            ReadDurabilityOptions {
+                tier: Some(DurabilityTier::EdgeServer),
+                local_updates: LocalUpdates::Immediate,
+            },
+            QueryPropagation::Full,
+            None,
+        )
+        .expect("query setup");
+    // No tick of any kind between the query call and this assertion.
+    let registered = core.sync_sender().take().iter().any(|entry| {
+        entry.destination == Destination::Server(server_id)
+            && matches!(entry.payload, SyncPayload::QuerySubscription { .. })
+    });
+    assert!(
+        registered,
+        "the registration must reach the sync sender inside the query call, not on the \
+         next batched tick"
+    );
+}
+
+#[test]
+fn a_tiered_subscription_hands_its_registration_to_the_transport_inside_the_subscribe_call() {
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::QueryPropagation;
+    // GB twin (v18 item 3, half B), the subscribe path. `create_subscription` +
+    // `execute_subscription` flush the registration at a different site than the query call
+    // does, so a disarm of either site is visible to exactly one of the two gates (the
+    // falsification of the query-call gate alone left the subscribe site uncovered).
+    // Internal on purpose: same observable as the query-call gate above.
+    let app_id = AppId::from_name("registration-leaves-in-the-subscribe-call");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_pending_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let handle = core.create_subscription(
+        Query::new("users"),
+        None,
+        ReadDurabilityOptions {
+            tier: Some(DurabilityTier::EdgeServer),
+            local_updates: LocalUpdates::Immediate,
+        },
+        QueryPropagation::Full,
+    );
+    core.execute_subscription(handle, |_delta| {})
+        .expect("subscription setup");
+    // No tick of any kind between the execute call and this assertion.
+    let registered = core.sync_sender().take().iter().any(|entry| {
+        entry.destination == Destination::Server(server_id)
+            && matches!(entry.payload, SyncPayload::QuerySubscription { .. })
+    });
+    assert!(
+        registered,
+        "the registration must reach the sync sender inside the subscribe call, not on the \
+         next batched tick"
+    );
+}
+
+#[test]
+fn a_failed_re_registration_of_a_live_query_ends_the_old_subscription() {
+    use crate::sync_manager::{QueryId, QueryPropagation, SubscriptionCaps};
+    // A re-registration of a held id is admitted without a charge (replays are free), so it
+    // reaches compile; if it fails there, the rejection tells the client the id is dead and
+    // the charge is released. The old subscription under that id must end with it —
+    // otherwise a client can grow live, uncounted server subscriptions one failed
+    // re-registration at a time, past every cap. The registration this server forwarded
+    // upstream for the replaced query must be withdrawn there too, or it settles at the
+    // upstream, charged to this server, for the life of the connection.
+    // Internal on purpose: live server subscriptions, admitted charges and the upstream
+    // outbox are engine state no public surface exposes.
+    let app_id = AppId::from_name("admission-failed-re-registration");
+    let sync = SyncManager::new()
+        .with_durability_tier(DurabilityTier::EdgeServer)
+        .with_subscription_caps(SubscriptionCaps::default());
+    let schema_manager = SchemaManager::new(sync, test_schema(), app_id, "dev", "main").unwrap();
+    let mut server = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    server.immediate_tick();
+    let client_id = ClientId::new();
+    server.add_client(client_id, Some(Session::new("reader")));
+    let upstream = ServerId::new();
+    server
+        .schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_pending_server(upstream);
+    server.batched_tick();
+    server.sync_sender().take();
+    let query_id = QueryId(21);
+    let register = |server: &mut RuntimeCore<MemoryStorage, NoopScheduler>, table: &str| {
+        server.park_sync_message(InboxEntry {
+            source: Source::Client(client_id),
+            payload: SyncPayload::QuerySubscription {
+                query_id,
+                query: Box::new(Query::new(table)),
+                session: Some(Session::new("reader")),
+                required_tier: None,
+                propagation: QueryPropagation::Full,
+                policy_context_tables: vec![],
+            },
+        });
+        server.batched_tick();
+        server.immediate_tick();
+        server.batched_tick();
+    };
+    let counts = |server: &RuntimeCore<MemoryStorage, NoopScheduler>| {
+        let qm = server.schema_manager().query_manager();
+        (
+            qm.server_subscription_count(),
+            qm.sync_manager().total_admitted_subscriptions(),
+        )
+    };
+    register(&mut server, "users");
+    assert_eq!(
+        counts(&server),
+        (1, 1),
+        "the first registration is live and counted"
+    );
+    let forwarded = server.sync_sender().take().iter().any(|entry| {
+        matches!(
+            (&entry.destination, &entry.payload),
+            (Destination::Server(id), SyncPayload::QuerySubscription { query_id: q, .. }) if *id == upstream && *q == query_id
+        )
+    });
+    assert!(
+        forwarded,
+        "fixture precondition: a full-propagation registration is forwarded to the upstream"
+    );
+    register(&mut server, "no_such_table");
+    assert_eq!(
+        counts(&server),
+        (0, 0),
+        "a re-registration that fails to compile ends the subscription it replaced: live \
+         server subscriptions and admitted charges must both be zero"
+    );
+    let withdrawn = server.sync_sender().take().iter().any(|entry| {
+        matches!(
+            (&entry.destination, &entry.payload),
+            (Destination::Server(id), SyncPayload::QueryUnsubscription { query_id: q }) if *id == upstream && *q == query_id
+        )
+    });
+    assert!(
+        withdrawn,
+        "the registration forwarded upstream for the replaced query must be withdrawn there"
+    );
+}
+
+#[test]
+fn cancelling_a_read_registered_at_a_long_pending_upstream_still_unsubscribes_it() {
+    use crate::query_manager::manager::LocalUpdates;
+    use crate::sync_manager::{PENDING_SERVER_TIMEOUT, QueryId, QueryPropagation};
+    let app_id = AppId::from_name("cancel-one-shot-pending-upstream");
+    let schema_manager =
+        SchemaManager::new(SyncManager::new(), test_schema(), app_id, "dev", "main").unwrap();
+    let mut core = new_test_core(schema_manager, MemoryStorage::new(), NoopScheduler);
+    let server_id = ServerId::new();
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .add_pending_server(server_id);
+    core.immediate_tick();
+    core.batched_tick();
+    core.sync_sender().take();
+    let (handle, _future) = core
+        .query_with_local_batch_tracked(
+            Query::new("users"),
+            None,
+            ReadDurabilityOptions {
+                tier: Some(DurabilityTier::EdgeServer),
+                local_updates: LocalUpdates::Immediate,
+            },
+            QueryPropagation::Full,
+            None,
+        )
+        .expect("query setup");
+    core.batched_tick();
+    let registered = core.sync_sender().take();
+    let registered_query_id = registered
+        .iter()
+        .find_map(|entry| match (&entry.destination, &entry.payload) {
+            (Destination::Server(id), SyncPayload::QuerySubscription { query_id, .. })
+                if *id == server_id =>
+            {
+                Some(*query_id)
+            }
+            _ => None,
+        })
+        .expect("a young pending upstream still receives the registration");
+    // The upstream stays pending past the point where outbound writes stop targeting it.
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .age_pending_server_for_test(server_id, PENDING_SERVER_TIMEOUT * 3);
+    assert!(core.cancel_one_shot_query(handle));
+    core.batched_tick();
+    let unsubscribed: Vec<QueryId> = core
+        .sync_sender()
+        .take()
+        .iter()
+        .filter(|entry| entry.destination == Destination::Server(server_id))
+        .filter_map(|entry| match &entry.payload {
+            SyncPayload::QueryUnsubscription { query_id } => Some(*query_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        unsubscribed,
+        vec![registered_query_id],
+        "the unsubscription must follow the registration to the pending upstream"
+    );
 }

@@ -670,8 +670,52 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Call this after any mutation operation (insert, update, delete, etc.)
     /// to process the change and schedule any required I/O.
     pub fn immediate_tick(&mut self) -> TickOutput {
+        // v18 item 6: one settle clock per lock hold — the outermost tick owns it, nested
+        // ticks inherit (design v3 § B2, v4 SF2). The re-arm belongs to the clock's owner:
+        // when its hold ends it takes the flag a pass set by deferring non-stalled work for
+        // budget and re-arms exactly once. A nested tick leaves the flag for its owner —
+        // a batched tick's continuation (3b) reads it first, and re-arming here as well
+        // counted one deferral twice (design v8, gate G6-7(f)).
+        // The clock is released even if the tick panics (diff r2 S7): a clock left set would
+        // make every later `begin_tick` look nested, and under a budget no unit would run
+        // again.
+        //
+        // CORRECTED (diff r30). This used to end "...on a host that survives a caught panic
+        // (RN's panic boundary)", and that host does not exist in this tree: every host holds
+        // the core behind a `Mutex` and none calls `into_inner()`, so a panic that unwinds
+        // through a tick poisons it and the runtime is finished — `runtime_tokio.rs:166-173`
+        // says so in as many words, and `jazz-rn:773-779` returns `lock poisoned`. RN's own
+        // boundary is one layer further out: it wraps the JS subscription callback
+        // (`jazz-rn/rust/src/lib.rs:399-410`) so that panic never reaches a tick at all. The
+        // release stays — it costs a landing pad this function already pays for and it keeps
+        // the invariant true — but it is hygiene, not a live outage being prevented, and
+        // `sqlite.rs:737` ("no host runs another pass over a poisoned core") is the statement
+        // of this that the sources actually support.
+        let owns_clock = self.schema_manager.query_manager_mut().begin_tick();
+        // Only the owner catches (diff r3 S2): a nested tick has nothing to release, so it
+        // pays no landing pad. The clock is released BEFORE the re-arm (diff r3 S1): the
+        // re-arm ends in the host's `schedule_batched_tick`, which may panic, and it reads
+        // only the flag, never the clock.
+        let output = if owns_clock {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.immediate_tick_inner()))
+        } else {
+            Ok(self.immediate_tick_inner())
+        };
+        if owns_clock {
+            self.schema_manager.query_manager_mut().end_tick();
+            if output.is_ok() {
+                self.rearm_for_deferred_settle_work();
+            }
+        }
+        match output {
+            Ok(output) => output,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    fn immediate_tick_inner(&mut self) -> TickOutput {
         let _span = trace_span!("immediate_tick", tier = self.tier_label).entered();
-
+        // v18 item 4 (C1): one pass transaction for every read below (nested ticks inherit).
+        self.begin_read_pass_in_tick();
         let recovered_sealed_batches = self
             .schema_manager
             .query_manager_mut()
@@ -835,9 +879,11 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             if let Some(&handle) = self.subscription_reverse.get(&failure.subscription_id) {
                 if let Some(pending) = self.pending_one_shot_queries.get_mut(&handle) {
                     if let Some(sender) = pending.sender.take() {
+                        // The server's rejection code travels in the message: the facade
+                        // on the other side of the binding can only see this string.
                         let _ = sender.send(Err(RuntimeError::QueryError(format!(
-                            "query subscription {} failed during schema recompile: {}",
-                            failure.subscription_id.0, failure.reason
+                            "query subscription {} failed [{}]: {}",
+                            failure.subscription_id.0, failure.code, failure.reason
                         ))));
                     }
                     failed_one_shots.push(handle);
@@ -878,9 +924,16 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             }
         }
 
+        // v18 item 4: the pass ends before the tail test reads the flush flag — a dirty
+        // pass transaction is what the barrier is scheduled for.
+        self.end_read_pass_in_tick();
         // 4. Schedule batched_tick if outbound messages exist or a WAL flush
-        // barrier is pending.
-        if self.has_outbound() || self.storage_write_pending_flush {
+        // barrier is pending. After a reported loss the storage arm is off (flag 3): the
+        // barrier can never succeed until the store is reopened, and a tick that
+        // re-scheduled itself for it would spin.
+        if self.has_outbound()
+            || (self.storage_write_pending_flush && !self.lost_writes_barrier_reported)
+        {
             self.scheduler.schedule_batched_tick();
         }
 
@@ -897,8 +950,51 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     ///
     /// Each step is followed by an immediate_tick to process results.
     pub fn batched_tick(&mut self) {
-        let _span = debug_span!("batched_tick", tier = self.tier_label).entered();
+        // v18 item 6: the batched tick owns the settle clock of its lock hold (nested
+        // `immediate_tick`s inherit it) unless it runs inside one.
+        // Same panic discipline as `immediate_tick` (diff r2 S7).
+        let owns_clock = self.schema_manager.query_manager_mut().begin_tick();
+        let outcome = if owns_clock {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.batched_tick_inner()))
+        } else {
+            self.batched_tick_inner();
+            Ok(())
+        };
+        if owns_clock {
+            self.schema_manager.query_manager_mut().end_tick();
+            if outcome.is_ok() {
+                self.rearm_for_deferred_settle_work();
+            }
+        }
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
+    /// v18 item 6 (design v8): the clock owner's one re-arm. A pass that deferred
+    /// non-stalled work for budget left the flag set; at the end of its lock hold the owner
+    /// peeks at it and schedules the batched tick that continues the work — once per hold,
+    /// whichever passes ran inside it. The flag stays set: it is the continuation's (3b)
+    /// to take, in the batched tick this re-arm asked for. Invariant at the end of a hold:
+    /// the flag is set iff a re-arm was scheduled by this hold.
+    fn rearm_for_deferred_settle_work(&mut self) {
+        if self.schema_manager.query_manager().settle_work_remains() {
+            self.scheduler.schedule_batched_tick();
+            // Counted after the call (diff r4 S3): a scheduler that panics scheduled nothing.
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::SETTLE_TICKS_REARMED,
+            );
+            #[cfg(any(test, feature = "test"))]
+            {
+                self.settle_rearms += 1;
+            }
+        }
+    }
+    fn batched_tick_inner(&mut self) {
+        let _span = debug_span!("batched_tick", tier = self.tier_label).entered();
+        // v18 item 4 (C1): the batched tick's own pass transaction; the nested immediate
+        // ticks below inherit it. Ended before the early return and before the barrier.
+        self.begin_read_pass_in_tick();
         self.handle_transport_messages();
 
         if !self.has_outbound()
@@ -928,6 +1024,24 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         // another batched_tick while we're inside one, so we must flush here.
         self.flush_runtime_outbox("flushing post-process outbox");
 
+        // 3b. v18 item 6: the continuation. The last pass deferred non-stalled work for
+        // budget, or tripped the outbox limiter with registrations left behind. Flush first
+        // (the limiter reads the outbox); then, only if this lock hold's clock still has
+        // room, take the flag and run one nested immediate tick that serves what fits (and
+        // sets the flag again if it defers). Under a spent clock a nested tick is a no-op
+        // pass — it would refuse every unit — so nothing runs and the flag stays set for
+        // the owner's one re-arm at the end of the hold (`rearm_for_deferred_settle_work`;
+        // design v8, diff r1 S6).
+        if self.schema_manager.query_manager().settle_work_remains() {
+            self.flush_runtime_outbox("flushing continuation outbox");
+            if self.schema_manager.query_manager().settle_clock_has_room() {
+                let _ = self
+                    .schema_manager
+                    .query_manager_mut()
+                    .take_settle_work_remains();
+                self.immediate_tick();
+            }
+        }
         // 4. If subscriptions are still pending, reschedule — but only if we
         //    actually drained something this tick. Otherwise no new work is
         //    waiting; the next inbound message will schedule us via
@@ -940,20 +1054,53 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 .sync_manager()
                 .has_pending_query_subscriptions()
         {
+            self.end_read_pass_in_tick();
             self.scheduler.schedule_batched_tick();
             return;
         }
-
+        // v18 item 4: the pass ends here, so the barrier below commits what it wrote.
+        self.end_read_pass_in_tick();
         // Flush the storage durability barrier so writes survive a hard kill (tab close, crash).
         let mut barrier_failed = false;
         if self.storage_write_pending_flush {
             let _span = tracing::debug_span!("flush_wal").entered();
+            // v18 item 8: the checkpoint policy lives under this barrier, and the settle line
+            // cannot see it — `SettlePass::begin()` closes back in `QueryManager::process`,
+            // above. Measured on the stand: `checkpoints=0` on all 175 settle lines while the
+            // policy underneath was doing its job. So the barrier reports its own.
+            let checkpoints_before = crate::query_manager::settle_cost::CheckpointCounts::read();
+            let barrier_started = std::time::Instant::now();
             if let Err(error) = self.flush_wal_barrier() {
                 barrier_failed = true;
-                tracing::error!(%error, "storage WAL flush failed");
-                if self.should_schedule_storage_flush_retry() {
+                // A `LostWrites` was logged once by `record_storage_flush_error`; every
+                // barrier after it would repeat the same line, so only other errors log here,
+                // and no retry is scheduled for a loss (flag 3, set by the barrier just now).
+                if !matches!(error, StorageError::LostWrites { .. }) {
+                    tracing::error!(%error, "storage WAL flush failed");
+                }
+                // diff r23 SF5: the guard vetoes FIRST. `should_schedule_storage_flush_retry`
+                // latches `storage_flush_retry_scheduled` as a side effect, so evaluating it on
+                // the left set the latch on a lost store although no retry was scheduled. No
+                // live reader can see that today, and a predicate that lies is still a trap.
+                if !self.lost_writes_barrier_reported && self.should_schedule_storage_flush_retry()
+                {
                     self.scheduler.schedule_batched_tick();
                 }
+            }
+            // Only when something actually happened. A barrier that checkpointed nothing is the
+            // common case once item 8 is on — that is the whole point of it — and logging a line
+            // per tick to say so would reintroduce, in the log, the per-tick cost the item
+            // removed from the disk.
+            let checkpoints = crate::query_manager::settle_cost::CheckpointCounts::read()
+                .since(checkpoints_before);
+            if !checkpoints.is_empty() {
+                tracing::info!(
+                    checkpoints = checkpoints.checkpoints,
+                    checkpoints_blocked = checkpoints.blocked,
+                    checkpoint_failures = checkpoints.failures,
+                    micros = barrier_started.elapsed().as_micros() as u64,
+                    "jazz wal barrier"
+                );
             }
         }
 
@@ -991,8 +1138,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .queue_applied_row_confirmations(server_id);
         self.flush_runtime_outbox("flushing delivery confirmations");
     }
-
-    fn flush_runtime_outbox(&mut self, log_message: &str) {
+    pub(super) fn flush_runtime_outbox(&mut self, log_message: &str) {
         self.schema_manager
             .query_manager()
             .sync_manager()
@@ -1229,6 +1375,15 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }
         self.parked_sync_messages.push(message);
         self.scheduler.schedule_batched_tick();
+    }
+
+    /// Park an entry the transport staging already admitted. The caller is the tick that is
+    /// about to run (or `flush()`), so no tick is scheduled.
+    pub fn park_staged_sync_message(&mut self, message: InboxEntry) {
+        if let Some((ref tracer, ref name)) = self.sync_tracer {
+            tracer.record_incoming(&message.source, name, &message.payload);
+        }
+        self.parked_sync_messages.push(message);
     }
 
     /// Park a sequenced sync message for in-order processing in next batched_tick.

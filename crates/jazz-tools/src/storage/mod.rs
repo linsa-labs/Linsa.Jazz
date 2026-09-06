@@ -20,7 +20,7 @@ mod storage_core;
 mod storage_trait;
 pub use memory::MemoryStorage;
 pub use opfs_btree::OpfsBTreeStorage;
-pub use storage_trait::Storage;
+pub use storage_trait::{PassOutcome, Storage};
 #[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
 mod rocksdb;
 #[cfg(all(feature = "rocksdb", not(target_arch = "wasm32")))]
@@ -117,6 +117,12 @@ pub enum StorageError {
         max_key_bytes: usize,
     },
     SecurityError(String),
+    /// v18 item 4: the store's explicit transaction was ended behind its back (SQLite's own
+    /// full rollback on NOMEM/IOERR/INTERRUPT/FULL) with landed writes in it. Strict: the
+    /// store reports it on every transaction boundary until it is reopened.
+    LostWrites {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StorageError {
@@ -135,6 +141,7 @@ impl std::fmt::Display for StorageError {
                 "indexed value too large for {table}.{column} on branch {branch}: index key would be {key_bytes} bytes (max {max_key_bytes})"
             ),
             StorageError::SecurityError(message) => write!(f, "security error: {message}"),
+            StorageError::LostWrites { detail } => write!(f, "lost writes: {detail}"),
         }
     }
 }
@@ -3264,6 +3271,12 @@ pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>
             crate::query_manager::settle_cost::bump(
                 &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
             );
+            // v18 item 5: the history walk has its own counter — no D2 hook heals it, so a
+            // count that never converges is the signal, and mixing it into the visible one
+            // would hide exactly that.
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::HISTORY_LOCATOR_LADDER_RECOVERIES,
+            );
             // `debug`, not `info`: this fires on every READ of a split row, and the
             // ladder never writes the exact locator back, so it repeats for the life of
             // the row. Production logged 8751 of these in eight minutes from one table —
@@ -3388,13 +3401,14 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
             crate::query_manager::settle_cost::bump(
                 &crate::query_manager::settle_cost::LOCATOR_LADDER_RECOVERIES,
             );
-            // `debug`, not `info`: this fires on every READ of a split row, and the
-            // ladder never writes the exact locator back, so it repeats for the life of
-            // the row. Production logged 8751 of these in eight minutes from one table —
-            // formatting and I/O on the settle path, and enough noise to bury the lines
-            // that matter. The count is on the settle line as `locator_ladder_recoveries`,
-            // which is where an operator should read it; `LOCATOR_LADDER_RECOVERIES` above
-            // is bumped either way, so nothing is lost by lowering this.
+            // `debug`, not `info`: this fires on every READ of a split row until the
+            // recovery below persists the exact locator — after v18 item 5 that is once
+            // per row, not once per read. Before the hook, production logged 8751 of these
+            // in eight minutes from one table — formatting and I/O on the settle path, and
+            // enough noise to bury the lines that matter. The count is on the settle line
+            // as `locator_ladder_recoveries`, which is where an operator should read it;
+            // `LOCATOR_LADDER_RECOVERIES` above is bumped either way. The history arm
+            // keeps the old wording: nothing heals it, so it does repeat for the row's life.
             tracing::debug!(
                 table,
                 branch,
@@ -3402,6 +3416,32 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
                 raw_table = %row_raw_table,
                 "visible row recovered from a sibling raw table the locator did not name"
             );
+            // v18 item 5 (D2): the walk found the family; persist the exact locator so the
+            // next read of this row goes straight to it. The write path stamps one only on
+            // a cross-generation WRITE, and a row delivered before the catalogue knew its
+            // origin never gets that write — so without this the walk repeats for the life
+            // of the row (1,200 in five minutes against one `users` row, 2026-08-18). The
+            // store counts its own walks and its own persist failures; a failure never
+            // fails the read — a `LostWrites` is the barrier's to report, anything else is
+            // worth one warning here.
+            storage.note_visible_locator_recovery();
+            let recovered = ExactRowTableLocator {
+                row_raw_table: row_raw_table.clone().into(),
+                table_name: row_raw_table_id.table_name.clone(),
+                schema_hash: row_raw_table_id.schema_hash,
+            };
+            if let Err(error) =
+                storage.record_visible_row_table_locator_recovery(branch, row_id, &recovered)
+                && !matches!(error, StorageError::LostWrites { .. })
+            {
+                tracing::warn!(
+                    table,
+                    branch,
+                    %row_id,
+                    %error,
+                    "recovered visible locator could not be persisted"
+                );
+            }
             return Ok(Some(OwnedVisibleRowBytes {
                 row_raw_table_id: row_raw_table_id.clone(),
                 row_raw_table,
@@ -4676,6 +4716,25 @@ mod store_probe {
             std::env::temp_dir().join(format!("jazz-rpc-probe-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&scratch);
         std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        // v18 item 8, diff r24 SF2: the sidecars MUST come too. This probe reads a copy of a
+        // live store, and until item 8 the engine checkpointed on every barrier, which kept the
+        // main file near-current and let this get away with copying it alone. With a 30 s
+        // interval the main file lags by up to an interval, and by arbitrarily more whenever a
+        // reader is pinning the WAL — so a probe that skips the sidecar reads stale rows and
+        // reports them as the store's contents. Its siblings in this file already do this.
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
         let mut storage = SqliteStorage::open(&scratch).expect("open the scratch copy");
 
         let app_id =
@@ -5874,6 +5933,25 @@ mod store_probe {
             std::env::temp_dir().join(format!("jazz-dump-probe-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&scratch);
         std::fs::copy(&source, &scratch).expect("copy the replica for the probe");
+        // v18 item 8, diff r24 SF2: the sidecars MUST come too. This probe reads a copy of a
+        // live store, and until item 8 the engine checkpointed on every barrier, which kept the
+        // main file near-current and let this get away with copying it alone. With a 30 s
+        // interval the main file lags by up to an interval, and by arbitrarily more whenever a
+        // reader is pinning the WAL — so a probe that skips the sidecar reads stale rows and
+        // reports them as the store's contents. Its siblings in this file already do this.
+        for sidecar in ["-wal", "-shm"] {
+            let from = format!("{source}{sidecar}");
+            if std::path::Path::new(&from).exists() {
+                std::fs::copy(
+                    &from,
+                    scratch.with_file_name(format!(
+                        "{}{sidecar}",
+                        scratch.file_name().unwrap().to_string_lossy()
+                    )),
+                )
+                .expect("copy the store sidecar");
+            }
+        }
         let storage = SqliteStorage::open(&scratch).expect("open the copied replica");
         probe_dump_rows(storage);
     }
@@ -6975,73 +7053,11 @@ mod split_locator_tests {
         ));
         let _ = std::fs::remove_file(&path);
         let mut storage = SqliteStorage::open(&path).expect("temp sqlite store opens");
-
-        let schema = users_schema();
-        let schema_hash = crate::test_support::persist_test_schema(&mut storage, &schema);
-        let branch = ComposedBranchName::new("dev", schema_hash, "main").to_branch_name();
-
-        let row_id = ObjectId::new();
-        storage
-            .put_row_locator(
-                row_id,
-                Some(&RowLocator {
-                    table: "users".to_string().into(),
-                    origin_schema_hash: Some(schema_hash),
-                }),
-            )
-            .expect("locator persists");
-        let descriptor = schema
-            .get(&TableName::new("users"))
-            .expect("users descriptor")
-            .columns
-            .clone();
-        let data = crate::row_format::encode_row(
-            &descriptor,
-            &[crate::query_manager::types::Value::Text("split".into())],
-        )
-        .expect("row encodes");
-        let row = StoredRowBatch::new(
-            row_id,
-            branch.as_str(),
-            Vec::new(),
-            data,
-            crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
-            std::collections::HashMap::new(),
-            RowState::VisibleDirect,
-            None,
-        );
-        apply_row_batch(
-            &mut storage,
-            row_id,
-            &BranchName::new(branch.as_str()),
-            row,
-            &[],
-        )
-        .expect("batch applies");
-
-        // Positive control: the row reads back through the honest locator.
-        let honest =
-            load_visible_region_row_bytes_with_storage(&storage, "users", branch.as_str(), row_id)
-                .expect("read succeeds");
-        assert!(
-            honest.is_some(),
-            "the row must be readable before poisoning"
-        );
-
-        // The poison: re-stamp the locator with a schema hash the store has
-        // no raw tables for — the defect-20 split (locator names one
-        // generation, bytes sit in another).
-        let lying_hash = SchemaHash::from_bytes([7u8; 32]);
-        storage
-            .put_row_locator(
-                row_id,
-                Some(&RowLocator {
-                    table: "users".to_string().into(),
-                    origin_schema_hash: Some(lying_hash),
-                }),
-            )
-            .expect("poisoned locator persists");
-
+        // v18 item 5: the fixture (schema, row, honest read, poison) is
+        // `crate::test_support::poisoned_split_row`, shared with the RocksDB twin G-D1r so
+        // both stores are gated on ONE shape. Unchanged in behaviour, including the
+        // positive control, which now runs inside the helper.
+        let (branch, row_id, schema_hash) = crate::test_support::poisoned_split_row(&mut storage);
         // The read fallback must recover the row from the sibling raw table.
         let recovered =
             load_visible_region_row_bytes_with_storage(&storage, "users", branch.as_str(), row_id)

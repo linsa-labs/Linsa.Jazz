@@ -24,6 +24,10 @@ struct QueryExecutionOptionsWire {
     propagation: Option<String>,
     local_updates: Option<String>,
     transaction_batch_id: Option<String>,
+    /// Caller's deadline for a one-shot query, in milliseconds. Honoured by the native
+    /// (napi) binding, which cancels the engine-side query when it elapses; other
+    /// runtimes ignore it.
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -254,12 +258,21 @@ pub fn default_read_durability_options(tier: Option<DurabilityTier>) -> ReadDura
 pub fn parse_read_durability_options(
     tier: Option<&str>,
     options_json: Option<&str>,
-) -> Result<(ReadDurabilityOptions, QueryPropagation, Option<BatchId>), String> {
+) -> Result<
+    (
+        ReadDurabilityOptions,
+        QueryPropagation,
+        Option<BatchId>,
+        Option<u64>,
+    ),
+    String,
+> {
     let parsed_tier = tier.map(parse_durability_tier).transpose()?;
     let Some(raw) = options_json else {
         return Ok((
             default_read_durability_options(parsed_tier),
             QueryPropagation::Full,
+            None,
             None,
         ));
     };
@@ -290,7 +303,10 @@ pub fn parse_read_durability_options(
         .as_deref()
         .map(parse_batch_id_input)
         .transpose()?;
-
+    let timeout_ms = match options.timeout_ms {
+        Some(0) => return Err("timeout_ms must be greater than zero".to_string()),
+        other => other,
+    };
     Ok((
         ReadDurabilityOptions {
             tier: parsed_tier,
@@ -298,6 +314,7 @@ pub fn parse_read_durability_options(
         },
         propagation,
         transaction_batch_id,
+        timeout_ms,
     ))
 }
 
@@ -403,9 +420,9 @@ mod tests {
 
     #[test]
     fn read_durability_options_default_to_full_and_immediate() {
-        let (durability, propagation, transaction_batch_id) =
+        let (durability, propagation, transaction_batch_id, timeout_ms) =
             parse_read_durability_options(Some("local"), None).expect("parse options");
-
+        assert_eq!(timeout_ms, None);
         assert_eq!(
             durability.tier,
             Some(crate::sync_manager::DurabilityTier::Local)
@@ -423,7 +440,7 @@ mod tests {
         let batch_id = BatchId::new();
         let options_json = format!(r#"{{"transaction_batch_id":"{batch_id}"}}"#);
 
-        let (_, _, parsed_batch_id) =
+        let (_, _, parsed_batch_id, _) =
             parse_read_durability_options(None, Some(&options_json)).expect("parse options");
 
         assert_eq!(parsed_batch_id, Some(batch_id));
@@ -544,5 +561,19 @@ mod tests {
         assert_eq!(context.batch_mode(), BatchMode::Transactional);
         assert_eq!(context.target_branch_name(), Some("dev-111111111111-main"));
         assert!(context.batch_id().is_some());
+    }
+
+    #[test]
+    fn a_query_deadline_parses_and_zero_is_refused() {
+        let (_, _, _, timeout_ms) =
+            parse_read_durability_options(None, Some(r#"{"timeout_ms":5000}"#))
+                .expect("parse options");
+        assert_eq!(timeout_ms, Some(5000));
+        assert!(parse_read_durability_options(None, Some(r#"{"timeout_ms":0}"#)).is_err());
+        // An engine that predates the field ignores it; one that knows it must not require it.
+        let (_, _, _, absent) =
+            parse_read_durability_options(None, Some(r#"{"propagation":"full"}"#))
+                .expect("parse options");
+        assert_eq!(absent, None);
     }
 }

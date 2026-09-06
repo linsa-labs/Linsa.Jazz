@@ -2744,6 +2744,47 @@ impl SyncManager {
                     (Some(client_session), None) => Some(client_session.clone()),
                     (None, payload_session) => payload_session.clone(),
                 };
+                let role = client.role;
+                // Admission control (item 2 / defect #31): refuse before anything is queued,
+                // so a refused registration costs no compile, no settle and no state — not
+                // even a `query_origin` entry.
+                let principal = super::admission::Principal::for_client(
+                    role,
+                    client_id,
+                    effective_session.as_ref(),
+                );
+                let principal_kind = principal.kind();
+                if let Err(refusal) = self.admission.admit(
+                    principal,
+                    client_id,
+                    *query_id,
+                    super::admission::Registration {
+                        query,
+                        session: effective_session.as_ref(),
+                        required_tier: *required_tier,
+                        propagation: *propagation,
+                        policy_context_tables,
+                    },
+                    web_time::Instant::now(),
+                ) {
+                    tracing::warn!(
+                        target: "jazz::admission",
+                        %client_id,
+                        principal = principal_kind,
+                        query_id = query_id.0,
+                        table = %query.table,
+                        cap = refusal.cap_name(),
+                        %refusal,
+                        "refused query subscription"
+                    );
+                    self.emit_query_subscription_rejected(
+                        client_id,
+                        *query_id,
+                        super::admission::SUBSCRIPTION_OVER_CAP,
+                        refusal.to_string(),
+                    );
+                    return;
+                }
                 // Track origin for QuerySettled relay
                 self.query_origin
                     .entry(*query_id)
@@ -2782,6 +2823,24 @@ impl SyncManager {
                         self.query_origin.remove(query_id);
                     }
                 }
+                // A registration still parked for the query manager is withdrawn here,
+                // not registered and then torn down: the query manager drains
+                // unsubscriptions BEFORE subscriptions in one pass, so without this a
+                // subscribe+unsubscribe pair arriving together (a cancelled one-shot read
+                // whose frames waited on the lock) would leave a live server subscription
+                // until the client disconnects.
+                let before = self.pending_query_subscriptions.len();
+                self.pending_query_subscriptions.retain(|pending| {
+                    !(pending.client_id == client_id && pending.query_id == *query_id)
+                });
+                if self.pending_query_subscriptions.len() != before {
+                    tracing::debug!(
+                        %client_id,
+                        query_id = query_id.0,
+                        "withdrew a parked query subscription on unsubscription"
+                    );
+                }
+                self.admission.release(client_id, *query_id);
                 self.pending_query_unsubscriptions
                     .push(PendingQueryUnsubscription {
                         client_id,
