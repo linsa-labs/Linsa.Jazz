@@ -27,9 +27,9 @@
 //! another and no `Rejected` fate is produced; rows from upstream are transactional only,
 //! because a visible direct row from upstream records a fate on apply and the retained
 //! seal it belongs to is then past the sweep's reach (an open defect gated in
-//! `sync_manager/tests/server_origin_seal.rs`, unchanged here); fate promotion has no live
-//! route on a node whose only peers are clients and is gated on reopen in
-//! `sealed_batch_cost.rs`.
+//! `sync_manager/tests/server_origin_seal.rs`, unchanged here); fate promotion reaches a
+//! node only through a hydrated batch record or the opening walk, neither of which the
+//! stream drives, and is gated on reopen in `sealed_batch_cost.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -776,6 +776,166 @@ fn a_seal_whose_fate_read_failed_is_settled_by_the_tick_after_the_store_recovers
     );
 }
 
+/// The sweep's third read of a seal — its rows through the local batch row index — can
+/// fail like the other two, and a seal whose rows could not be read is not a seal whose
+/// rows are absent.
+#[test]
+fn a_seal_whose_row_index_read_failed_is_settled_by_the_tick_after_the_store_recovers() {
+    let sweep = Arc::new(Mutex::new(SweepCallCounts::default()));
+    let fail_row_index_gets = Arc::new(Mutex::new(false));
+    let storage = Box::new(
+        RowMutationObservingStorage::observing_sweep(Arc::clone(&sweep))
+            .failing_row_index_gets_when(Arc::clone(&fail_row_index_gets)),
+    ) as Box<dyn Storage>;
+    let mut core = sweeping_core_over(
+        storage,
+        DurabilityTier::Local,
+        "sealed-batch-sweep-row-index-fault",
+    );
+    let client_id = peer_client(&mut core);
+    core.immediate_tick();
+
+    let batch_id = BatchId::new();
+    let row_id = ObjectId::new();
+    let row = user_row(
+        row_id,
+        batch_id,
+        crate::row_histories::RowState::StagingPending,
+        None,
+    );
+    deliver(
+        &mut core,
+        Source::Client(client_id),
+        SyncPayload::SealBatch {
+            submission: seal_declaring(
+                batch_id,
+                crate::batch_fate::BatchMode::Transactional,
+                &[row.clone()],
+            ),
+        },
+    );
+    core.immediate_tick();
+    // The row lands by the path that leaves completion to the sweep, and the store fails
+    // the sweep's read of the batch's rows.
+    deliver(
+        &mut core,
+        Source::Server(ServerId::new()),
+        SyncPayload::RowBatchNeeded {
+            metadata: Some(users_row_metadata(row_id)),
+            row,
+        },
+    );
+    *fail_row_index_gets.lock().unwrap() = true;
+    core.immediate_tick();
+    *fail_row_index_gets.lock().unwrap() = false;
+    assert_eq!(
+        core.storage()
+            .load_authoritative_batch_fate(batch_id)
+            .unwrap(),
+        None,
+        "while the store fails row index reads nothing can be settled"
+    );
+
+    core.immediate_tick();
+    assert_eq!(
+        core.storage()
+            .load_authoritative_batch_fate(batch_id)
+            .unwrap(),
+        Some(crate::batch_fate::BatchFate::AcceptedTransaction {
+            batch_id,
+            confirmed_tier: DurabilityTier::Local,
+        }),
+        "the rows were there all along: a row read that failed must put the batch back in \
+         front of the sweep, not pass for rows that never arrived"
+    );
+}
+
+/// The settle itself can fail at its write: a fate the store refused to take is not a fate,
+/// and the seal it belongs to has to be driven again.
+#[test]
+fn a_seal_whose_fate_write_failed_is_settled_by_the_tick_after_the_store_recovers() {
+    let sweep = Arc::new(Mutex::new(SweepCallCounts::default()));
+    let fail_fate_puts = Arc::new(Mutex::new(false));
+    let storage = Box::new(
+        RowMutationObservingStorage::observing_sweep(Arc::clone(&sweep))
+            .failing_fate_puts_when(Arc::clone(&fail_fate_puts)),
+    ) as Box<dyn Storage>;
+    let mut core = sweeping_core_over(
+        storage,
+        DurabilityTier::Local,
+        "sealed-batch-sweep-fate-write-fault",
+    );
+    let client_id = peer_client(&mut core);
+    core.immediate_tick();
+
+    let batch_id = BatchId::new();
+    let row_id = ObjectId::new();
+    let row = user_row(
+        row_id,
+        batch_id,
+        crate::row_histories::RowState::StagingPending,
+        None,
+    );
+    deliver(
+        &mut core,
+        Source::Client(client_id),
+        SyncPayload::SealBatch {
+            submission: seal_declaring(
+                batch_id,
+                crate::batch_fate::BatchMode::Transactional,
+                &[row.clone()],
+            ),
+        },
+    );
+    core.immediate_tick();
+    deliver(
+        &mut core,
+        Source::Server(ServerId::new()),
+        SyncPayload::RowBatchNeeded {
+            metadata: Some(users_row_metadata(row_id)),
+            row,
+        },
+    );
+    // Completable now; the settle's write of the fate is what the store refuses.
+    *fail_fate_puts.lock().unwrap() = true;
+    core.immediate_tick();
+    *fail_fate_puts.lock().unwrap() = false;
+    assert_eq!(
+        core.storage()
+            .load_authoritative_batch_fate(batch_id)
+            .unwrap(),
+        None,
+        "a fate the store refused must not be reported as written"
+    );
+    assert!(
+        core.storage()
+            .load_sealed_batch_submission(batch_id)
+            .unwrap()
+            .is_some(),
+        "a seal whose settle failed keeps its submission"
+    );
+
+    core.immediate_tick();
+    assert_eq!(
+        core.storage()
+            .load_authoritative_batch_fate(batch_id)
+            .unwrap(),
+        Some(crate::batch_fate::BatchFate::AcceptedTransaction {
+            batch_id,
+            confirmed_tier: DurabilityTier::Local,
+        }),
+        "the store took the write on the next tick: a fate write that failed must put the \
+         batch back in front of the sweep"
+    );
+    assert_eq!(
+        core.storage()
+            .load_sealed_batch_submission(batch_id)
+            .unwrap(),
+        None,
+        "a completed seal must retire its submission"
+    );
+}
+
 /// Two transactions on the same row, examined by one sweep, settle in the order they were
 /// made: the one that builds on the other after it.
 ///
@@ -1095,7 +1255,14 @@ fn a_seal_whose_completion_on_arrival_failed_is_settled_by_the_next_tick() {
         },
     });
     core.batched_tick();
+    // The store is still failing when the sweep takes its own look at the seal.
+    let reads_before = sweep.lock().unwrap().submission_row_reads;
+    core.immediate_tick();
     *fail_submission_gets.lock().unwrap() = false;
+    assert!(
+        sweep.lock().unwrap().submission_row_reads > reads_before,
+        "the sweep must have tried to read the seal it was handed"
+    );
     assert!(
         core.storage()
             .load_sealed_batch_submission(batch_id)
@@ -1108,7 +1275,7 @@ fn a_seal_whose_completion_on_arrival_failed_is_settled_by_the_next_tick() {
             .load_authoritative_batch_fate(batch_id)
             .unwrap(),
         None,
-        "with its read failing the seal could not be completed on arrival"
+        "with its read failing the seal could not be completed on arrival or by the sweep"
     );
 
     core.immediate_tick();
@@ -1121,7 +1288,7 @@ fn a_seal_whose_completion_on_arrival_failed_is_settled_by_the_next_tick() {
             confirmed_tier: DurabilityTier::Local,
         }),
         "the seal and its row are on disk and nothing will re-send them: the tick after \
-         the failed completion must settle the batch"
+         the store recovers must settle the batch, however many reads of it failed"
     );
     assert_eq!(
         core.storage()

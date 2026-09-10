@@ -2162,9 +2162,9 @@ impl SyncManager {
         // holds, and a crash can leave a completable seal behind that nothing will re-send.
         // After that a submission is looked at again only when it was put back in front of
         // the sweep — persisted, a row of its applied, a read or write of its fate that
-        // failed — because those are the only ways a retained submission becomes drivable. A production store held 2258 seals whose
-        // rows never arrived: nothing can complete them, nothing deletes them, and every
-        // tick re-read all of them to learn that again.
+        // failed — because those are the only ways a retained submission becomes drivable.
+        // A production store held 2258 seals whose rows never arrived: nothing can complete
+        // them, nothing deletes them, and every tick re-read all of them to learn that again.
         let batch_ids: Vec<crate::row_histories::BatchId> = if self.sealed_batch_sweep_primed {
             let touched = std::mem::take(&mut self.sealed_batches_to_sweep);
             if touched.is_empty() {
@@ -2235,7 +2235,7 @@ impl SyncManager {
                 }
             };
 
-            let mut rows_unreadable = false;
+            let mut rows_unreadable: Option<crate::storage::StorageError> = None;
             let batch_rows = self.transactional_batch_rows_reporting(
                 storage,
                 submission.batch_id,
@@ -2245,17 +2245,19 @@ impl SyncManager {
                     .map(|member| member.object_id)
                     .collect::<Vec<_>>(),
                 |error| {
-                    tracing::warn!(
-                        ?batch_id,
-                        %error,
-                        "failed to read a sealed batch's rows during recovery"
-                    );
-                    rows_unreadable = true;
+                    rows_unreadable.get_or_insert(error);
                 },
             );
-            if rows_unreadable {
+            if let Some(error) = rows_unreadable {
                 // Absent rows leave a seal uncompletable until they arrive; unreadable rows
                 // say nothing about it, so it is not the seal's fate that gets decided here.
+                // One line per batch per sweep: a store that keeps failing is looked at
+                // again every tick, and a row-by-row report of it would be a log flood.
+                tracing::warn!(
+                    ?batch_id,
+                    %error,
+                    "failed to read a sealed batch's rows during recovery"
+                );
                 self.note_sealed_batch_for_sweep(batch_id);
                 continue;
             }

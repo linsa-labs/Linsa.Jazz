@@ -291,8 +291,8 @@ pub struct SyncManager {
     /// once per process and only this set afterwards, so its price follows what changed
     /// rather than what the store has kept (2258 permanently uncompletable seals on the
     /// production store, re-read on every tick, were 62.6 % of the server's CPU). Ordered,
-    /// because the sweep settles in id order: ids are time-ordered, so a transaction is
-    /// examined after the one it builds on.
+    /// so the sweep visits ids in the order the full scan did: the order they were minted
+    /// in, on one process. Same guarantee as before, no stronger.
     pub(super) sealed_batches_to_sweep: BTreeSet<BatchId>,
     /// Whether the sweep has walked the retained submission table for this process yet.
     pub(super) sealed_batch_sweep_primed: bool,

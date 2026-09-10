@@ -89,6 +89,12 @@ struct RowMutationObservingStorage {
     /// While set, every point read of a sealed submission row fails. Models a transient
     /// storage error under the completion that follows a seal's arrival.
     fail_submission_gets: Arc<Mutex<bool>>,
+    /// While set, every point read of a local batch row index fails. Models a transient
+    /// storage error under the sweep's read of a seal's rows.
+    fail_row_index_gets: Arc<Mutex<bool>>,
+    /// While set, every write of an authoritative batch fate fails. Models a transient
+    /// storage error under the settle a completable seal triggers.
+    fail_fate_puts: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Default)]
@@ -157,6 +163,8 @@ impl RowMutationObservingStorage {
             sweep: Arc::new(Mutex::new(SweepCallCounts::default())),
             fail_fate_gets: Arc::new(Mutex::new(false)),
             fail_submission_gets: Arc::new(Mutex::new(false)),
+            fail_row_index_gets: Arc::new(Mutex::new(false)),
+            fail_fate_puts: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -179,7 +187,19 @@ impl RowMutationObservingStorage {
             sweep,
             fail_fate_gets,
             fail_submission_gets,
+            fail_row_index_gets: Arc::new(Mutex::new(false)),
+            fail_fate_puts: Arc::new(Mutex::new(false)),
         }
+    }
+
+    fn failing_row_index_gets_when(mut self, flag: Arc<Mutex<bool>>) -> Self {
+        self.fail_row_index_gets = flag;
+        self
+    }
+
+    fn failing_fate_puts_when(mut self, flag: Arc<Mutex<bool>>) -> Self {
+        self.fail_fate_puts = flag;
+        self
     }
 }
 
@@ -1061,6 +1081,14 @@ impl Storage for RowMutationObservingStorage {
     }
 
     fn raw_table_put(&mut self, table: &str, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        if table == "__authoritative_batch_settlement"
+            && key.starts_with("batch:")
+            && *self.fail_fate_puts.lock().unwrap()
+        {
+            return Err(StorageError::IoError(
+                "authoritative batch fate writes deliberately failing in this test".to_string(),
+            ));
+        }
         self.inner.raw_table_put(table, key, value)
     }
 
@@ -1095,6 +1123,14 @@ impl Storage for RowMutationObservingStorage {
         }
         if table == "__branch_name_by_ord" {
             self.sweep.lock().unwrap().branch_name_gets += 1;
+        }
+        if table == "__local_batch_row_index"
+            && key.starts_with("batch:")
+            && *self.fail_row_index_gets.lock().unwrap()
+        {
+            return Err(StorageError::IoError(
+                "local batch row index reads deliberately failing in this test".to_string(),
+            ));
         }
         self.inner.raw_table_get(table, key)
     }
