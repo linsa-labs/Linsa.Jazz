@@ -894,6 +894,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             .map_err(|err| {
                 RuntimeError::WriteError(format!("persist local batch record: {err}"))
             })?;
+        // The record carries the batch's seal, and the storage layer persists it along with
+        // the record: a hydrated seal with no fate yet is a seal the sweep has to look at.
+        if record.sealed_submission.is_some() {
+            self.schema_manager
+                .query_manager_mut()
+                .sync_manager_mut()
+                .note_sealed_batch_for_sweep(record.batch_id);
+        }
         self.local_batch_record_cache
             .insert(record.batch_id, record);
         self.mark_storage_write_pending_flush();
@@ -1111,6 +1119,13 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                     RuntimeError::WriteError(format!("persist sealed batch submission: {err}"))
                 })?;
             seal_persisted = true;
+            // Written here rather than through the sync manager, so it is told: the tick
+            // this commit ends in is what settles the batch on a node that is its own
+            // authority.
+            self.schema_manager
+                .query_manager_mut()
+                .sync_manager_mut()
+                .note_sealed_batch_for_sweep(batch_id);
             self.storage
                 .upsert_local_batch_record(&record)
                 .map_err(|err| {

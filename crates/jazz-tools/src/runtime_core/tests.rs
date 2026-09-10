@@ -73,12 +73,22 @@ struct SweepCallCounts {
     /// Point reads resolving a branch ord back to its name. Only submission decoding does
     /// this on the sweep's path, so it tracks how many rows the sweep decoded.
     branch_name_gets: usize,
+    /// Key-only prefix scans of the sealed-submission table: the id walk the sweep does
+    /// before deciding which rows to read. Once per process — the tick that opens the
+    /// store — and never again while it runs.
+    sealed_submission_key_scans: usize,
 }
 
 struct RowMutationObservingStorage {
     inner: MemoryStorage,
     calls: Arc<Mutex<RowMutationCallCounts>>,
     sweep: Arc<Mutex<SweepCallCounts>>,
+    /// While set, every point read of an authoritative batch fate fails. Models a
+    /// transient storage error under the recovery sweep.
+    fail_fate_gets: Arc<Mutex<bool>>,
+    /// While set, every point read of a sealed submission row fails. Models a transient
+    /// storage error under the completion that follows a seal's arrival.
+    fail_submission_gets: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone, Default)]
@@ -145,14 +155,30 @@ impl RowMutationObservingStorage {
             inner: MemoryStorage::new(),
             calls,
             sweep: Arc::new(Mutex::new(SweepCallCounts::default())),
+            fail_fate_gets: Arc::new(Mutex::new(false)),
+            fail_submission_gets: Arc::new(Mutex::new(false)),
         }
     }
 
     fn observing_sweep(sweep: Arc<Mutex<SweepCallCounts>>) -> Self {
+        Self::observing_sweep_with_faults(
+            sweep,
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(false)),
+        )
+    }
+
+    fn observing_sweep_with_faults(
+        sweep: Arc<Mutex<SweepCallCounts>>,
+        fail_fate_gets: Arc<Mutex<bool>>,
+        fail_submission_gets: Arc<Mutex<bool>>,
+    ) -> Self {
         Self {
             inner: MemoryStorage::new(),
             calls: Arc::new(Mutex::new(RowMutationCallCounts::default())),
             sweep,
+            fail_fate_gets,
+            fail_submission_gets,
         }
     }
 }
@@ -1053,9 +1079,19 @@ impl Storage for RowMutationObservingStorage {
         // behaves like a real backend rather than like memory.
         if table == "__authoritative_batch_settlement" && key.starts_with("batch:") {
             self.sweep.lock().unwrap().authoritative_fate_gets += 1;
+            if *self.fail_fate_gets.lock().unwrap() {
+                return Err(StorageError::IoError(
+                    "authoritative batch fate reads deliberately failing in this test".to_string(),
+                ));
+            }
         }
         if table == "__sealed_batch_submission" && key.starts_with("batch:") {
             self.sweep.lock().unwrap().submission_row_reads += 1;
+            if *self.fail_submission_gets.lock().unwrap() {
+                return Err(StorageError::IoError(
+                    "sealed submission reads deliberately failing in this test".to_string(),
+                ));
+            }
         }
         if table == "__branch_name_by_ord" {
             self.sweep.lock().unwrap().branch_name_gets += 1;
@@ -1079,6 +1115,9 @@ impl Storage for RowMutationObservingStorage {
         table: &str,
         prefix: &str,
     ) -> Result<RawTableKeys, StorageError> {
+        if table == "__sealed_batch_submission" {
+            self.sweep.lock().unwrap().sealed_submission_key_scans += 1;
+        }
         self.inner.raw_table_scan_prefix_keys(table, prefix)
     }
 
@@ -1604,6 +1643,111 @@ fn staged_user_row(
         HashMap::new(),
         crate::row_histories::RowState::StagingPending,
         None,
+    )
+}
+
+// ---- Sealed-batch sweep helpers, shared by `sealed_batch_cost` and
+// ---- `sealed_batch_sweep_differential`: a tiered node over a boxed storage, a peer client
+// ---- to speak for, and the rows, seals and metadata the users table needs.
+
+type SweepingCore = BoxedStorageTestCore;
+
+fn sweeping_core_over(
+    storage: Box<dyn Storage>,
+    tier: DurabilityTier,
+    app_name: &str,
+) -> SweepingCore {
+    // The sweep returns immediately when `my_tiers` is empty, so a runtime without a
+    // durability tier would gate nothing at all.
+    let schema_manager = SchemaManager::new(
+        SyncManager::new().with_durability_tier(tier),
+        test_schema(),
+        AppId::from_name(app_name),
+        "dev",
+        "main",
+    )
+    .unwrap();
+    new_test_core(schema_manager, storage, NoopScheduler)
+}
+
+fn sweeping_core(
+    tier: DurabilityTier,
+    app_name: &str,
+) -> (Arc<Mutex<SweepCallCounts>>, SweepingCore) {
+    let sweep = Arc::new(Mutex::new(SweepCallCounts::default()));
+    let storage = Box::new(RowMutationObservingStorage::observing_sweep(Arc::clone(
+        &sweep,
+    ))) as Box<dyn Storage>;
+    (
+        Arc::clone(&sweep),
+        sweeping_core_over(storage, tier, app_name),
+    )
+}
+
+fn peer_client(core: &mut SweepingCore) -> ClientId {
+    let client_id = ClientId::new();
+    core.add_client(client_id, None);
+    core.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager_mut()
+        .set_client_role(client_id, ClientRole::Peer);
+    client_id
+}
+
+fn deliver(core: &mut SweepingCore, source: Source, payload: SyncPayload) {
+    core.park_sync_message(InboxEntry { source, payload });
+    core.batched_tick();
+}
+
+fn user_row(
+    row_id: ObjectId,
+    batch_id: BatchId,
+    state: crate::row_histories::RowState,
+    confirmed_tier: Option<DurabilityTier>,
+) -> crate::row_histories::StoredRowBatch {
+    crate::row_histories::StoredRowBatch::new_with_batch_id(
+        batch_id,
+        row_id,
+        "main",
+        Vec::<BatchId>::new(),
+        encode_row(
+            &test_schema()[&TableName::new("users")].columns,
+            &user_row_values(row_id, "alice"),
+        )
+        .expect("user test row should encode"),
+        crate::metadata::RowProvenance::for_insert(row_id.to_string(), 1_000),
+        HashMap::new(),
+        state,
+        confirmed_tier,
+    )
+}
+
+fn users_row_metadata(row_id: ObjectId) -> crate::sync_manager::RowMetadata {
+    crate::sync_manager::RowMetadata {
+        id: row_id,
+        metadata: HashMap::from([(
+            crate::metadata::MetadataKey::Table.as_str().to_string(),
+            "users".to_string(),
+        )]),
+    }
+}
+
+fn seal_declaring(
+    batch_id: BatchId,
+    mode: crate::batch_fate::BatchMode,
+    rows: &[crate::row_histories::StoredRowBatch],
+) -> SealedBatchSubmission {
+    SealedBatchSubmission::new(
+        batch_id,
+        mode,
+        crate::object::BranchName::new("main"),
+        rows.iter()
+            .map(|row| SealedBatchMember {
+                object_id: row.row_id,
+                row_digest: row.content_digest(),
+            })
+            .collect(),
+        Vec::new(),
     )
 }
 
@@ -2193,6 +2337,7 @@ mod query_subscription;
 mod rejected_write_retires_tracking;
 mod schema_catalogue;
 mod sealed_batch_cost;
+mod sealed_batch_sweep_differential;
 mod subscription_fanout_cost;
 mod subscription_registration_cost;
 mod sync_replay;

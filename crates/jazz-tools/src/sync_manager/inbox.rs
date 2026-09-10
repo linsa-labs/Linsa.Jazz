@@ -235,7 +235,24 @@ impl SyncManager {
     }
 
     fn persist_authoritative_batch_fate<H: Storage>(
-        &self,
+        &mut self,
+        storage: &mut H,
+        fate: &BatchFate,
+    ) -> Result<(BatchFate, bool), crate::storage::StorageError> {
+        let result = Self::write_authoritative_batch_fate(storage, fate);
+        // A write that failed has to be retried, so the sweep must come back for the batch.
+        // A write that succeeded needs no such thing: every fate written here is at or
+        // above this node's own tier — recorded on apply at `max(incoming, local)`, settled
+        // by this node, or sent down by an upstream — and the sweep `continue`s on those.
+        // The one fate it can still act on, a direct fate confirmed below this tier, only
+        // ever meets a node from disk, and the opening walk is what looks at those.
+        if result.is_err() {
+            self.note_sealed_batch_for_sweep(fate.batch_id());
+        }
+        result
+    }
+
+    fn write_authoritative_batch_fate<H: Storage>(
         storage: &mut H,
         fate: &BatchFate,
     ) -> Result<(BatchFate, bool), crate::storage::StorageError> {
@@ -296,7 +313,7 @@ impl SyncManager {
     }
 
     fn persist_sealed_batch_submission<H: Storage>(
-        &self,
+        &mut self,
         storage: &mut H,
         submission: &SealedBatchSubmission,
     ) -> Result<(), crate::storage::StorageError> {
@@ -309,7 +326,9 @@ impl SyncManager {
                     "failed to persist sealed batch submission"
                 );
                 error
-            })
+            })?;
+        self.note_sealed_batch_for_sweep(submission.batch_id);
+        Ok(())
     }
 
     fn ensure_object_metadata<H: Storage>(
@@ -782,10 +801,12 @@ impl SyncManager {
                     }
                 }
             };
+        let mut fate_recorded = false;
         if fate_recording.should_record()
             && let Some(confirmed_tier) = authoritative_tier
             && row.state.is_visible()
         {
+            fate_recorded = true;
             let fate = match row.state {
                 RowState::VisibleDirect => BatchFate::DurableDirect {
                     batch_id: row.batch_id,
@@ -802,6 +823,13 @@ impl SyncManager {
             if let Ok((fate, true)) = self.persist_authoritative_batch_fate(storage, &fate) {
                 self.pending_batch_fates.push(fate);
             }
+        }
+        // A row landed — first attempt, retry, or a parked batch drained later — so its
+        // seal, if this node retains one, may have just become completable. When a fate at
+        // this node's tier was recorded above the seal is past driving and the persist
+        // already decided whether the sweep needs to come back.
+        if !fate_recorded {
+            self.note_sealed_batch_for_sweep(row.batch_id);
         }
 
         RowApplyOutcome::Applied(Box::new(AppliedRowBatch {
@@ -1250,22 +1278,44 @@ impl SyncManager {
         batch_id: crate::row_histories::BatchId,
         object_ids: &[ObjectId],
     ) -> Vec<(String, StoredRowBatch)> {
+        self.transactional_batch_rows_reporting(storage, batch_id, object_ids, |_| {})
+    }
+
+    /// [`Self::transactional_batch_rows`], handing every storage error to `on_error` instead
+    /// of treating it as an absent row. An absent row is a fact; an unreadable one is not.
+    pub(super) fn transactional_batch_rows_reporting<H: Storage>(
+        &self,
+        storage: &H,
+        batch_id: crate::row_histories::BatchId,
+        object_ids: &[ObjectId],
+        mut on_error: impl FnMut(crate::storage::StorageError),
+    ) -> Vec<(String, StoredRowBatch)> {
         let object_ids = object_ids.iter().copied().collect::<HashSet<_>>();
-        let Ok(Some(batch_rows)) = storage.load_local_batch_row_index(batch_id) else {
-            return Vec::new();
+        let batch_rows = match storage.load_local_batch_row_index(batch_id) {
+            Ok(Some(batch_rows)) => batch_rows,
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                on_error(error);
+                return Vec::new();
+            }
         };
         let mut rows = batch_rows
             .into_iter()
             .filter(|member| object_ids.contains(&member.object_id))
             .filter_map(|member| {
-                let Ok(Some(row)) = storage.load_history_row_batch_for_schema_hash(
+                let row = match storage.load_history_row_batch_for_schema_hash(
                     member.table_name.as_str(),
                     member.schema_hash,
                     member.branch_name.as_str(),
                     member.object_id,
                     batch_id,
-                ) else {
-                    return None;
+                ) {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return None,
+                    Err(error) => {
+                        on_error(error);
+                        return None;
+                    }
                 };
                 // Either rule: the mint is parent-blind now, and every installed store
                 // still carries members minted with parents included. A member that stops
@@ -1736,6 +1786,7 @@ impl SyncManager {
             }
             Err(error) => {
                 tracing::warn!(?batch_id, %error, "failed to load authoritative batch fate");
+                self.note_sealed_batch_for_sweep(batch_id);
                 return;
             }
         };
@@ -2105,11 +2156,34 @@ impl SyncManager {
         // because ticks are serialized under the runtime mutex it set the tick rate for
         // every client on the process. The fate check is the cheap discriminator, so it goes
         // first, and a submission's row is read only once it has survived it.
-        let batch_ids = match storage.scan_sealed_batch_submission_ids() {
-            Ok(batch_ids) => batch_ids,
-            Err(error) => {
-                tracing::warn!(%error, "failed to scan sealed batch submissions for recovery");
+        //
+        // And only for the submissions something happened to. The table is walked once per
+        // process, when the sweep first runs: that is the price of learning what a store
+        // holds, and a crash can leave a completable seal behind that nothing will re-send.
+        // After that a submission is looked at again only when it was put back in front of
+        // the sweep — persisted, a row of its applied, a read or write of its fate that
+        // failed — because those are the only ways a retained submission becomes drivable. A production store held 2258 seals whose
+        // rows never arrived: nothing can complete them, nothing deletes them, and every
+        // tick re-read all of them to learn that again.
+        let batch_ids: Vec<crate::row_histories::BatchId> = if self.sealed_batch_sweep_primed {
+            let touched = std::mem::take(&mut self.sealed_batches_to_sweep);
+            if touched.is_empty() {
                 return false;
+            }
+            touched.into_iter().collect()
+        } else {
+            // Anything noted before this walk is on disk and therefore in the walk; and a
+            // node whose walk keeps failing must not keep a growing set of ids to show for it.
+            self.sealed_batches_to_sweep.clear();
+            match storage.scan_sealed_batch_submission_ids() {
+                Ok(batch_ids) => {
+                    self.sealed_batch_sweep_primed = true;
+                    batch_ids
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to scan sealed batch submissions for recovery");
+                    return false;
+                }
             }
         };
 
@@ -2128,6 +2202,8 @@ impl SyncManager {
                         %error,
                         "failed to load authoritative batch fate during sealed batch recovery"
                     );
+                    // A read that failed is not a submission that cannot be driven.
+                    self.note_sealed_batch_for_sweep(batch_id);
                     continue;
                 }
             }
@@ -2154,11 +2230,13 @@ impl SyncManager {
                         %error,
                         "failed to load a sealed batch submission during recovery"
                     );
+                    self.note_sealed_batch_for_sweep(batch_id);
                     continue;
                 }
             };
 
-            let batch_rows = self.transactional_batch_rows(
+            let mut rows_unreadable = false;
+            let batch_rows = self.transactional_batch_rows_reporting(
                 storage,
                 submission.batch_id,
                 &submission
@@ -2166,7 +2244,21 @@ impl SyncManager {
                     .iter()
                     .map(|member| member.object_id)
                     .collect::<Vec<_>>(),
+                |error| {
+                    tracing::warn!(
+                        ?batch_id,
+                        %error,
+                        "failed to read a sealed batch's rows during recovery"
+                    );
+                    rows_unreadable = true;
+                },
             );
+            if rows_unreadable {
+                // Absent rows leave a seal uncompletable until they arrive; unreadable rows
+                // say nothing about it, so it is not the seal's fate that gets decided here.
+                self.note_sealed_batch_for_sweep(batch_id);
+                continue;
+            }
             if let Err(rejection) = self.validate_sealed_batch_submission(&submission) {
                 self.reject_sealed_transactional_batch(storage, None, rejection, &batch_rows);
                 recovered_any = true;

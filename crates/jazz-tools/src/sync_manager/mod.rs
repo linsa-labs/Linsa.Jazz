@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use web_time::Instant;
@@ -285,6 +285,17 @@ pub struct SyncManager {
 
     /// This node's durability identities (empty = don't emit durability notifications).
     pub(super) my_tiers: HashSet<DurabilityTier>,
+    /// Sealed batch submissions the recovery sweep has to look at on its next pass: touched
+    /// since the last one by a submission persisted, one of its rows applied, or a fate
+    /// write that failed and has to be retried. The sweep walks the whole retained table
+    /// once per process and only this set afterwards, so its price follows what changed
+    /// rather than what the store has kept (2258 permanently uncompletable seals on the
+    /// production store, re-read on every tick, were 62.6 % of the server's CPU). Ordered,
+    /// because the sweep settles in id order: ids are time-ordered, so a transaction is
+    /// examined after the one it builds on.
+    pub(super) sealed_batches_to_sweep: BTreeSet<BatchId>,
+    /// Whether the sweep has walked the retained submission table for this process yet.
+    pub(super) sealed_batch_sweep_primed: bool,
     /// Tracks which clients are interested in row batch-member state updates.
     pub(super) row_batch_interest: HashMap<RowBatchKey, HashSet<ClientId>>,
     /// Tracks clients that explicitly requested the current or next known fate
@@ -460,6 +471,8 @@ impl SyncManager {
             handed_to_schema_layer: HashMap::new(),
             next_pending_id: 0,
             my_tiers: HashSet::new(),
+            sealed_batches_to_sweep: BTreeSet::new(),
+            sealed_batch_sweep_primed: false,
             row_batch_interest: HashMap::new(),
             batch_fate_interest: HashMap::new(),
             query_origin: HashMap::new(),
@@ -482,6 +495,27 @@ impl SyncManager {
     pub fn with_durability_tier(mut self, tier: DurabilityTier) -> Self {
         self.my_tiers.insert(tier);
         self
+    }
+
+    /// Put a sealed batch in front of the next recovery sweep.
+    ///
+    /// Called wherever something that can make a retained submission drivable is written:
+    /// the submission itself, one of its rows, or a read or write of its fate that failed
+    /// and has to be retried. A node without a durability tier never sweeps
+    /// (`recover_completed_sealed_batches_with_storage` returns before draining), so it must
+    /// not accumulate either: every row batch a client ever receives would stay here for
+    /// the life of the process.
+    pub(crate) fn note_sealed_batch_for_sweep(&mut self, batch_id: BatchId) {
+        if self.my_tiers.is_empty() {
+            return;
+        }
+        self.sealed_batches_to_sweep.insert(batch_id);
+    }
+
+    /// How many sealed batches the next recovery sweep will look at.
+    #[cfg(test)]
+    pub(crate) fn sealed_batches_awaiting_sweep(&self) -> usize {
+        self.sealed_batches_to_sweep.len()
     }
 
     /// Allow authenticated user clients to publish structural schema catalogue
@@ -618,6 +652,7 @@ impl SyncManager {
             }
         }
         connections += self.my_tiers.len() * std::mem::size_of::<DurabilityTier>();
+        connections += self.sealed_batches_to_sweep.len() * std::mem::size_of::<BatchId>();
 
         let mut subscriptions = 0usize;
         for state in self.clients.values() {
