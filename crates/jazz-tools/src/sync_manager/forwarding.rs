@@ -495,7 +495,7 @@ impl SyncManager {
         }
     }
 
-    pub(super) fn forward_update_to_clients_with_storage(
+    pub(crate) fn forward_update_to_clients_with_storage(
         &mut self,
         storage: &impl crate::storage::Storage,
         object_id: ObjectId,
@@ -522,6 +522,11 @@ impl SyncManager {
             .filter(|(id, client)| **id != except && client.is_in_scope(object_id, &branch_name))
             .map(|(id, _)| *id)
             .collect();
+        // Every local write comes through here, one per keystroke on a client runtime, so a node
+        // with no client holding the row stops before reading storage.
+        if client_ids.is_empty() {
+            return;
+        }
 
         let _span = tracing::debug_span!("forward_update_to_clients", %object_id, %branch_name, client_count = client_ids.len()).entered();
 

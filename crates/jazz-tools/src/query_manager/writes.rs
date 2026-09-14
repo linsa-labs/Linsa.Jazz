@@ -339,8 +339,35 @@ impl QueryManager {
         update: RowVisibilityChange,
     ) -> Result<StoredRowBatch, QueryError> {
         let row = update.row.clone();
+        self.forward_local_visibility_change_to_clients(&*storage, &update);
         self.handle_row_update_with_origin(storage, update, true, false);
         Ok(row)
+    }
+
+    /// A version this node made visible itself reaches its downstream clients the way an arrival
+    /// does: forwarded to every client whose scope already holds the row. The settle pass sends
+    /// a client rows only when its scope changes, so without this a client keeps the version it
+    /// was first given. Callers run this once the batch's fate is stored, so the fate goes with it.
+    pub(crate) fn forward_local_visibility_change_to_clients<H: Storage>(
+        &mut self,
+        storage: &H,
+        change: &RowVisibilityChange,
+    ) {
+        // A client runtime writes on every keystroke and has no clients: stop before interning
+        // the branch name.
+        if !self.sync_manager.has_clients()
+            || matches!(
+                change.row.state,
+                RowState::StagingPending | RowState::Superseded
+            )
+        {
+            return;
+        }
+        self.sync_manager.forward_update_to_clients_with_storage(
+            storage,
+            change.object_id,
+            BranchName::new(&change.row.branch),
+        );
     }
 
     fn maybe_record_local_direct_settlement<H: Storage>(

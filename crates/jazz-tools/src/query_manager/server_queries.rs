@@ -129,6 +129,13 @@ struct UpdatePermissionRequest<'a> {
     auth_context: &'a crate::schema_manager::SchemaContext,
 }
 
+// Branch-schema maps built on this thread; lets a test see work a settle pass does for
+// subscriptions that have nothing to settle.
+#[cfg(test)]
+thread_local! {
+    pub(super) static BRANCH_SCHEMA_MAPS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl QueryManager {
     fn should_emit_query_settled_to_downstream(
         required_tier: Option<DurabilityTier>,
@@ -292,6 +299,8 @@ impl QueryManager {
         schema_context: &crate::schema_manager::SchemaContext,
     ) -> std::collections::HashMap<String, crate::query_manager::types::SchemaHash> {
         let mut map = std::collections::HashMap::new();
+        #[cfg(test)]
+        BRANCH_SCHEMA_MAPS_BUILT.with(|built| built.set(built.get() + 1));
         map.insert(
             schema_context.branch_name().as_str().to_string(),
             schema_context.current_hash,
@@ -1614,11 +1623,18 @@ impl QueryManager {
         let pending = self.sync_manager.take_pending_query_unsubscriptions();
 
         for unsub in pending {
-            let propagation = self
+            let propagation = match self
                 .server_subscriptions
                 .remove(&(unsub.client_id, unsub.query_id))
-                .map(|sub| sub.propagation)
-                .unwrap_or(crate::sync_manager::QueryPropagation::Full);
+            {
+                Some(sub) => sub.propagation,
+                // Withdrawn while queued, with nothing registered under the key: a subscription
+                // is forwarded upstream only when it registers, so nothing was forwarded for this
+                // key since its last registration ended. Forwarding the withdrawal would remove
+                // whatever upstream now shares the query id.
+                None if unsub.cancelled_queued_subscription => continue,
+                None => crate::sync_manager::QueryPropagation::Full,
+            };
 
             if propagation == crate::sync_manager::QueryPropagation::Full {
                 // Forward unsubscription to upstream servers
@@ -1643,11 +1659,6 @@ impl QueryManager {
             let Some(mut sub) = self.server_subscriptions.remove(&(client_id, query_id)) else {
                 continue;
             };
-            let branches = &sub.branches;
-            let table = sub.query.table.as_str().to_string();
-            let include_deleted = sub.query.include_deleted;
-            let branch_schema_map = Self::branch_schema_map_for_context(&sub.schema_context);
-            let mut schema_warnings = SchemaWarningAccumulator::default();
             let had_dirty_graph = sub.graph.has_dirty_nodes();
 
             if sub.settled_once && !had_dirty_graph && !sub.needs_recompile {
@@ -1680,6 +1691,14 @@ impl QueryManager {
                 self.server_subscriptions.insert((client_id, query_id), sub);
                 continue;
             }
+
+            // Every pass visits every subscription and a clean one leaves above, so what only
+            // the settle below needs is built here, not before that exit.
+            let branches = &sub.branches;
+            let table = sub.query.table.as_str().to_string();
+            let include_deleted = sub.query.include_deleted;
+            let branch_schema_map = Self::branch_schema_map_for_context(&sub.schema_context);
+            let mut schema_warnings = SchemaWarningAccumulator::default();
 
             // Settle-cost accounting: past the clean-cached-scope short-circuit
             // above, so this subscription is about to do real settle work.

@@ -297,6 +297,7 @@ impl SyncManager {
         for client_id in clients {
             self.queue_batch_fate_to_client(client_id, fate.clone());
         }
+        self.retire_batch_fate_interest_if_settled(&fate);
     }
 
     fn restore_permission_rejected_delete_row<H: Storage>(

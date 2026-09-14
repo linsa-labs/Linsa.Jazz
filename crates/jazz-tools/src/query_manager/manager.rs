@@ -1066,7 +1066,7 @@ impl QueryManager {
     /// Recompile subscriptions that are marked as stale.
     ///
     /// Called during process() to rebuild QueryGraphs when schemas change.
-    fn recompile_stale_subscriptions(&mut self) {
+    fn recompile_stale_subscriptions<H: Storage>(&mut self, storage: &H) {
         if !self.has_stale_subscriptions() {
             return;
         }
@@ -1260,7 +1260,7 @@ impl QueryManager {
                 );
             }
             self.sync_manager
-                .drop_client_query_subscription(client_id, query_id);
+                .drop_client_query_subscription(storage, client_id, query_id);
             if propagation == QueryPropagation::Full {
                 self.sync_manager
                     .send_query_unsubscription_to_servers(query_id);
@@ -1740,7 +1740,7 @@ impl QueryManager {
         // Tests/benchmarks that don't need real storage use NullStorage.
 
         // 6. Recompile any subscriptions marked as stale due to schema changes
-        self.recompile_stale_subscriptions();
+        self.recompile_stale_subscriptions(&*storage);
 
         // 7. Settle all subscriptions - row_loader reads from subscription's branches
         // Extract references to avoid borrowing self in the closure

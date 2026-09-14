@@ -544,6 +544,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
                 });
         }
 
+        let mut withdrawn = Vec::new();
         let query_manager = self.schema_manager.query_manager_mut();
         for (
             table,
@@ -559,6 +560,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         {
             if was_visible {
                 let branch_name = crate::object::BranchName::new(&branch);
+                withdrawn.push((row_id, branch_name));
                 let _ = self.storage.patch_row_region_rows_by_batch(
                     &table,
                     member_batch_id,
@@ -624,6 +626,17 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             } else {
                 query_manager.clear_local_pending_row_overlay(&table, row_id);
             }
+        }
+
+        // Rows this node had made visible may have reached its clients. A client that was sent only
+        // the rejected version has nothing to roll back to, so send each row as it stands after the
+        // rollback. The rejection itself reaches those clients through the inbox's fate relay.
+        if withdrawn.is_empty() {
+            return;
+        }
+        let sync_manager = self.schema_manager.query_manager_mut().sync_manager_mut();
+        for (row_id, branch_name) in withdrawn {
+            sync_manager.forward_update_to_clients_with_storage(&self.storage, row_id, branch_name);
         }
     }
 

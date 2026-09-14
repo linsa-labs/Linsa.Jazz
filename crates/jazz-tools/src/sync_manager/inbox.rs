@@ -1820,6 +1820,7 @@ impl SyncManager {
             for client_id in interested_clients {
                 self.queue_batch_fate_to_client(client_id, fate.clone());
             }
+            self.retire_batch_fate_interest_if_settled(&fate);
         }
     }
 
@@ -2416,6 +2417,7 @@ impl SyncManager {
                         });
                     }
                 }
+                self.retire_batch_fate_interest_if_settled(&fate);
             }
             SyncPayload::BatchFateNeeded { batch_ids } => {
                 self.respond_to_batch_fate_request(
@@ -2876,10 +2878,23 @@ impl SyncManager {
                         self.query_origin.remove(query_id);
                     }
                 }
+                // A subscription still queued here arrived before this unsubscription: a client
+                // never reuses a query id and replays only its live subscriptions, so whatever
+                // it sent for this id precedes the withdrawal. The pass drains unsubscriptions
+                // before subscriptions, so left in the queue it would be registered after its
+                // own withdrawal and never removed. Cancelling at arrival rather than in the pass
+                // keeps arrival order for a subscription that reaches the same key later, which
+                // happens on an upstream server: a hub forwards its downstream clients' ids
+                // under its own client id. There the queued subscription may belong to another of
+                // the hub's clients under the same key; cancelling it is what the pass does to a
+                // registered one, and the shared key is a defect of its own.
+                let cancelled_queued_subscription =
+                    self.cancel_pending_query_subscription(client_id, *query_id);
                 self.pending_query_unsubscriptions
                     .push(PendingQueryUnsubscription {
                         client_id,
                         query_id: *query_id,
+                        cancelled_queued_subscription,
                     });
             }
             SyncPayload::BatchFate { fate } => {

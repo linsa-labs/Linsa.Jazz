@@ -795,6 +795,8 @@ pub struct PendingQuerySubscription {
 pub struct PendingQueryUnsubscription {
     pub client_id: ClientId,
     pub query_id: QueryId,
+    /// The withdrawal cancelled this client's subscription while it was still queued.
+    pub cancelled_queued_subscription: bool,
 }
 
 /// A write from a User client awaiting permission check (policy evaluation).

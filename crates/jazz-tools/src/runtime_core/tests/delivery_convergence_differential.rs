@@ -37,11 +37,12 @@
 //! is strategy-less, so the model is LWW and collapsing a frontier to its `(updated_at,
 //! batch_id)` maximum is what LWW says should happen — the oracle can therefore see
 //! accumulation but not OVER-collapse; a `Counter` or `GSet` column and a matching model arm
-//! would fix that. And delete/restore are excluded from the alphabet (see
-//! `a_deleted_row_never_reaches_a_subscribed_peer`), so the delete-winner corruption is outside
+//! would fix that. And delete/restore are excluded from the alphabet (a single delete is pinned
+//! by `a_sender_delete_reaches_a_subscribed_peer`), so the delete-winner corruption is outside
 //! the generated space.
 
 use super::*;
+use crate::batch_fate::{BatchFate, BatchMode};
 use crate::storage::SqliteStorage;
 
 type Node = RuntimeCore<SqliteStorage, NoopScheduler>;
@@ -598,12 +599,9 @@ fn choose_and_apply(
                 .expect("a peer may update a row it holds");
             format!("update(peer {peer_index}, {row_id}, hits={hits})")
         }
-        // Delete and restore are deliberately NOT in this alphabet. A server-side delete never
-        // reaches a subscribed peer at all — see
-        // `a_deleted_row_never_reaches_a_subscribed_peer` below, which pins that as its own
-        // measured defect. Including an operation whose outcome is governed by a different,
-        // still-open defect would keep this oracle permanently red and mask everything it was
-        // built to find.
+        // Delete and restore are not in this alphabet yet. They were kept out while a server-side
+        // delete never reached a subscribed peer; `a_sender_delete_reaches_a_subscribed_peer`
+        // below now pins that it does, and adding them here is the next step for this oracle.
         6..=8 => {
             let body = format!("s{op_index}-b");
             entry.body = body.clone();
@@ -732,33 +730,509 @@ fn a_peer_write_on_a_delivered_row_reaches_the_sender() {
     let _ = std::fs::remove_file(peer_path);
 }
 
-/// A server-side delete never reaches a subscribed peer.
+/// A sender on EdgeServer with one subscribed peer, settled, the peer holding a row the sender
+/// inserted.
 ///
-/// MEASURED, not inferred: across a full randomized run of the oracle above — 90 row
-/// deliveries traced payload by payload — not one delivery carried `is_deleted`. The peer goes
-/// on serving the row as live forever.
+/// Peers are read through a local-only query: a query that went to the sender would register there
+/// and replay the row, which is the delivery these gates are about.
+struct SenderAndPeer {
+    server: Node,
+    peers: Vec<Peer>,
+    network: Network,
+    rng: Xorshift,
+    row_id: ObjectId,
+    app: String,
+    tag: String,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl SenderAndPeer {
+    fn new(tag: &str, seed: u64) -> Self {
+        let mut rng = Xorshift(seed);
+        let schema = docs_schema();
+        let app = format!("delivery-sender-{tag}");
+
+        let (server_storage, server_path) = open_store(&format!("{tag}-server"), 0, 0);
+        let mut server = runtime_over(
+            schema.clone(),
+            &app,
+            server_storage,
+            Some(DurabilityTier::EdgeServer),
+        );
+
+        let (peer_storage, peer_path) = open_store(&format!("{tag}-peer"), 0, 1);
+        let core = runtime_over(schema, &app, peer_storage, None);
+        let client_id = ClientId::new();
+        let server_id = ServerId::new();
+        let mut peer = Peer {
+            core,
+            server_id,
+            client_id,
+            subscription: None,
+        };
+        server.add_client(client_id, Some(Session::new("alice")));
+        peer.core.add_server(server_id);
+        subscribe(&mut peer);
+
+        let mut peers = vec![peer];
+        let mut network = Network::new();
+        network.settle(&mut server, &mut peers, &mut rng);
+
+        let ((row_id, _), _) = server
+            .insert(
+                "docs",
+                HashMap::from([
+                    ("owner".to_string(), Value::Text("owner".into())),
+                    ("body".to_string(), Value::Text("from-server".into())),
+                    ("hits".to_string(), Value::BigInt(0)),
+                ]),
+                None,
+            )
+            .expect("the server may insert");
+        network.settle(&mut server, &mut peers, &mut rng);
+
+        let branch = server.schema_manager().branch_name().to_string();
+        assert_eq!(
+            tip_count(&mut peers[0].core, row_id, &branch),
+            1,
+            "fixture precondition: the peer must hold the inserted row before it can miss a later \
+             version of it"
+        );
+
+        Self {
+            server,
+            peers,
+            network,
+            rng,
+            row_id,
+            app,
+            tag: tag.to_string(),
+            paths: vec![server_path, peer_path],
+        }
+    }
+
+    /// Connect and subscribe one more peer, not yet settled; returns its index.
+    fn add_peer(&mut self) -> usize {
+        let index = self.peers.len();
+        let (storage, path) = open_store(&format!("{}-peer{index}", self.tag), 0, index + 1);
+        self.paths.push(path);
+        let core = runtime_over(docs_schema(), &self.app, storage, None);
+        let mut peer = Peer {
+            core,
+            server_id: ServerId::new(),
+            client_id: ClientId::new(),
+            subscription: None,
+        };
+        self.server
+            .add_client(peer.client_id, Some(Session::new("alice")));
+        peer.core.add_server(peer.server_id);
+        subscribe(&mut peer);
+        self.peers.push(peer);
+        index
+    }
+
+    /// Deliver an upstream's rejection of `batch_id` to the sender and let it act on it.
+    fn reject_from_upstream(
+        &mut self,
+        upstream_id: ServerId,
+        batch_id: crate::row_histories::BatchId,
+    ) {
+        self.server.park_sync_message(InboxEntry {
+            source: Source::Server(upstream_id),
+            payload: SyncPayload::BatchFate {
+                fate: BatchFate::Rejected {
+                    batch_id,
+                    code: "permission_denied".to_string(),
+                    reason: "upstream refused the write".to_string(),
+                },
+            },
+        });
+        self.server.batched_tick();
+        self.server.immediate_tick();
+    }
+
+    fn settle(&mut self) {
+        self.network
+            .settle(&mut self.server, &mut self.peers, &mut self.rng);
+    }
+
+    fn update_values() -> Vec<(String, Value)> {
+        vec![
+            ("body".to_string(), Value::Text("updated".into())),
+            ("hits".to_string(), Value::BigInt(1)),
+        ]
+    }
+
+    fn row(&self, body: &str, hits: i64) -> Snapshot {
+        vec![(self.row_id, "owner".to_string(), body.to_string(), hits)]
+    }
+}
+
+fn batch_fate_interest_len(node: &mut Node) -> usize {
+    node.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager()
+        .batch_fate_interest_len()
+}
+
+fn batch_fate_interest_clients(node: &mut Node, batch_id: crate::row_histories::BatchId) -> usize {
+    node.schema_manager_mut()
+        .query_manager_mut()
+        .sync_manager()
+        .batch_fate_interest_clients(batch_id)
+}
+
+impl Drop for SenderAndPeer {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A sender's own update to a row a subscribed peer already holds reaches that peer, with its
+/// fate.
 ///
-/// Mechanism, verified as far as the code goes: deletion is not a `RowState`. A delete is a
-/// `VisibleDirect` batch carrying `is_deleted`/`delete_kind`
-/// (`row_histories/types.rs:111-123`), so `load_current_row_from_storage`
-/// (`sync_manager/forwarding.rs:120-145`) loads the tombstone perfectly well — both its
-/// visible-region branch and its history fallback accept it. What refuses it is the scope gate
-/// in `queue_row_to_client`: `if !in_scope { return; }`. A deleted row no longer matches the
-/// subscription that put it in scope, so the one payload that would tell the peer it is gone is
-/// dropped for the precise reason that it is gone. `prune_client_scope_tracking`
-/// (`sync_manager/mod.rs:1233-1269`) then clears the bookkeeping and sends the client nothing.
+/// A row reaches a client by one of two paths. A change arriving from another node is forwarded
+/// to every client whose scope holds the row (`forward_update_to_clients_*`, from the inbox), and
+/// a row entering a client's scope is replayed when the settle pass moves that scope. A node's
+/// own write that leaves membership unchanged took neither: `finish_local_row_history_write`
+/// forwarded to servers only, and `settle_server_subscriptions` sends rows only when the scope set
+/// changes. The peer kept the version it was first given.
 ///
-/// The step not directly instrumented is the scope recomputation itself — that the delete is
-/// what removes the row from the client's scope, rather than some earlier refusal. Everything
-/// either side of it is measured.
-///
-/// This is NOT the parent-stripping defect and is not fixed by the elided-snapshot frontier
-/// rule; it reproduces identically with that rule armed. It is recorded here rather than folded
-/// into the oracle above, because an alphabet containing an operation governed by a separate
-/// open defect can never go green and would mask every other finding.
-#[ignore = "open finding: a delete is refused by the scope gate that its own effect triggers"]
+/// The randomized oracle above hid this. A peer without a durability tier sends even its
+/// local-only reads to the server, where each one was registered and never removed, and every
+/// such registration replayed the row at its current version. Once that leak was closed the
+/// oracle went red on nearly every seed.
 #[test]
-fn a_deleted_row_never_reaches_a_subscribed_peer() {
+fn a_sender_update_on_a_delivered_row_reaches_a_subscribed_peer() {
+    let mut f = SenderAndPeer::new("upd", 0x5EED_0003);
+
+    let batch_id = f
+        .server
+        .update(f.row_id, SenderAndPeer::update_values(), None)
+        .expect("the server may update a live row");
+    f.settle();
+
+    let expected = f.row("updated", 1);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the sender must hold its own update"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the peer is subscribed to docs and holds this row, so the sender's update must reach \
+         it. The write changed no membership, so no scope moved and nothing was replayed."
+    );
+    assert_eq!(
+        f.peers[0]
+            .core
+            .storage()
+            .load_authoritative_batch_fate(batch_id)
+            .expect("the peer's fate should read"),
+        Some(BatchFate::DurableDirect {
+            batch_id,
+            confirmed_tier: DurabilityTier::EdgeServer,
+        }),
+        "the peer holds the update, so it must hold its fate too. A local write's fate is \
+         recorded after the write itself, so a forward made inside the write goes out before \
+         there is a fate to send, and nothing sends it later: the sweep leaves a batch confirmed \
+         at the node's own tier alone."
+    );
+}
+
+/// A sender's update inside an explicit direct batch reaches a subscribed peer when the batch
+/// commits.
+///
+/// A write into an open batch is staged, so the write changes no visibility and forwards nothing.
+/// Its rows become visible at commit, in `publish_direct_batch_rows`, which is a second place a
+/// node makes its own version visible.
+#[test]
+fn a_sender_direct_batch_update_reaches_a_subscribed_peer_on_commit() {
+    let mut f = SenderAndPeer::new("batch", 0x5EED_0004);
+
+    let batch_id = f.server.begin_batch(BatchMode::Direct);
+    let write_context = WriteContext {
+        session: None,
+        attribution: None,
+        updated_at: None,
+        batch_mode: None,
+        batch_id: Some(batch_id),
+        target_branch_name: None,
+    };
+    f.server
+        .update(
+            f.row_id,
+            SenderAndPeer::update_values(),
+            Some(&write_context),
+        )
+        .expect("the server may update inside its batch");
+    f.server
+        .commit_batch(batch_id)
+        .expect("the server may commit its batch");
+    f.settle();
+
+    let expected = f.row("updated", 1);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the sender must hold its committed update"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the batch committed and its update is visible on the sender, so the subscribed peer \
+         holding the row must receive it"
+    );
+}
+
+/// A sender's update that its upstream rejects is withdrawn from a subscribed peer.
+///
+/// Once a node's own update reaches its clients, a rejection from upstream has to follow it:
+/// `mark_local_batch_rows_rejected` rolls the sender back to the version before, and a peer left
+/// holding the rejected version must be told, as clients are for a rejected client write.
+#[test]
+fn a_sender_update_rejected_upstream_is_withdrawn_from_a_subscribed_peer() {
+    let mut f = SenderAndPeer::new("reject", 0x5EED_0005);
+    let upstream_id = ServerId::new();
+    f.server.add_server(upstream_id);
+    f.settle();
+
+    let batch_id = f
+        .server
+        .update(f.row_id, SenderAndPeer::update_values(), None)
+        .expect("the server may update a live row");
+    f.settle();
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        f.row("updated", 1),
+        "fixture precondition: the peer must hold the update before its rejection can be missed"
+    );
+
+    f.reject_from_upstream(upstream_id, batch_id);
+    f.settle();
+
+    let expected = f.row("from-server", 0);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the rejection must roll the sender back"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the upstream rejected the update this peer was sent, so the peer must drop it as the \
+         sender did"
+    );
+}
+
+/// A sender's delete that took a row out of a subscribed peer's scope, then was rejected upstream,
+/// is undone on that peer as well.
+///
+/// The delete reaches the peer while the row is still in its scope. The next settle pass drops the
+/// row from that scope, and `prune_client_scope_tracking` drops with it the record that the peer
+/// was sent the delete's batch. The rejection comes after that: the fate relay finds no client
+/// interested in the batch, and the restored row re-enters the peer's scope as a version the peer
+/// already holds, under a tombstone the peer was never told is void.
+#[test]
+fn a_sender_delete_rejected_upstream_after_leaving_scope_is_undone_on_a_subscribed_peer() {
+    let mut f = SenderAndPeer::new("reject-delete", 0x5EED_0006);
+    let upstream_id = ServerId::new();
+    f.server.add_server(upstream_id);
+    f.settle();
+
+    let batch_id = f
+        .server
+        .delete(f.row_id, None)
+        .expect("the server may delete a live row");
+    f.settle();
+    assert!(
+        visible_docs(&mut f.peers[0].core).is_empty(),
+        "fixture precondition: the peer must hold the delete before its rejection can be missed"
+    );
+
+    f.reject_from_upstream(upstream_id, batch_id);
+    f.settle();
+
+    let expected = f.row("from-server", 0);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the rejection must restore the row on the sender"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the upstream rejected the delete this peer was sent, so the peer must show the row again \
+         as the sender does"
+    );
+    assert_eq!(
+        batch_fate_interest_clients(&mut f.server, batch_id),
+        0,
+        "a rejection is the batch's last fate, so the sender must stop keeping the peer on it"
+    );
+}
+
+/// The same loss with a peer that confirms deliveries: the confirmed delete is recorded as sent
+/// only when the confirmation arrives, which here is after the settle pass has dropped the row
+/// from the peer's scope, so the delete's interest outlives that prune and the rejection gets
+/// through without help. This pins that the kept interest changes nothing for such a peer.
+#[test]
+fn a_sender_delete_rejected_upstream_after_leaving_scope_is_undone_on_a_confirming_peer() {
+    let mut f = SenderAndPeer::new("reject-delete-acks", 0x5EED_0009);
+    let client_id = f.peers[0].client_id;
+    f.server.set_client_acks_deliveries(client_id, true);
+    f.peers[0].core.set_upstream_supports_delivery_acks(true);
+    let upstream_id = ServerId::new();
+    f.server.add_server(upstream_id);
+    f.settle();
+
+    let batch_id = f
+        .server
+        .delete(f.row_id, None)
+        .expect("the server may delete a live row");
+    f.settle();
+    assert!(
+        visible_docs(&mut f.peers[0].core).is_empty(),
+        "fixture precondition: the peer must hold the delete before its rejection can be missed"
+    );
+
+    f.reject_from_upstream(upstream_id, batch_id);
+    f.settle();
+
+    let expected = f.row("from-server", 0);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the rejection must restore the row on the sender"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the upstream rejected the delete this confirming peer was sent, so the peer must show \
+         the row again as the sender does"
+    );
+    assert_eq!(batch_fate_interest_clients(&mut f.server, batch_id), 0);
+}
+
+/// A peer's delete relayed by the sender to another subscribed peer, then rejected upstream after
+/// the row left that peer's scope, is undone there as well.
+///
+/// The same loss as for the sender's own delete, on the path that forwarded changes to clients
+/// before local writes were: an arrival is forwarded while the row is in scope, and the scope
+/// prune forgets that it was.
+#[test]
+fn a_relayed_delete_rejected_upstream_after_leaving_scope_is_undone_on_another_peer() {
+    let mut f = SenderAndPeer::new("reject-relayed", 0x5EED_0008);
+    let upstream_id = ServerId::new();
+    f.server.add_server(upstream_id);
+    let writer = f.add_peer();
+    f.settle();
+    assert_eq!(
+        visible_docs(&mut f.peers[writer].core),
+        f.row("from-server", 0),
+        "fixture precondition: the writer must hold the row before it can delete it"
+    );
+
+    let batch_id = f.peers[writer]
+        .core
+        .delete(f.row_id, None)
+        .expect("the writer may delete a live row");
+    f.settle();
+    assert!(
+        visible_docs(&mut f.server).is_empty() && visible_docs(&mut f.peers[0].core).is_empty(),
+        "fixture precondition: the writer's delete must reach the sender and the other peer"
+    );
+
+    f.reject_from_upstream(upstream_id, batch_id);
+    f.settle();
+
+    let expected = f.row("from-server", 0);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the rejection must restore the row on the sender"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        expected,
+        "the upstream rejected the delete this peer was relayed, so the peer must show the row \
+         again as the sender does"
+    );
+    assert_eq!(
+        batch_fate_interest_clients(&mut f.server, batch_id),
+        0,
+        "a rejection is the batch's last fate, so the sender must stop keeping the peer on it"
+    );
+}
+
+/// A peer that subscribed after a sender's update holds only that version; when the update is
+/// rejected upstream, the peer is sent the version that stands again.
+///
+/// A scope replay sends a row's current version with its parents stripped, so this peer's history
+/// for the row is the rejected version alone. Rolling it back leaves the peer nothing to fall back
+/// to: the rejected version reads as the row's insert, and the row goes. The peer's scope on the
+/// sender does not change, because the restored version matches its query as the rejected one did,
+/// so no settle pass sends the row again. The sender has to send it when it withdraws the version.
+#[test]
+fn a_sender_update_rejected_upstream_is_restored_on_a_peer_that_subscribed_after_it() {
+    let mut f = SenderAndPeer::new("reject-late-peer", 0x5EED_0007);
+    let upstream_id = ServerId::new();
+    f.server.add_server(upstream_id);
+    f.settle();
+
+    let batch_id = f
+        .server
+        .update(f.row_id, SenderAndPeer::update_values(), None)
+        .expect("the server may update a live row");
+    f.settle();
+    let late = f.add_peer();
+    f.settle();
+    assert_eq!(
+        visible_docs(&mut f.peers[late].core),
+        f.row("updated", 1),
+        "fixture precondition: the late peer must hold the update"
+    );
+    assert_eq!(
+        f.peers[late]
+            .core
+            .storage()
+            .scan_history_row_batches("docs", f.row_id)
+            .expect("history should read")
+            .len(),
+        1,
+        "fixture precondition: the late peer must hold the update alone, as a scope replay sends it"
+    );
+
+    f.reject_from_upstream(upstream_id, batch_id);
+    f.settle();
+
+    let expected = f.row("from-server", 0);
+    assert_eq!(
+        visible_docs(&mut f.server),
+        expected,
+        "fixture precondition: the rejection must roll the sender back"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[late].core),
+        expected,
+        "the late peer was sent only the rejected update, so it must be sent the version that \
+         stands again"
+    );
+}
+
+/// A sender's delete of a row a subscribed peer holds reaches that peer.
+///
+/// This stood as an open finding blamed on the scope gate in `queue_row_to_client`: a deleted row
+/// leaves the subscription's scope, so its tombstone would be dropped for the very reason that it
+/// is gone. That was not the mechanism. A delete arriving through the inbox is forwarded on
+/// arrival, while the row is still in scope, and a delete the sender made itself was never
+/// forwarded to clients at all, like every other local write. Now that local writes are
+/// forwarded, the tombstone goes out before the settle pass drops the row from scope.
+#[test]
+fn a_sender_delete_reaches_a_subscribed_peer() {
     let mut rng = Xorshift(0x5EED_0002);
     let schema = docs_schema();
     let app = "delivery-delete-propagation";
@@ -822,6 +1296,12 @@ fn a_deleted_row_never_reaches_a_subscribed_peer() {
          payload carrying the tombstone is the delivery, and the scope gate drops it because \
          the deletion removed the row from the scope that would have carried it. The peer \
          serves a deleted row as live indefinitely."
+    );
+    assert_eq!(
+        batch_fate_interest_len(&mut server),
+        0,
+        "with no upstream nothing can reject the delete later, so the row leaving the peer's \
+         scope must not keep the peer waiting for its fate"
     );
 
     let _ = std::fs::remove_file(server_path);

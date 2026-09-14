@@ -538,9 +538,10 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }
 
         for visibility_change in visibility_changes {
-            self.schema_manager
-                .query_manager_mut()
-                .handle_row_update(&mut self.storage, visibility_change);
+            let query_manager = self.schema_manager.query_manager_mut();
+            query_manager
+                .forward_local_visibility_change_to_clients(&self.storage, &visibility_change);
+            query_manager.handle_row_update(&mut self.storage, visibility_change);
         }
 
         Ok(())

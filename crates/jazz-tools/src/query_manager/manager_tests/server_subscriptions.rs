@@ -1352,3 +1352,305 @@ fn a_superseded_unconfirmed_batch_stops_being_owed() {
          connected client is never reaped"
     );
 }
+
+fn push_subscription(
+    server_qm: &mut QueryManager,
+    client_id: crate::sync_manager::ClientId,
+    query_id: crate::sync_manager::QueryId,
+    query: &crate::query_manager::query::Query,
+) {
+    use crate::sync_manager::{InboxEntry, QueryPropagation, Source, SyncPayload};
+    server_qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id,
+            query: Box::new(query.clone()),
+            session: None,
+            required_tier: None,
+            propagation: QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+}
+
+fn push_unsubscription(
+    server_qm: &mut QueryManager,
+    client_id: crate::sync_manager::ClientId,
+    query_id: crate::sync_manager::QueryId,
+) {
+    use crate::sync_manager::{InboxEntry, Source, SyncPayload};
+    server_qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QueryUnsubscription { query_id },
+    });
+}
+
+fn live_server_subscriptions(server_qm: &QueryManager) -> usize {
+    server_qm
+        .server_subscription_telemetry()
+        .iter()
+        .map(|group| group.count)
+        .sum()
+}
+
+/// A one-shot read that the client answers from its own store sends its subscription and
+/// its unsubscription in the same flush, so both reach the server inside one pass. The pass
+/// drains unsubscriptions before subscriptions, so the unsubscription finds nothing to remove,
+/// the queued subscription is registered afterwards, and it lives until the client
+/// disconnects: every later settle pass walks it, and every write to a table it reads
+/// re-settles it.
+#[test]
+fn a_subscription_withdrawn_in_the_same_pass_is_never_registered() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    server_qm.process(&mut storage);
+
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        0,
+        "the client subscribed and unsubscribed before the server's pass, yet the server \
+         registered the subscription and will carry it until the client disconnects"
+    );
+}
+
+/// The reverse order within one pass must keep the subscription. A single client never sends
+/// it (query ids are not reused), but a hub forwards its downstream clients' ids under its own
+/// client id, so a later subscription can share the key upstream. Green on the stock core as
+/// well: it pins that a withdrawal cancels at arrival, not when the pass runs.
+#[test]
+fn a_resubscription_after_the_unsubscription_in_the_same_pass_stays_registered() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        1,
+        "fixture: registered"
+    );
+
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        1,
+        "the subscription that arrived after the unsubscription was dropped"
+    );
+}
+
+/// Subscribe, withdraw and subscribe again inside one pass: the last word is a subscription.
+/// Green on the stock core as well; it would go red if the cancel ran when the pass does.
+#[test]
+fn the_last_of_subscribe_unsubscribe_subscribe_in_one_pass_wins() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+
+    assert_eq!(live_server_subscriptions(&server_qm), 1);
+}
+
+/// A withdrawal only cancels its own client's queued subscription, never another client's
+/// subscription under the same query id.
+#[test]
+fn a_withdrawal_does_not_cancel_another_clients_queued_subscription() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let alice = ClientId::new();
+    let bob = ClientId::new();
+    connect_client(&mut server_qm, &storage, alice);
+    connect_client(&mut server_qm, &storage, bob);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, alice, QueryId(1), &query);
+    push_subscription(&mut server_qm, bob, QueryId(1), &query);
+    push_unsubscription(&mut server_qm, alice, QueryId(1));
+    server_qm.process(&mut storage);
+
+    assert_eq!(live_server_subscriptions(&server_qm), 1);
+}
+
+/// Every settle pass walks every server subscription. One whose graph is clean and already
+/// settled has nothing to do, but the pass used to build its branch-schema map (a String and a
+/// HashMap entry per live schema) before finding that out, and threw it away. With hundreds of
+/// live subscriptions that idle work was a large share of the sync server's CPU.
+#[test]
+fn a_settle_pass_over_clean_subscriptions_builds_no_branch_schema_maps() {
+    use crate::query_manager::server_queries::BRANCH_SCHEMA_MAPS_BUILT;
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    for id in 1..=50u64 {
+        push_subscription(&mut server_qm, client_id, QueryId(id), &query);
+    }
+    // A pass stops admitting registrations once the outbox holds a full initial replay; run
+    // passes until all are in.
+    for _ in 0..20 {
+        server_qm.process(&mut storage);
+        if live_server_subscriptions(&server_qm) == 50 {
+            break;
+        }
+    }
+    server_qm.process(&mut storage);
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        50,
+        "fixture: registered"
+    );
+    assert!(
+        server_qm
+            .server_subscriptions
+            .values()
+            .all(|sub| sub.settled_once && !sub.graph.has_dirty_nodes() && !sub.needs_recompile),
+        "fixture: every subscription must be clean and settled, else this measures real work"
+    );
+
+    let before = BRANCH_SCHEMA_MAPS_BUILT.with(|built| built.get());
+    server_qm.process(&mut storage);
+    let built = BRANCH_SCHEMA_MAPS_BUILT.with(|built| built.get()) - before;
+
+    assert_eq!(
+        built, 0,
+        "a settle pass with nothing to settle built {built} branch-schema maps for 50 clean \
+         subscriptions"
+    );
+}
+
+/// A subscription that did not fit into its pass waits in the queue for a later one, and the
+/// client can withdraw it meanwhile. The next pass drains unsubscriptions first, so unless the
+/// withdrawal reaches the queue the subscription is registered after it and never removed.
+#[test]
+fn a_subscription_withdrawn_while_it_waits_for_a_later_pass_is_never_registered() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    for id in 1..=40u64 {
+        push_subscription(&mut server_qm, client_id, QueryId(id), &query);
+    }
+    server_qm.process(&mut storage);
+    assert!(
+        !server_qm
+            .server_subscriptions
+            .contains_key(&(client_id, QueryId(40))),
+        "fixture: the last subscription must still be waiting after the first pass"
+    );
+
+    push_unsubscription(&mut server_qm, client_id, QueryId(40));
+    for _ in 0..30 {
+        server_qm.process(&mut storage);
+    }
+
+    assert!(
+        !server_qm
+            .server_subscriptions
+            .contains_key(&(client_id, QueryId(40))),
+        "the client withdrew a subscription while it waited in the queue, and a later pass \
+         registered it anyway"
+    );
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        39,
+        "every other waiting subscription must still be registered"
+    );
+}
+
+/// A client that reconnects replays its live subscriptions. If it withdraws one before the
+/// server's pass, the replay must not bring it back: the withdrawal has to take both the
+/// registration and the replayed subscription still in the queue.
+#[test]
+fn a_replayed_subscription_withdrawn_in_the_same_pass_leaves_nothing_registered() {
+    use crate::sync_manager::{ClientId, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        1,
+        "fixture: registered"
+    );
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    server_qm.process(&mut storage);
+
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        0,
+        "the withdrawal removed the registration, and the replay queued before it registered \
+         the subscription again"
+    );
+}
+
+/// A hub forwards a downstream subscription upstream when it registers it. One withdrawn while
+/// still queued was never forwarded, so its withdrawal must not be forwarded either: upstream
+/// keys are the hub's client id plus the downstream query id, ids repeat across the hub's
+/// downstream clients, and a stray withdrawal removes whichever live subscription shares the id.
+#[test]
+fn a_hub_sends_nothing_upstream_for_a_subscription_withdrawn_before_registration() {
+    use crate::sync_manager::{ClientId, Destination, QueryId, ServerId, SyncPayload};
+
+    let (mut hub, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let upstream_id = ServerId::new();
+    let client_id = ClientId::new();
+    connect_server(&mut hub, &storage, upstream_id);
+    connect_client(&mut hub, &storage, client_id);
+    let query = hub.query("users").build();
+    hub.process(&mut storage);
+    let _ = hub.sync_manager_mut().take_outbox();
+
+    push_subscription(&mut hub, client_id, QueryId(42), &query);
+    push_unsubscription(&mut hub, client_id, QueryId(42));
+    hub.process(&mut storage);
+
+    let upstream: Vec<_> = hub
+        .sync_manager_mut()
+        .take_outbox()
+        .into_iter()
+        .filter(|entry| entry.destination == Destination::Server(upstream_id))
+        .filter_map(|entry| match entry.payload {
+            SyncPayload::QuerySubscription { query_id, .. } => Some(("subscription", query_id)),
+            SyncPayload::QueryUnsubscription { query_id } => Some(("unsubscription", query_id)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        upstream.is_empty(),
+        "the hub never registered the subscription, yet sent upstream: {upstream:?}"
+    );
+}

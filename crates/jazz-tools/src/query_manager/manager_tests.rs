@@ -1311,6 +1311,7 @@ mod local_write_exemption;
 mod misc;
 mod policies;
 mod recursive_queries;
+mod server_subscription_withdrawal_differential;
 mod server_subscriptions;
 mod subscription_output_oracle;
 mod subscriptions;

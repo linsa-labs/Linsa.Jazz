@@ -84,6 +84,7 @@ fn memory_size_separates_sync_state_buckets() {
         .push(PendingQueryUnsubscription {
             client_id,
             query_id: QueryId(7),
+            cancelled_queued_subscription: false,
         });
     sm.pending_query_settled.push(PendingQuerySettled {
         server_id: Some(server_id),

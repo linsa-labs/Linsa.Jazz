@@ -606,6 +606,15 @@ impl SyncManager {
         Self::fate_settled_at(fate, self.settlement_target())
     }
 
+    /// Call after relaying `fate` to the interested clients. A settled fate is the last one the
+    /// batch gets, so the interest kept for it ends here, including what
+    /// `prune_client_scope_tracking` kept for clients the batch's rows left.
+    pub(super) fn retire_batch_fate_interest_if_settled(&mut self, fate: &BatchFate) {
+        if self.batch_fate_is_settled(fate) {
+            self.batch_fate_interest.remove(&fate.batch_id());
+        }
+    }
+
     /// [`Self::fate_needs_settlement_at`] against this node's settlement
     /// target.
     pub fn batch_needs_settlement(&self, fate: Option<&BatchFate>) -> bool {
@@ -915,6 +924,24 @@ impl SyncManager {
         !self.servers.is_empty()
     }
 
+    pub fn has_clients(&self) -> bool {
+        !self.clients.is_empty()
+    }
+
+    /// Client registrations waiting for a batch fate, counted per batch and client.
+    #[cfg(test)]
+    pub(crate) fn batch_fate_interest_len(&self) -> usize {
+        self.batch_fate_interest.values().map(HashSet::len).sum()
+    }
+
+    /// Clients registered as waiting for this batch's fate.
+    #[cfg(test)]
+    pub(crate) fn batch_fate_interest_clients(&self, batch_id: BatchId) -> usize {
+        self.batch_fate_interest
+            .get(&batch_id)
+            .map_or(0, HashSet::len)
+    }
+
     /// Get client state.
     pub fn get_client(&self, client_id: ClientId) -> Option<&ClientState> {
         self.clients.get(&client_id)
@@ -1147,6 +1174,19 @@ impl SyncManager {
         std::mem::take(&mut self.pending_query_unsubscriptions)
     }
 
+    /// Withdraw a client's subscription that is still queued for the QueryManager. Returns
+    /// whether one was queued.
+    fn cancel_pending_query_subscription(
+        &mut self,
+        client_id: ClientId,
+        query_id: QueryId,
+    ) -> bool {
+        let queued = self.pending_query_subscriptions.len();
+        self.pending_query_subscriptions
+            .retain(|pending| !(pending.client_id == client_id && pending.query_id == query_id));
+        self.pending_query_subscriptions.len() != queued
+    }
+
     /// Storage-backed version of `set_client_query_scope` that can replay row
     /// objects directly from storage-backed visible rows.
     pub fn set_client_query_scope_with_storage<H: Storage + ?Sized>(
@@ -1211,7 +1251,7 @@ impl SyncManager {
             entries.into_iter().collect()
         };
 
-        self.prune_client_scope_tracking(client_id, &no_longer_visible);
+        self.prune_client_scope_tracking(storage, client_id, &no_longer_visible);
 
         let mut newly_visible_batch_ids = HashSet::new();
         for (object_id, branch_name) in newly_visible_for_query {
@@ -1239,7 +1279,12 @@ impl SyncManager {
     /// Drop a client's query subscription state.
     ///
     /// Removes per-query scope and origin tracking.
-    pub fn drop_client_query_subscription(&mut self, client_id: ClientId, query_id: QueryId) {
+    pub fn drop_client_query_subscription<H: Storage + ?Sized>(
+        &mut self,
+        storage: &H,
+        client_id: ClientId,
+        query_id: QueryId,
+    ) {
         if let Some(client) = self.clients.get_mut(&client_id) {
             let old_scope: HashSet<(ObjectId, BranchName)> = client
                 .queries
@@ -1254,7 +1299,7 @@ impl SyncManager {
                 .collect();
             let no_longer_visible: HashSet<(ObjectId, BranchName)> =
                 old_scope.difference(&new_scope).cloned().collect();
-            self.prune_client_scope_tracking(client_id, &no_longer_visible);
+            self.prune_client_scope_tracking(storage, client_id, &no_longer_visible);
         }
 
         if let Some(clients) = self.query_origin.get_mut(&query_id) {
@@ -1265,8 +1310,9 @@ impl SyncManager {
         }
     }
 
-    fn prune_client_scope_tracking(
+    fn prune_client_scope_tracking<H: Storage + ?Sized>(
         &mut self,
+        storage: &H,
         client_id: ClientId,
         removed_scope: &HashSet<(ObjectId, BranchName)>,
     ) {
@@ -1294,7 +1340,30 @@ impl SyncManager {
             }
         }
 
+        // The client keeps the versions it was sent after the row leaves its scope, and the row
+        // interest dropped here is what would carry a later fate to it. While an upstream can
+        // still reject one of those batches, keep the client on the batch's fate instead: the
+        // relay that brings the rejection reaches it, and retires the entry once the fate is
+        // settled. A node with no upstream settles every fate itself, so it keeps nothing.
+        let has_upstream = self.has_servers_or_pending_servers();
         for key in removed_row_batches {
+            if has_upstream
+                && !self
+                    .batch_fate_interest
+                    .get(&key.batch_id)
+                    .is_some_and(|clients| clients.contains(&client_id))
+            {
+                let fate = storage
+                    .load_authoritative_batch_fate(key.batch_id)
+                    .ok()
+                    .flatten();
+                if self.batch_needs_settlement(fate.as_ref()) {
+                    self.batch_fate_interest
+                        .entry(key.batch_id)
+                        .or_default()
+                        .insert(client_id);
+                }
+            }
             if let Some(clients) = self.row_batch_interest.get_mut(&key) {
                 clients.remove(&client_id);
                 if clients.is_empty() {

@@ -2202,3 +2202,73 @@ fn rc_transaction_visible_subscription_hides_partial_accepted_batch_until_scope_
         "both accepted rows should appear together once the scoped batch is complete"
     );
 }
+
+/// Production shape of the server-subscription leak. A node whose own tier is `Local` (the
+/// rpc-server) reads at tier `Local`: the read settles from its own store inside the call and
+/// the one-shot query unsubscribes in the same tick, so the subscription and the
+/// unsubscription leave in one flush and the upstream server sees both in one pass. The
+/// server used to register the subscription anyway and keep it until the node disconnected.
+#[test]
+fn rc_local_tier_one_shot_read_leaves_no_subscription_upstream() {
+    let mut s = create_3tier_rc();
+    let c_server = s.c_server_for_b;
+
+    let mut future = s.b.query_with_propagation(
+        Query::new("users"),
+        None,
+        ReadDurabilityOptions {
+            tier: Some(DurabilityTier::Local),
+            local_updates: crate::query_manager::manager::LocalUpdates::Immediate,
+        },
+        crate::sync_manager::QueryPropagation::Full,
+    );
+    let waker = noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        matches!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(Ok(_))),
+        "fixture: a Local-tier read on a Local-tier node settles from its own store"
+    );
+
+    s.b.batched_tick();
+    let flushed = s.b.sync_sender().take();
+    let upstream = |entry: &&OutboxEntry| entry.destination == Destination::Server(c_server);
+    let subscriptions = flushed
+        .iter()
+        .filter(upstream)
+        .filter(|entry| matches!(entry.payload, SyncPayload::QuerySubscription { .. }))
+        .count();
+    let unsubscriptions = flushed
+        .iter()
+        .filter(upstream)
+        .filter(|entry| matches!(entry.payload, SyncPayload::QueryUnsubscription { .. }))
+        .count();
+    assert_eq!(
+        (subscriptions, unsubscriptions),
+        (1, 1),
+        "fixture: the subscription and its unsubscription leave in one flush"
+    );
+
+    for entry in flushed {
+        if entry.destination == Destination::Server(c_server) {
+            s.c.park_sync_message(InboxEntry {
+                source: Source::Client(s.b_client_of_c),
+                payload: entry.payload,
+            });
+        }
+    }
+    s.c.batched_tick();
+    s.c.immediate_tick();
+
+    let live: usize =
+        s.c.schema_manager()
+            .query_manager()
+            .server_subscription_telemetry()
+            .iter()
+            .map(|group| group.count)
+            .sum();
+    assert_eq!(
+        live, 0,
+        "the node's one-shot read is finished and withdrawn, yet the upstream server still \
+         holds its subscription"
+    );
+}
