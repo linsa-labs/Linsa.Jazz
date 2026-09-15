@@ -283,6 +283,17 @@ pub(crate) struct QuerySubscription {
     pub(crate) reported_schema_warnings: HashSet<SchemaWarningKey>,
 }
 
+impl QuerySubscription {
+    /// Whether the next `process()` settles this subscription.
+    fn needs_settle(&self) -> bool {
+        self.needs_recompile
+            || !self.settled_once
+            || self.needs_visibility_recompute
+            || self.has_pending_local_updates
+            || self.graph.has_dirty_nodes()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LocalUpdates {
     #[default]
@@ -467,6 +478,9 @@ pub(super) struct ServerQuerySubscription {
     pub(super) last_scope: HashSet<(ObjectId, BranchName)>,
     /// Flag indicating this subscription needs recompilation due to schema change.
     pub(super) needs_recompile: bool,
+    /// A table some select policy reads has changed. The graph can be clean while the verdicts
+    /// behind `last_scope` are not, so the next pass re-derives the scope anyway.
+    pub(super) needs_reauthorization: bool,
     /// Flag indicating this server subscription has settled at least once.
     /// Used to emit QuerySettled to the client on first settlement.
     pub(super) settled_once: bool,
@@ -553,6 +567,12 @@ pub struct QueryManager {
     pub(super) schema: Arc<Schema>,
     pub(super) row_policy_mode: RowPolicyMode,
     pub(super) authorization_schema: Option<Arc<Schema>>,
+    /// Tables each table's select policy reads under `authorization_schema`; cleared
+    /// whenever that schema is replaced.
+    select_policy_deps: HashMap<TableName, super::authz_cache::TableDeps>,
+    /// Union of the tables any select policy reads under `authorization_schema`; `None`
+    /// until first needed, reset whenever that schema is replaced.
+    policy_read_tables: Option<super::authz_cache::TableDeps>,
     pub(super) authorization_schema_required: bool,
     pub(super) authorization_context_cache: HashMap<(String, String), Arc<SchemaContext>>,
     /// Cross-tick row-authorization verdicts. See `authz_cache`.
@@ -762,6 +782,8 @@ impl QueryManager {
             schema: Arc::new(Schema::new()),
             row_policy_mode: RowPolicyMode::PermissiveLocal,
             authorization_schema: None,
+            select_policy_deps: HashMap::new(),
+            policy_read_tables: None,
             authorization_schema_required: false,
             authorization_context_cache: HashMap::new(),
             authz_verdicts: super::authz_cache::AuthzVerdictCache::default(),
@@ -827,6 +849,8 @@ impl QueryManager {
         } else {
             None
         };
+        self.select_policy_deps.clear();
+        self.policy_read_tables = None;
         self.authz_schema_generation += 1;
         self.authorization_context_cache.clear();
         self.authorization_schema_required = false;
@@ -858,6 +882,8 @@ impl QueryManager {
 
     pub fn set_authorization_schema(&mut self, schema: Schema) {
         self.authorization_schema = Some(Arc::new(schema));
+        self.select_policy_deps.clear();
+        self.policy_read_tables = None;
         self.authz_schema_generation += 1;
         self.authorization_context_cache.clear();
         self.row_policy_mode = RowPolicyMode::Enforcing;
@@ -1760,14 +1786,10 @@ impl QueryManager {
         let subscription_ids: Vec<_> = self.subscriptions.keys().copied().collect();
 
         for sub_id in subscription_ids {
-            let should_process_subscription =
-                self.subscriptions.get(&sub_id).is_some_and(|subscription| {
-                    subscription.needs_recompile
-                        || !subscription.settled_once
-                        || subscription.needs_visibility_recompute
-                        || subscription.has_pending_local_updates
-                        || subscription.graph.has_dirty_nodes()
-                });
+            let should_process_subscription = self
+                .subscriptions
+                .get(&sub_id)
+                .is_some_and(QuerySubscription::needs_settle);
             if !should_process_subscription {
                 continue;
             }
@@ -2028,6 +2050,14 @@ impl QueryManager {
                     &visible_rows,
                 );
                 if visible_delta.is_empty() {
+                    // The settle above already folded the pending local rows in and
+                    // nothing visible changed. Keeping the flag would re-settle and
+                    // re-authorize this subscription on every later pass, until some
+                    // unrelated change becomes visible.
+                    subscription.has_pending_local_updates = false;
+                    subscription
+                        .pending_local_row_ids
+                        .retain(|id| self.pending_local_row_batches.contains_key(id));
                     self.subscriptions.insert(sub_id, subscription);
                     continue;
                 }
@@ -2629,8 +2659,91 @@ impl QueryManager {
         }
     }
 
+    /// A subscription filtered by explicit authorization re-checks its rows against select
+    /// policies that may read other tables, and a server subscription derives its scope the
+    /// same way. A change to one of those tables changes verdicts without touching either
+    /// graph, so the graph-scoped marks never reach them. Every table change passes through
+    /// `mark_subscriptions_dirty_with_origin` or `mark_subscriptions_rows_changed` — the
+    /// batched visibility effects, the rejection retract/restore paths and the pending-overlay
+    /// track/clear — and both call this.
+    fn mark_policy_dependents_for_recompute(&mut self, table: &str) {
+        // The schema `authorization_schema_for_context` evaluates policies against.
+        let Some(auth_schema) = self
+            .authorization_schema
+            .clone()
+            .or_else(|| (!self.schema.is_empty()).then(|| self.schema.clone()))
+        else {
+            return;
+        };
+        let deps = &mut self.select_policy_deps;
+        let read_by_some_policy = self
+            .policy_read_tables
+            .get_or_insert_with(|| {
+                let mut union = std::collections::HashSet::new();
+                for policy_table in auth_schema.keys() {
+                    let table_deps = deps.entry(*policy_table).or_insert_with(|| {
+                        super::authz_cache::select_policy_dependency_tables(
+                            &auth_schema,
+                            policy_table,
+                        )
+                    });
+                    match table_deps {
+                        super::authz_cache::TableDeps::Known(read) => {
+                            union.extend(read.iter().copied())
+                        }
+                        super::authz_cache::TableDeps::Unknown => {
+                            return super::authz_cache::TableDeps::Unknown;
+                        }
+                    }
+                }
+                super::authz_cache::TableDeps::Known(union)
+            })
+            .reads(table);
+        if !read_by_some_policy {
+            return;
+        }
+        // The verdict cache is otherwise invalidated only where batched visibility effects
+        // are applied, which the rejection and pending-overlay paths never reach.
+        self.authz_verdicts.invalidate([table], std::iter::empty());
+        let mut policy_reads_table = |graph: &super::graph::QueryGraph| {
+            graph
+                .index_scan_nodes
+                .iter()
+                .map(|(_, read, _)| *read)
+                .chain(graph.array_subquery_tables.iter().map(|(_, read)| *read))
+                .chain(
+                    graph
+                        .recursive_relation_tables
+                        .iter()
+                        .map(|(_, read)| *read),
+                )
+                .chain(graph.magic_column_tables.iter().map(|(_, read)| *read))
+                .any(|read| {
+                    deps.entry(read)
+                        .or_insert_with(|| {
+                            super::authz_cache::select_policy_dependency_tables(&auth_schema, &read)
+                        })
+                        .reads(table)
+                })
+        };
+        for subscription in self.subscriptions.values_mut() {
+            if subscription.uses_explicit_authorization_filtering
+                && !subscription.needs_visibility_recompute
+                && policy_reads_table(&subscription.graph)
+            {
+                subscription.needs_visibility_recompute = true;
+            }
+        }
+        for server_sub in self.server_subscriptions.values_mut() {
+            if !server_sub.needs_reauthorization && policy_reads_table(&server_sub.graph) {
+                server_sub.needs_reauthorization = true;
+            }
+        }
+    }
+
     /// Mark subscriptions dirty for a table based on update origin.
     fn mark_subscriptions_dirty_with_origin(&mut self, table: &str, local_update: bool) {
+        self.mark_policy_dependents_for_recompute(table);
         // Mark local subscriptions dirty
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
@@ -2656,6 +2769,7 @@ impl QueryManager {
         rows: &ahash::AHashSet<ObjectId>,
         local_update: bool,
     ) {
+        self.mark_policy_dependents_for_recompute(table);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_changed_for_table(table, rows);
@@ -2709,6 +2823,8 @@ impl QueryManager {
     }
 
     pub(crate) fn mark_local_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+        // The row's own verdicts were computed for the version this change replaces.
+        self.authz_verdicts.invalidate(std::iter::empty(), [id]);
         let ids = ahash::AHashSet::from_iter([id]);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
@@ -2747,6 +2863,8 @@ impl QueryManager {
     }
 
     pub(super) fn mark_local_row_deleted_in_subscriptions(&mut self, table: &str, id: ObjectId) {
+        // The row's own verdicts were computed for the version this change replaces.
+        self.authz_verdicts.invalidate(std::iter::empty(), [id]);
         let ids = ahash::AHashSet::from_iter([id]);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
@@ -2770,6 +2888,17 @@ impl QueryManager {
             scope_exempt: self.scope_exempt_local_rows.contains_key(&id),
             awaiting_scope: self.confirmed_local_rows_awaiting_scope.contains_key(&id),
         }
+    }
+
+    /// Subscriptions the next `process()` would settle. With nothing left to do this is empty;
+    /// anything listed re-settles and re-authorizes on every pass for nothing.
+    #[cfg(test)]
+    pub(crate) fn subscriptions_awaiting_settle(&self) -> Vec<QuerySubscriptionId> {
+        self.subscriptions
+            .iter()
+            .filter(|(_, subscription)| subscription.needs_settle())
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Drop every trace of a local write from the three maps that track one.

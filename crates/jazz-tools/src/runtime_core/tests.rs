@@ -2369,6 +2369,8 @@ mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
 mod locator_ladder_heal;
+mod policy_dependency_differential;
+mod policy_dependency_rejection;
 mod query_subscription;
 mod rejected_write_retires_tracking;
 mod schema_catalogue;

@@ -82,6 +82,14 @@ impl TableDeps {
             TableDeps::Known(deps) => deps.iter().any(|dep| changed_tables.contains(dep.as_str())),
         }
     }
+
+    /// Whether a write to `table` can change a verdict that depends on these reads.
+    pub(super) fn reads(&self, table: &str) -> bool {
+        match self {
+            TableDeps::Unknown => true,
+            TableDeps::Known(deps) => deps.iter().any(|dep| dep.as_str() == table),
+        }
+    }
 }
 
 /// Extract every table `table`'s select policy reads, transitively through Inherits
@@ -320,6 +328,11 @@ impl AuthzVerdictCache {
         verdict: bool,
         auth_schema: &Schema,
     ) {
+        // Off means off: `get` serves nothing then, so rows stored here would only pile up to
+        // `MAX_CACHED_ROWS` and make every `invalidate` scan them.
+        if !cache_enabled() {
+            return;
+        }
         self.ensure_marker(marker);
         if self.rows.len() >= MAX_CACHED_ROWS {
             self.rows.clear();

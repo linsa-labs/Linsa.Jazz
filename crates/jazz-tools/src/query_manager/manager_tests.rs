@@ -1313,6 +1313,7 @@ mod policies;
 mod recursive_queries;
 mod server_subscription_withdrawal_differential;
 mod server_subscriptions;
+mod stuck_local_updates;
 mod subscription_output_oracle;
 mod subscriptions;
 mod updates;

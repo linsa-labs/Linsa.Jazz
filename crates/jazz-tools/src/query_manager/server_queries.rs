@@ -1587,6 +1587,7 @@ impl QueryManager {
                     last_emitted_settled_tier,
                     last_scope: scope.unwrap_or_default(),
                     needs_recompile: false,
+                    needs_reauthorization: false,
                     settled_once,
                     propagation: sub.propagation,
                     reported_schema_warnings,
@@ -1661,7 +1662,11 @@ impl QueryManager {
             };
             let had_dirty_graph = sub.graph.has_dirty_nodes();
 
-            if sub.settled_once && !had_dirty_graph && !sub.needs_recompile {
+            if sub.settled_once
+                && !had_dirty_graph
+                && !sub.needs_recompile
+                && !sub.needs_reauthorization
+            {
                 let settled_tier = self
                     .sync_manager
                     .max_local_durability_tier()
@@ -1779,6 +1784,7 @@ impl QueryManager {
                 }
             };
             if let Some(new_scope) = new_scope {
+                sub.needs_reauthorization = false;
                 let scope_changed = new_scope.as_ref() != &sub.last_scope;
                 if scope_changed {
                     let owned_scope = new_scope.into_owned();

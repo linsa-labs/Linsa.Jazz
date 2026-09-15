@@ -177,3 +177,126 @@ fn authz_cache_serves_hits_and_tracks_policy_dep_writes() {
     core.immediate_tick();
     assert_eq!(team_ids(&mut core, sub), vec![team2]);
 }
+
+fn owned_docs_structural_schema() -> Schema {
+    SchemaBuilder::new()
+        .table(TableSchema::builder("docs").column("owner_id", ColumnType::Text))
+        .build()
+}
+
+/// Anyone may create a doc; only its owner reads it or edits it, and an edit may hand it to
+/// anyone. No policy reads another table.
+fn owned_docs_auth_schema() -> Schema {
+    let owner = || PolicyExpr::eq_session("owner_id", vec!["user_id".into()]);
+    SchemaBuilder::new()
+        .table(
+            TableSchema::builder("docs")
+                .column("owner_id", ColumnType::Text)
+                .policies(
+                    TablePolicies::new()
+                        .with_select(owner())
+                        .with_insert(PolicyExpr::True)
+                        .with_update(Some(owner()), PolicyExpr::True),
+                ),
+        )
+        .build()
+}
+
+fn settle_link(
+    client: &mut TestCore,
+    server: &mut TestCore,
+    client_id: ClientId,
+    server_id: ServerId,
+) -> Vec<OutboxEntry> {
+    let mut server_outputs = Vec::new();
+    for _ in 0..10 {
+        client.batched_tick();
+        pump_client_messages_to_server(client, server, server_id, client_id);
+        pump_server_messages_to_clients(
+            server,
+            &mut [ClientForServer {
+                core: &mut *client,
+                server_id,
+                client_id,
+            }],
+            &mut server_outputs,
+        );
+        client.batched_tick();
+        client.immediate_tick();
+    }
+    server_outputs
+}
+
+/// The verdict cache drops a changed row's own verdicts only where batched visibility effects
+/// are applied. A rejected update is taken back through `clear_local_pending_row_overlay`, which
+/// never gets there, so the verdict computed for the pending version outlives that version.
+#[test]
+fn a_rejected_update_does_not_leave_its_pending_verdict_in_the_cache() {
+    crate::query_manager::authz_cache::set_cache_enabled_for_tests(true);
+    let runtime = |app_name: &str| {
+        let mut core = create_runtime_with_schema(owned_docs_structural_schema(), app_name);
+        core.schema_manager_mut()
+            .query_manager_mut()
+            .set_authorization_schema(owned_docs_auth_schema());
+        core
+    };
+    let mut client = runtime("rejected-update-verdict");
+    let mut server = runtime("rejected-update-verdict");
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    // The server knows this connection as mallory: creating a doc needs no owner, handing one
+    // over needs to own it. Alice's hand-over is admitted locally and rejected upstream.
+    server.add_client(client_id, Some(Session::new("mallory")));
+    client.add_server(server_id);
+    let alice = Session::new("alice");
+    let as_alice = WriteContext::from_session(alice.clone());
+
+    let sub = client
+        .schema_manager_mut()
+        .query_manager_mut()
+        .subscribe_with_session(Query::new("docs"), Some(alice), None)
+        .unwrap();
+    client.immediate_tick();
+    let ((doc, _), _) = client
+        .insert(
+            "docs",
+            HashMap::from([("owner_id".to_string(), Value::Text("alice".into()))]),
+            Some(&as_alice),
+        )
+        .unwrap();
+    let _ = settle_link(&mut client, &mut server, client_id, server_id);
+    assert_eq!(
+        team_ids(&mut client, sub),
+        vec![doc],
+        "fixture precondition: the doc is accepted and alice sees it"
+    );
+
+    client
+        .update(
+            doc,
+            vec![("owner_id".to_string(), Value::Text("bob".into()))],
+            Some(&as_alice),
+        )
+        .unwrap();
+    client.immediate_tick();
+    assert!(
+        team_ids(&mut client, sub).is_empty(),
+        "fixture precondition: handed to bob, the pending doc leaves alice's view"
+    );
+
+    let server_outputs = settle_link(&mut client, &mut server, client_id, server_id);
+    assert!(
+        server_outputs.iter().any(|entry| matches!(
+            &entry.payload,
+            SyncPayload::BatchFate { fate } if fate.is_rejected()
+        )),
+        "fixture precondition: the server must reject the hand-over, else this gates nothing"
+    );
+
+    assert_eq!(
+        team_ids(&mut client, sub),
+        vec![doc],
+        "the hand-over was rejected and the doc is alice's again, but the subscription still \
+         hides it: the verdict cached for the pending version outlived that version"
+    );
+}
