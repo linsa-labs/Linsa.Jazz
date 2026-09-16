@@ -455,9 +455,43 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         }
 
         if let Some(acked_tier) = fate.confirmed_tier() {
-            self.schema_manager
-                .query_manager_mut()
-                .mark_subscriptions_visibility_recompute_for_tier(acked_tier);
+            // A confirmation changes the visibility of ITS OWN rows, and the loop below
+            // marks exactly those — by table and object id, so a materializer that holds or
+            // tracks one re-loads it and emits what the tier was holding back
+            // (`MaterializeNode::known_tuples` keeps in-scope rows that were not yet
+            // materializable). The marking also puts the id into the pending set of every
+            // subscription on the table, and for an `Immediate` subscription the row loader
+            // reads a pending id at no tier, not at the subscription's own. It reaches rows
+            // this node never authored, because the batchId->rows index is written by the
+            // generic history-row write path.
+            //
+            // Confirming batch X can change which version of a row is visible while the
+            // row's current version belongs to a later batch. The marking in
+            // `apply_pending_batch_fate_effects` sees that case only while a local batch
+            // record survives: it unions `visible_rows_by_batch` with that record's members,
+            // and `visible_rows_by_batch` drops a row as soon as a newer version lands. For a
+            // batch this node did not author there is no such record, and then this loop is
+            // the only thing that covers it. It keeps the full-store fallback of
+            // `local_batch_rows` for the same reason: when no tracked source lists the
+            // batch's rows, `local_batch_rows_tracked_only` finds nothing to mark.
+            //
+            // A tier-wide sweep used to stand here, marking every subscription whose
+            // durability tier was at or below the confirmed one, unrelated to the batch's
+            // contents. It set no dirty node, so the row loader never ran and it could not
+            // re-materialize a row the tier had been holding back: it only re-ran the
+            // post-settle filters — the per-row authorization filter above all — over
+            // unchanged graph output. With the app's subscriptions all carrying
+            // a session and a tier, every confirmation therefore re-authorized every row of
+            // every open subscription. Measured on the Linsa app 2026-09-16 with
+            // `JAZZ_POLICY_COUNTERS=1`: one keystroke's draft write cost a pass over ~1054
+            // rows, 5067 `row_access_eval` policy evaluations per second against 105/s idle
+            // — and one scope authz check each, the verdict cache being off by default.
+            //
+            // The sweep's forced settle had one effect that mattered: it ended in the
+            // retain that drops pending ids no local batch backs, and so retired the ids
+            // this loop leaves in subscriptions that do not hold the row. That retain now
+            // runs in the settle loop of `QueryManager::process` for the subscriptions it
+            // skips, wherever such an id may have appeared.
             for (member, row_locator, _) in
                 self.local_batch_rows(batch_id, LocalBatchLookup::ConfirmedFate)
             {

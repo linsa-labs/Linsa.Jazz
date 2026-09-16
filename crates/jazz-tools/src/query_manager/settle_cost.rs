@@ -112,6 +112,11 @@ pub static INDEX_READS: AtomicU64 = AtomicU64::new(0);
 /// denominator for everything above: the useful output the pass produced.
 pub static ROWS_EMITTED: AtomicU64 = AtomicU64::new(0);
 
+/// Pending local row ids a settle pass looked up while dropping the ones no local batch
+/// backs any more, in subscriptions it did not settle. Those subscriptions did no other
+/// work in the pass, so this is what an idle subscription costs.
+pub static PENDING_ID_RETAIN_SCANS: AtomicU64 = AtomicU64::new(0);
+
 /// Cached subgraph instances currently held by every `ArraySubqueryNode` in the
 /// process — a GAUGE, not a counter: it goes down as well as up, and a settle
 /// pass reports its VALUE, never a delta (see [`SettleCounts::since`]).
@@ -327,6 +332,7 @@ pub struct SettleCounts {
     pub row_loads: u64,
     pub index_reads: u64,
     pub rows_emitted: u64,
+    pub pending_id_retain_scans: u64,
     pub locator_ladder_recoveries: u64,
     pub history_scans: u64,
     pub history_entries: u64,
@@ -364,6 +370,7 @@ impl SettleCounts {
             row_loads: ROW_LOADS.load(Ordering::Relaxed),
             index_reads: INDEX_READS.load(Ordering::Relaxed),
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
+            pending_id_retain_scans: PENDING_ID_RETAIN_SCANS.load(Ordering::Relaxed),
             locator_ladder_recoveries: LOCATOR_LADDER_RECOVERIES.load(Ordering::Relaxed),
             history_scans: HISTORY_SCANS.load(Ordering::Relaxed),
             history_entries: HISTORY_ENTRIES.load(Ordering::Relaxed),
@@ -405,6 +412,9 @@ impl SettleCounts {
             row_loads: self.row_loads.saturating_sub(base.row_loads),
             index_reads: self.index_reads.saturating_sub(base.index_reads),
             rows_emitted: self.rows_emitted.saturating_sub(base.rows_emitted),
+            pending_id_retain_scans: self
+                .pending_id_retain_scans
+                .saturating_sub(base.pending_id_retain_scans),
             locator_ladder_recoveries: self
                 .locator_ladder_recoveries
                 .saturating_sub(base.locator_ladder_recoveries),
@@ -513,6 +523,7 @@ impl Drop for SettlePass {
             storage_write_micros = cost.storage_write_micros,
             storage_write_bytes = cost.storage_write_bytes,
             pending_local_row_batches = cost.pending_local_row_batches,
+            pending_id_retain_scans = cost.pending_id_retain_scans,
             undelivered_payloads = cost.undelivered_payloads,
             undelivered_clients = cost.undelivered_clients,
             live_instances = cost.live_instances,

@@ -183,6 +183,7 @@ impl QueryManager {
                 local_updates,
                 has_pending_local_updates: false,
                 pending_local_row_ids: HashSet::new(),
+                pending_local_row_ids_may_be_unbacked: false,
                 local_overlay_rows,
                 query_frontier_settled_tier,
                 current_ordered_ids: Vec::new(),
@@ -297,6 +298,7 @@ impl QueryManager {
             subscription.sync_backed = true;
             if !overlay_row_ids.is_empty() {
                 subscription.pending_local_row_ids.extend(overlay_row_ids);
+                subscription.pending_local_row_ids_may_be_unbacked = true;
                 subscription.has_pending_local_updates = true;
             } else if subscription.local_updates == LocalUpdates::Immediate
                 && !self.pending_local_row_batches.is_empty()

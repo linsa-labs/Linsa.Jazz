@@ -261,6 +261,10 @@ pub(crate) struct QuerySubscription {
     /// Row ids that should use the local current version as an overlay while
     /// waiting for a stricter settled tier.
     pub(crate) pending_local_row_ids: HashSet<ObjectId>,
+    /// False only while every id in `pending_local_row_ids` is backed by
+    /// `QueryManager::pending_local_row_batches`. Set wherever an id enters the set
+    /// unbacked or loses its backing, cleared by the retain that drops unbacked ids.
+    pub(crate) pending_local_row_ids_may_be_unbacked: bool,
     /// Optional one-shot overlay keyed by row id for a specific local batch.
     /// When present, reads must not fall back to unrelated pending local rows.
     pub(crate) local_overlay_rows: HashMap<ObjectId, RowBatchKey>,
@@ -283,7 +287,22 @@ pub(crate) struct QuerySubscription {
     pub(crate) reported_schema_warnings: HashSet<SchemaWarningKey>,
 }
 
+/// See `QueryManager::pending_local_row_id_census`.
+#[cfg(any(test, feature = "test"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PendingLocalRowIdCensus {
+    pub total_ids: usize,
+    pub unflagged_with_unbacked: usize,
+}
+
 impl QuerySubscription {
+    /// Drop the pending ids no local batch backs any more.
+    fn retain_backed_pending_local_row_ids(&mut self, backed: &HashMap<ObjectId, RowBatchKey>) {
+        self.pending_local_row_ids
+            .retain(|id| backed.contains_key(id));
+        self.pending_local_row_ids_may_be_unbacked = false;
+    }
+
     /// Whether the next `process()` settles this subscription.
     fn needs_settle(&self) -> bool {
         self.needs_recompile
@@ -659,6 +678,10 @@ pub struct QueryManager {
     /// after I was parked" from "one arrived in the same pass".
     pub(super) settle_pass: u64,
 
+    /// True while `process` settles subscriptions one at a time, each out of `subscriptions`
+    /// for its turn. See `retire_local_row_tracking`.
+    in_settle_loop: bool,
+
     /// Per query, the pass in which it last received a settle FROM A SERVER at or above
     /// its own required tier. This is the authority a parked exemption is measured
     /// against — see `record_authoritative_snapshot` for why it cannot be one global
@@ -802,6 +825,7 @@ impl QueryManager {
             scope_exempt_local_rows: HashMap::new(),
             confirmed_local_rows_awaiting_scope: HashMap::new(),
             settle_pass: 0,
+            in_settle_loop: false,
             authoritative_snapshot_pass: HashMap::new(),
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
@@ -1532,14 +1556,22 @@ impl QueryManager {
             .iter()
             .filter_map(BatchFate::confirmed_tier)
             .max();
-        if let Some(confirmed_tier) = max_confirmed_tier {
-            self.mark_subscriptions_visibility_recompute_for_tier(confirmed_tier);
-        }
+        // No tier-wide marking here: a confirmed tier says nothing about which rows a
+        // subscription shows. Marking every subscription at or below it set no dirty node,
+        // so the row loader never ran and it could not re-materialize a row the tier had
+        // been holding back — it only re-ran the post-settle filters, the per-row
+        // authorization filter above all, over unchanged graph output. The per-batch and
+        // per-row marking below cover the rows these fates are actually about, and
+        // `max_confirmed_tier` still feeds the trace at the end of this function.
 
         // Phase one of releasing the scope exemption: a write that has reached the
         // settlement target no longer needs to be shielded from the server's answer on its
         // own merits. It is only PARKED here, not dropped — see the drain in `process`,
         // which retires it once a fresh scope snapshot has actually arrived.
+        // Parking alone does not change what `filter_synced_query_scope_tuples` answers:
+        // a parked row stays exempt until a scope snapshot recorded in a later pass, and
+        // `record_authoritative_snapshot` asks the subscription that snapshot is for to
+        // recompute its visibility. So parking needs no marking of its own.
         let settlement_target = self.sync_manager.settlement_target();
         for fate in &batch_fates {
             if fate
@@ -1614,20 +1646,6 @@ impl QueryManager {
         );
     }
 
-    pub(crate) fn mark_subscriptions_visibility_recompute_for_tier(
-        &mut self,
-        confirmed_tier: DurabilityTier,
-    ) {
-        for subscription in self.subscriptions.values_mut() {
-            if subscription
-                .durability_tier
-                .is_some_and(|required_tier| confirmed_tier >= required_tier)
-            {
-                subscription.needs_visibility_recompute = true;
-            }
-        }
-    }
-
     /// Remove a client and all its server-side state (subscriptions, in-flight policy checks).
     ///
     /// Returns `false` if the client has unprocessed inbox entries.
@@ -1666,6 +1684,9 @@ impl QueryManager {
         // ran longer than `JAZZ_SETTLE_LOG_MS`.
         let _settle_cost = super::settle_cost::SettlePass::begin();
         self.settle_pass = self.settle_pass.wrapping_add(1);
+        // A panic inside the settle loop that a binding catches and survives leaves this set
+        // until here, and a retire before then trips the debug assertion.
+        self.in_settle_loop = false;
 
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
@@ -1785,12 +1806,33 @@ impl QueryManager {
         let storage_ref: &dyn Storage = storage;
         let subscription_ids: Vec<_> = self.subscriptions.keys().copied().collect();
 
+        self.in_settle_loop = true;
         for sub_id in subscription_ids {
-            let should_process_subscription = self
-                .subscriptions
-                .get(&sub_id)
-                .is_some_and(QuerySubscription::needs_settle);
-            if !should_process_subscription {
+            let Some(subscription) = self.subscriptions.get_mut(&sub_id) else {
+                continue;
+            };
+            if !subscription.needs_settle() {
+                // For an `Immediate` subscription the row loader reads a pending id at no
+                // tier. A confirmation puts its rows' ids into every subscription on the
+                // table and dirties only those whose graph tracks the row, and a subscription
+                // can also hold an id whose local batch has since been retired. The delivery
+                // paths of a settle drop such ids, but only after they load, so a
+                // subscription that settles in the pass where one appears still loads it. A
+                // subscription that does not settle now would keep one, and if the row later
+                // entered its filter through a version held below the subscription's tier,
+                // the loader would serve that version. Drop them from the subscriptions a
+                // pass skips, and only where one may have appeared: a set can hold every row
+                // this node still tracks as its own write, of every table for a subscription
+                // opened after those writes, and a retain on every skip would look them all
+                // up on every pass.
+                if subscription.pending_local_row_ids_may_be_unbacked {
+                    super::settle_cost::add(
+                        &super::settle_cost::PENDING_ID_RETAIN_SCANS,
+                        subscription.pending_local_row_ids.len() as u64,
+                    );
+                    subscription
+                        .retain_backed_pending_local_row_ids(&self.pending_local_row_batches);
+                }
                 continue;
             }
 
@@ -2033,9 +2075,7 @@ impl QueryManager {
                     descriptor: subscription.graph.combined_descriptor.clone(),
                 });
                 subscription.has_pending_local_updates = false;
-                subscription
-                    .pending_local_row_ids
-                    .retain(|id| self.pending_local_row_batches.contains_key(id));
+                subscription.retain_backed_pending_local_row_ids(&self.pending_local_row_batches);
             } else {
                 let visible_rows =
                     Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
@@ -2056,8 +2096,7 @@ impl QueryManager {
                     // unrelated change becomes visible.
                     subscription.has_pending_local_updates = false;
                     subscription
-                        .pending_local_row_ids
-                        .retain(|id| self.pending_local_row_batches.contains_key(id));
+                        .retain_backed_pending_local_row_ids(&self.pending_local_row_batches);
                     self.subscriptions.insert(sub_id, subscription);
                     continue;
                 }
@@ -2085,13 +2124,12 @@ impl QueryManager {
                     descriptor: subscription.graph.combined_descriptor.clone(),
                 });
                 subscription.has_pending_local_updates = false;
-                subscription
-                    .pending_local_row_ids
-                    .retain(|id| self.pending_local_row_batches.contains_key(id));
+                subscription.retain_backed_pending_local_row_ids(&self.pending_local_row_batches);
             }
 
             self.subscriptions.insert(sub_id, subscription);
         }
+        self.in_settle_loop = false;
 
         // Note: With sync storage, object loading is immediate. No need to request
         // async loads - objects are available when we query for them.
@@ -2799,12 +2837,18 @@ impl QueryManager {
         self.mark_subscriptions_dirty_with_origin(table, true);
     }
 
+    fn any_unbacked(&self, ids: &ahash::AHashSet<ObjectId>) -> bool {
+        ids.iter()
+            .any(|id| !self.pending_local_row_batches.contains_key(id))
+    }
+
     fn mark_rows_updated_in_subscriptions(
         &mut self,
         table: &str,
         ids: &ahash::AHashSet<ObjectId>,
         local_overlay: bool,
     ) {
+        let unbacked = local_overlay && self.any_unbacked(ids);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_updated(table, ids);
@@ -2812,6 +2856,7 @@ impl QueryManager {
                     subscription
                         .pending_local_row_ids
                         .extend(ids.iter().copied());
+                    subscription.pending_local_row_ids_may_be_unbacked |= unbacked;
                 }
             }
         }
@@ -2826,10 +2871,12 @@ impl QueryManager {
         // The row's own verdicts were computed for the version this change replaces.
         self.authz_verdicts.invalidate(std::iter::empty(), [id]);
         let ids = ahash::AHashSet::from_iter([id]);
+        let unbacked = !self.pending_local_row_batches.contains_key(&id);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_updated(table, &ids);
                 subscription.pending_local_row_ids.insert(id);
+                subscription.pending_local_row_ids_may_be_unbacked |= unbacked;
             }
         }
         for server_sub in self.server_subscriptions.values_mut() {
@@ -2845,6 +2892,7 @@ impl QueryManager {
         ids: &ahash::AHashSet<ObjectId>,
         local_overlay: bool,
     ) {
+        let unbacked = local_overlay && self.any_unbacked(ids);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_deleted(table, ids);
@@ -2852,6 +2900,7 @@ impl QueryManager {
                     subscription
                         .pending_local_row_ids
                         .extend(ids.iter().copied());
+                    subscription.pending_local_row_ids_may_be_unbacked |= unbacked;
                 }
             }
         }
@@ -2866,10 +2915,12 @@ impl QueryManager {
         // The row's own verdicts were computed for the version this change replaces.
         self.authz_verdicts.invalidate(std::iter::empty(), [id]);
         let ids = ahash::AHashSet::from_iter([id]);
+        let unbacked = !self.pending_local_row_batches.contains_key(&id);
         for subscription in self.subscriptions.values_mut() {
             if Self::subscription_involves_table(&subscription.graph, table) {
                 subscription.graph.mark_rows_deleted(table, &ids);
                 subscription.pending_local_row_ids.insert(id);
+                subscription.pending_local_row_ids_may_be_unbacked |= unbacked;
             }
         }
         for server_sub in self.server_subscriptions.values_mut() {
@@ -2888,6 +2939,34 @@ impl QueryManager {
             scope_exempt: self.scope_exempt_local_rows.contains_key(&id),
             awaiting_scope: self.confirmed_local_rows_awaiting_scope.contains_key(&id),
         }
+    }
+
+    /// For gates: how many pending local row ids live subscriptions hold, and how many
+    /// subscriptions hold an id no local batch backs while not flagged for the retain that
+    /// drops it. That last number must always be zero.
+    #[cfg(any(test, feature = "test"))]
+    pub fn pending_local_row_id_census(&self) -> PendingLocalRowIdCensus {
+        let mut census = PendingLocalRowIdCensus::default();
+        for subscription in self.subscriptions.values() {
+            census.total_ids += subscription.pending_local_row_ids.len();
+            census.unflagged_with_unbacked += usize::from(
+                !subscription.pending_local_row_ids_may_be_unbacked
+                    && subscription
+                        .pending_local_row_ids
+                        .iter()
+                        .any(|id| !self.pending_local_row_batches.contains_key(id)),
+            );
+        }
+        census
+    }
+
+    /// For gates: how many live subscriptions hold `id` as a pending local row id.
+    #[cfg(any(test, feature = "test"))]
+    pub fn pending_local_row_id_holders(&self, id: ObjectId) -> usize {
+        self.subscriptions
+            .values()
+            .filter(|subscription| subscription.pending_local_row_ids.contains(&id))
+            .count()
     }
 
     /// Subscriptions the next `process()` would settle. With nothing left to do this is empty;
@@ -2909,8 +2988,23 @@ impl QueryManager {
     /// exemption out of `pending_local_row_batches` and forgetting one removal site is
     /// exactly how a stale exemption outlives the write it stood for, which is the defect
     /// this family was split to fix. Route every removal through here.
+    ///
+    /// Must not run inside the settle loop in `process`: a subscription being settled is
+    /// out of `self.subscriptions` there and would miss the flag set below. Debug builds
+    /// assert it.
     pub(super) fn retire_local_row_tracking(&mut self, id: ObjectId) {
-        self.pending_local_row_batches.remove(&id);
+        debug_assert!(
+            !self.in_settle_loop,
+            "retiring a local row's tracking inside the settle loop misses the subscription \
+             being settled"
+        );
+        if self.pending_local_row_batches.remove(&id).is_some() {
+            for subscription in self.subscriptions.values_mut() {
+                if subscription.pending_local_row_ids.contains(&id) {
+                    subscription.pending_local_row_ids_may_be_unbacked = true;
+                }
+            }
+        }
         self.scope_exempt_local_rows.remove(&id);
         self.confirmed_local_rows_awaiting_scope.remove(&id);
     }
