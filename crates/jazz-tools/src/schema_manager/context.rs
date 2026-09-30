@@ -75,6 +75,8 @@ pub enum SchemaError {
         expected: Option<ObjectId>,
         current: Option<ObjectId>,
     },
+    /// Published declared indexes do not fit the schema they are published for.
+    InvalidIndexDeclarations(String),
 }
 
 impl std::fmt::Display for SchemaError {
@@ -113,6 +115,9 @@ impl std::fmt::Display for SchemaError {
                     "stale permissions parent: expected {:?}, current {:?}",
                     expected, current
                 )
+            }
+            SchemaError::InvalidIndexDeclarations(message) => {
+                write!(f, "invalid index declarations: {message}")
             }
         }
     }

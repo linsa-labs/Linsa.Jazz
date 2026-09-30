@@ -14,6 +14,7 @@ use crate::sync_manager::{
 };
 
 use super::authz_cache::{AuthzMarker, AuthzSessionKey};
+use super::graph::IncludePlacement;
 use super::manager::{QueryManager, SchemaWarningAccumulator, ServerQuerySubscription};
 use super::policy::{ComplexClause, Operation, PolicyExpr};
 use super::policy_graph::{PolicyGraph, PolicyGraphBuildOptions};
@@ -1004,15 +1005,208 @@ impl QueryManager {
         }
     }
 
+    /// Recompiles a server subscription whose scope took a page row past the rows its
+    /// includes were built for, now with includes for every matching row, settles it and
+    /// returns its scope. The subscription keeps that placement from then on.
+    fn rebuild_with_includes_for_matching_rows(
+        &mut self,
+        storage: &dyn Storage,
+        client_id: ClientId,
+        query_id: crate::sync_manager::QueryId,
+        sub: &mut ServerQuerySubscription,
+        schema_warnings: &mut SchemaWarningAccumulator,
+    ) -> Option<HashSet<(ObjectId, BranchName)>> {
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::INCLUDE_REBUILDS,
+        );
+        sub.includes_past_page = true;
+        let compiled = self.compile_server_subscription_graph(
+            client_id,
+            &sub.query,
+            sub.session.clone(),
+            true,
+        );
+        let Ok((graph, schema_context, branches)) = compiled else {
+            // The stale recompile retries it, and drops the subscription if it fails.
+            sub.needs_recompile = true;
+            return None;
+        };
+        sub.graph = graph;
+        sub.schema_context = schema_context;
+        sub.branches = branches;
+
+        let branch_schema_map = Self::branch_schema_map_for_context(&sub.schema_context);
+        Self::settle_server_graph(
+            &self.row_bytes_dedup,
+            &mut sub.graph,
+            storage,
+            &sub.branches,
+            sub.query.include_deleted,
+            &sub.schema_context,
+            &branch_schema_map,
+            sub.query.table.as_str(),
+            query_id,
+            schema_warnings,
+        );
+        let mut includes_past_page = false;
+        let (branches, schema_context) = (&sub.branches, &sub.schema_context);
+        let (include_deleted, table) = (sub.query.include_deleted, sub.query.table.as_str());
+        self.authorized_scope_from_graph_if_available(
+            storage,
+            &mut SettlementEvalCache::default(),
+            &mut sub.graph,
+            &mut |row_bytes_dedup, graph| {
+                Self::settle_server_graph(
+                    row_bytes_dedup,
+                    graph,
+                    storage,
+                    branches,
+                    include_deleted,
+                    schema_context,
+                    &branch_schema_map,
+                    table,
+                    query_id,
+                    schema_warnings,
+                )
+            },
+            schema_context,
+            &branch_schema_map,
+            sub.session.as_ref(),
+            &mut includes_past_page,
+        )
+    }
+
+    /// Settles a server subscription's graph, loading rows the way the subscription reads
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_server_graph(
+        row_bytes_dedup: &std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
+        graph: &mut super::graph::QueryGraph,
+        storage: &dyn Storage,
+        branches: &[String],
+        include_deleted: bool,
+        schema_context: &crate::schema_manager::SchemaContext,
+        branch_schema_map: &HashMap<String, SchemaHash>,
+        table: &str,
+        query_id: crate::sync_manager::QueryId,
+        schema_warnings: &mut SchemaWarningAccumulator,
+    ) {
+        let row_loader = |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
+            Self::load_visible_row_for_query(
+                storage,
+                id,
+                table_hint.as_ref().map(TableName::as_str),
+                branches,
+                None,
+                None,
+                false,
+                false,
+                include_deleted,
+                schema_context,
+                branch_schema_map,
+                table,
+                super::graph_nodes::output::QuerySubscriptionId(query_id.0),
+                schema_warnings,
+                row_bytes_dedup,
+            )
+        };
+        let delta = graph.settle(storage, row_loader);
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::ROWS_EMITTED,
+            (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
+        );
+    }
+
+    /// Which rows of a server subscription's paginated query need their includes.
+    ///
+    /// The sync scope takes the first `offset + limit` rows the session may read
+    /// (`filtered_sync_scope_tuples`), judged against the authorization schema. When
+    /// that schema can deny a root row the graph kept — the graph is compiled without
+    /// the policy filter whenever the authorization schema differs from the one the
+    /// query compiles against — the prefix runs past the page, and the rows past it
+    /// need their includes too. Only when no root row can be denied is the page the
+    /// whole scope, and its includes can be built for the page alone.
+    ///
+    /// This is a prediction from the policies: a root row can still be denied for a
+    /// reason no policy shows (it fails to load, or has no lens into the authorization
+    /// schema). The scope walk catches that case and the subscription is rebuilt with
+    /// `IncludePlacement::MatchingRows` (`ServerQuerySubscription::includes_past_page`).
+    pub(super) fn include_placement_for_server_scope(
+        &mut self,
+        query: &crate::query_manager::query::Query,
+        schema_context: &crate::schema_manager::SchemaContext,
+        session: Option<&Session>,
+        bypasses_authorization: bool,
+    ) -> IncludePlacement {
+        #[cfg(test)]
+        if let Some(placement) = self.include_placement_override {
+            return placement;
+        }
+        // Its scope is the graph's own prefix, whatever the policies say.
+        if bypasses_authorization {
+            return IncludePlacement::PageRows;
+        }
+
+        // A deleted row the query keeps does not load as visible, so the scope denies it.
+        if query.include_deleted {
+            return IncludePlacement::MatchingRows;
+        }
+
+        let Some((auth_schema, _)) =
+            self.authorization_schema_for_context(&schema_context.env, &schema_context.user_branch)
+        else {
+            return IncludePlacement::PageRows;
+        };
+        let permissive = !self.row_policy_mode.denies_missing_explicit_policy();
+        if permissive
+            && auth_schema
+                .values()
+                .all(|table_schema| table_schema.policies.select.using.is_none())
+        {
+            return IncludePlacement::PageRows;
+        }
+        // Mirrors the verdict of `evaluate_provenance_row_select_policy` for a root row.
+        let root_rows_readable = match auth_schema
+            .get(&query.table)
+            .map(|table_schema| table_schema.policies.select_policy())
+        {
+            Some(Some(PolicyExpr::True)) => session.is_some(),
+            Some(Some(_)) => false,
+            Some(None) => permissive,
+            None => false,
+        };
+        if root_rows_readable {
+            IncludePlacement::PageRows
+        } else {
+            IncludePlacement::MatchingRows
+        }
+    }
+
+    /// The sync scope of a settled server graph: the rows `session` may read.
+    ///
+    /// A page read through ordered windows (`IndexScanNode::new_window`) walks each window
+    /// only as far as the page needs, and the graph grows them against its own last row.
+    /// The graph carries no policy filter, though, so rows the session may not read can
+    /// fill the window and leave the readable page short. The walk then grows the windows
+    /// short of the last readable row (all of them, when the readable rows ran out) and
+    /// settles the graph again through `resettle`, until the page fills or every window is
+    /// exhausted.
+    #[allow(clippy::too_many_arguments)]
     fn authorized_scope_from_graph_if_available(
         &mut self,
         storage: &dyn Storage,
         settlement_eval_cache: &mut SettlementEvalCache,
-        graph: &super::graph::QueryGraph,
+        graph: &mut super::graph::QueryGraph,
+        resettle: &mut dyn FnMut(
+            &std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
+            &mut super::graph::QueryGraph,
+        ),
         schema_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         session: Option<&Session>,
+        includes_past_page: &mut bool,
     ) -> Option<HashSet<(ObjectId, BranchName)>> {
+        *includes_past_page = false;
         let Some((auth_schema, auth_context)) =
             self.authorization_schema_for_context(&schema_context.env, &schema_context.user_branch)
         else {
@@ -1037,30 +1231,42 @@ impl QueryManager {
         // when its IDENTITY rows (outer row and join legs) are readable — a
         // denied nested include row leaves only itself out of the synced
         // scope, not the ancestors carrying it.
-        let authorized_scope_tuples = graph.filtered_sync_scope_tuples(|tuple| {
-            let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
-            for (object_id, branch_name) in tuple.provenance().iter().copied() {
-                let verdict = *authorization_cache
-                    .entry((object_id, branch_name))
-                    .or_insert_with(|| {
-                        self.provenance_row_matches_current_select_policy(
-                            storage,
-                            settlement_eval_cache,
-                            object_id,
-                            branch_name,
-                            session,
-                            &auth_schema,
-                            &auth_context,
-                            source_branch_schema_map,
-                            &universe,
-                        )
-                    });
-                if verdict {
-                    allowed_ids.insert(object_id);
+        let mut growths = 0;
+        let (authorized_scope_tuples, past_page) = loop {
+            let (tuples, past_page, filled_at) = graph.filtered_sync_scope_tuples(|tuple| {
+                let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
+                for (object_id, branch_name) in tuple.provenance().iter().copied() {
+                    let verdict = *authorization_cache
+                        .entry((object_id, branch_name))
+                        .or_insert_with(|| {
+                            self.provenance_row_matches_current_select_policy(
+                                storage,
+                                settlement_eval_cache,
+                                object_id,
+                                branch_name,
+                                session,
+                                &auth_schema,
+                                &auth_context,
+                                source_branch_schema_map,
+                                &universe,
+                            )
+                        });
+                    if verdict {
+                        allowed_ids.insert(object_id);
+                    }
                 }
+                !tuple.is_empty() && tuple.id_iter().all(|id| allowed_ids.contains(&id))
+            });
+            if growths < super::graph::execute::MAX_WINDOW_GROWTHS
+                && graph.grow_windows_short_of(filled_at)
+            {
+                growths += 1;
+                resettle(&self.row_bytes_dedup, graph);
+                continue;
             }
-            !tuple.is_empty() && tuple.id_iter().all(|id| allowed_ids.contains(&id))
-        });
+            break (tuples, past_page);
+        };
+        *includes_past_page = past_page;
 
         Some(
             authorized_scope_tuples
@@ -1160,7 +1366,7 @@ impl QueryManager {
         })
     }
 
-    fn client_bypasses_authorization_filtering(
+    pub(super) fn client_bypasses_authorization_filtering(
         &self,
         client_id: ClientId,
         session: Option<&Session>,
@@ -1368,12 +1574,24 @@ impl QueryManager {
             } else {
                 self.row_policy_mode
             };
+            let bypasses_authorization = self.client_bypasses_authorization_filtering(
+                sub.client_id,
+                session_for_policy.as_ref(),
+            );
+            let include_placement = self.include_placement_for_server_scope(
+                &query_for_compile,
+                &subscription_context,
+                session_for_policy.as_ref(),
+                bypasses_authorization,
+            );
             let graph = Self::compile_graph(
                 &query_for_compile,
                 &schema_for_compile,
                 session_for_policy.clone(),
                 &subscription_context,
                 compile_row_policy_mode,
+                include_placement,
+                &self.index_declarations,
             );
 
             let Ok(mut graph) = graph else {
@@ -1414,35 +1632,18 @@ impl QueryManager {
             crate::query_manager::settle_cost::bump(
                 &crate::query_manager::settle_cost::SUBSCRIPTIONS_SETTLED,
             );
-            {
-                let row_bytes_dedup = &self.row_bytes_dedup;
-                let row_loader =
-                    |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
-                        Self::load_visible_row_for_query(
-                            storage_ref,
-                            id,
-                            table_hint.as_ref().map(TableName::as_str),
-                            &branches,
-                            None,
-                            None,
-                            false,
-                            false,
-                            include_deleted,
-                            &subscription_context,
-                            &branch_schema_map,
-                            &table,
-                            super::graph_nodes::output::QuerySubscriptionId(sub.query_id.0),
-                            &mut schema_warnings,
-                            row_bytes_dedup,
-                        )
-                    };
-
-                let delta = graph.settle(storage_ref, row_loader);
-                crate::query_manager::settle_cost::add(
-                    &crate::query_manager::settle_cost::ROWS_EMITTED,
-                    (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
-                );
-            }
+            Self::settle_server_graph(
+                &self.row_bytes_dedup,
+                &mut graph,
+                storage_ref,
+                &branches,
+                include_deleted,
+                &subscription_context,
+                &branch_schema_map,
+                &table,
+                sub.query_id,
+                &mut schema_warnings,
+            );
             let mut reported_schema_warnings = HashSet::new();
             let new_schema_warnings = Self::finalize_schema_warnings(
                 &mut reported_schema_warnings,
@@ -1458,9 +1659,8 @@ impl QueryManager {
             // locally, including any ordered prefix required by pagination.
             let policy_context_tables =
                 Self::merged_policy_context_tables(&graph, &sub.policy_context_tables);
-            let scope = if self
-                .client_bypasses_authorization_filtering(sub.client_id, session_for_policy.as_ref())
-            {
+            let mut includes_past_page = false;
+            let scope = if bypasses_authorization {
                 let result_scope = graph.sync_scope_object_ids();
                 Some(if !policy_context_tables.is_empty() {
                     Self::scope_with_policy_context_rows_for_tables(
@@ -1474,14 +1674,112 @@ impl QueryManager {
                 })
             } else {
                 let mut settlement_eval_cache = SettlementEvalCache::default();
-                self.authorized_scope_from_graph_if_available(
+                let mut past_page = false;
+                let scope = self.authorized_scope_from_graph_if_available(
                     storage_ref,
                     &mut settlement_eval_cache,
-                    &graph,
+                    &mut graph,
+                    &mut |row_bytes_dedup, graph| {
+                        Self::settle_server_graph(
+                            row_bytes_dedup,
+                            graph,
+                            storage_ref,
+                            &branches,
+                            include_deleted,
+                            &subscription_context,
+                            &branch_schema_map,
+                            &table,
+                            sub.query_id,
+                            &mut schema_warnings,
+                        )
+                    },
                     &subscription_context,
                     &branch_schema_map,
                     session_for_policy.as_ref(),
-                )
+                    &mut past_page,
+                );
+                // A row of the page lies past the rows whose includes were built: build
+                // them for every matching row instead, before any of this scope goes out.
+                if past_page {
+                    crate::query_manager::settle_cost::bump(
+                        &crate::query_manager::settle_cost::INCLUDE_REBUILDS,
+                    );
+                    let rebuilt = Self::compile_graph(
+                        &query_for_compile,
+                        &schema_for_compile,
+                        session_for_policy.clone(),
+                        &subscription_context,
+                        compile_row_policy_mode,
+                        IncludePlacement::MatchingRows,
+                        &self.index_declarations,
+                    );
+                    let Ok(rebuilt) = rebuilt else {
+                        let reason = format!(
+                            "query compilation failed for query_id {}: {}",
+                            sub.query_id.0,
+                            rebuilt
+                                .err()
+                                .map(|err| err.to_string())
+                                .unwrap_or_else(|| "unknown compile error".to_string()),
+                        );
+                        self.sync_manager.emit_query_subscription_rejected(
+                            sub.client_id,
+                            sub.query_id,
+                            "query_compilation_failed",
+                            reason,
+                        );
+                        continue;
+                    };
+                    includes_past_page = true;
+                    graph = rebuilt;
+                    let mut rebuild_warnings = SchemaWarningAccumulator::default();
+                    Self::settle_server_graph(
+                        &self.row_bytes_dedup,
+                        &mut graph,
+                        storage_ref,
+                        &branches,
+                        include_deleted,
+                        &subscription_context,
+                        &branch_schema_map,
+                        &table,
+                        sub.query_id,
+                        &mut rebuild_warnings,
+                    );
+                    let new_schema_warnings = Self::finalize_schema_warnings(
+                        &mut reported_schema_warnings,
+                        rebuild_warnings.warnings_for_query(sub.query_id),
+                    );
+                    schema_warning_notifications.extend(
+                        new_schema_warnings
+                            .into_iter()
+                            .map(|warning| (sub.client_id, warning)),
+                    );
+                    self.authorized_scope_from_graph_if_available(
+                        storage_ref,
+                        &mut settlement_eval_cache,
+                        &mut graph,
+                        &mut |row_bytes_dedup, graph| {
+                            Self::settle_server_graph(
+                                row_bytes_dedup,
+                                graph,
+                                storage_ref,
+                                &branches,
+                                include_deleted,
+                                &subscription_context,
+                                &branch_schema_map,
+                                &table,
+                                sub.query_id,
+                                &mut rebuild_warnings,
+                            )
+                        },
+                        &subscription_context,
+                        &branch_schema_map,
+                        session_for_policy.as_ref(),
+                        &mut past_page,
+                    )
+                } else {
+                    scope
+                }
             };
             let settled_once = scope.is_some();
             let mut sent_below_required_settled = existing_subscription_state
@@ -1591,6 +1889,7 @@ impl QueryManager {
                     settled_once,
                     propagation: sub.propagation,
                     reported_schema_warnings,
+                    includes_past_page,
                 },
             );
 
@@ -1713,44 +2012,19 @@ impl QueryManager {
             );
 
             // Row loader for this subscription
+            let mut includes_past_page = false;
             let new_scope: Option<Cow<'_, HashSet<(ObjectId, BranchName)>>> = {
-                {
-                    let row_bytes_dedup = &self.row_bytes_dedup;
-                    let row_loader =
-                        |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
-                            Self::load_visible_row_for_query(
-                                storage,
-                                id,
-                                table_hint.as_ref().map(TableName::as_str),
-                                branches,
-                                None,
-                                None,
-                                false,
-                                false,
-                                include_deleted,
-                                &sub.schema_context,
-                                &branch_schema_map,
-                                &table,
-                                super::graph_nodes::output::QuerySubscriptionId(query_id.0),
-                                &mut schema_warnings,
-                                row_bytes_dedup,
-                            )
-                        };
-
-                    let delta = sub.graph.settle(storage, row_loader);
-                    crate::query_manager::settle_cost::add(
-                        &crate::query_manager::settle_cost::ROWS_EMITTED,
-                        (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
-                    );
-                }
-                let new_schema_warnings = Self::finalize_schema_warnings(
-                    &mut sub.reported_schema_warnings,
-                    schema_warnings.warnings_for_query(query_id),
-                );
-                schema_warning_notifications.extend(
-                    new_schema_warnings
-                        .into_iter()
-                        .map(|warning| (client_id, warning)),
+                Self::settle_server_graph(
+                    &self.row_bytes_dedup,
+                    &mut sub.graph,
+                    storage,
+                    branches,
+                    include_deleted,
+                    &sub.schema_context,
+                    &branch_schema_map,
+                    &table,
+                    query_id,
+                    &mut schema_warnings,
                 );
 
                 // Check if scope changed
@@ -1775,14 +2049,61 @@ impl QueryManager {
                     self.authorized_scope_from_graph_if_available(
                         storage,
                         &mut settlement_eval_cache,
-                        &sub.graph,
+                        &mut sub.graph,
+                        &mut |row_bytes_dedup, graph| {
+                            Self::settle_server_graph(
+                                row_bytes_dedup,
+                                graph,
+                                storage,
+                                branches,
+                                include_deleted,
+                                &sub.schema_context,
+                                &branch_schema_map,
+                                &table,
+                                query_id,
+                                &mut schema_warnings,
+                            )
+                        },
                         &sub.schema_context,
                         &branch_schema_map,
                         sub.session.as_ref(),
+                        &mut includes_past_page,
                     )
                     .map(Cow::Owned)
                 }
             };
+            // A row of the page lies past the rows whose includes were built: build them
+            // for every matching row instead, before any of this scope goes out.
+            // (A graph built that way has no page-only includes, so it cannot land here
+            // again.)
+            // The warnings are those of the graph that settles last.
+            let new_scope = if includes_past_page {
+                drop(new_scope);
+                schema_warnings = SchemaWarningAccumulator::default();
+                let rebuilt_scope = self.rebuild_with_includes_for_matching_rows(
+                    storage,
+                    client_id,
+                    query_id,
+                    &mut sub,
+                    &mut schema_warnings,
+                );
+                if rebuilt_scope.is_none() {
+                    // The graph changed under `last_scope`; derive it again next pass.
+                    sub.needs_reauthorization = true;
+                }
+                rebuilt_scope.map(Cow::Owned)
+            } else {
+                new_scope
+            };
+            let new_schema_warnings = Self::finalize_schema_warnings(
+                &mut sub.reported_schema_warnings,
+                schema_warnings.warnings_for_query(query_id),
+            );
+            schema_warning_notifications.extend(
+                new_schema_warnings
+                    .into_iter()
+                    .map(|warning| (client_id, warning)),
+            );
             if let Some(new_scope) = new_scope {
                 sub.needs_reauthorization = false;
                 let scope_changed = new_scope.as_ref() != &sub.last_scope;

@@ -166,6 +166,16 @@ pub static HISTORY_SCANS: AtomicU64 = AtomicU64::new(0);
 /// thinks to count them.
 pub static LOCATOR_LADDER_RECOVERIES: AtomicU64 = AtomicU64::new(0);
 
+/// Server subscriptions rebuilt with includes for every matching row because the scope
+/// took a page row past the rows whose includes were built for the page alone. A rebuilt
+/// subscription pays per matching row again for the rest of its life, so a count that
+/// keeps rising means pages are quietly losing that saving.
+pub static INCLUDE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// Extra settle passes run because an ordered window left its page short (see
+/// `QueryGraph::grow_short_windows`). Each one re-walks the window twice as far.
+pub static WINDOW_GROWTHS: AtomicU64 = AtomicU64::new(0);
+
 /// History entries decoded — counted at `decode_history_row_bytes_in_table`,
 /// the choke point every scan path funnels through. Divided by
 /// [`HISTORY_SCANS`] it gives the mean depth the pass paid for.
@@ -334,6 +344,8 @@ pub struct SettleCounts {
     pub rows_emitted: u64,
     pub pending_id_retain_scans: u64,
     pub locator_ladder_recoveries: u64,
+    pub include_rebuilds: u64,
+    pub window_growths: u64,
     pub history_scans: u64,
     pub history_entries: u64,
     pub history_bytes: u64,
@@ -372,6 +384,8 @@ impl SettleCounts {
             rows_emitted: ROWS_EMITTED.load(Ordering::Relaxed),
             pending_id_retain_scans: PENDING_ID_RETAIN_SCANS.load(Ordering::Relaxed),
             locator_ladder_recoveries: LOCATOR_LADDER_RECOVERIES.load(Ordering::Relaxed),
+            include_rebuilds: INCLUDE_REBUILDS.load(Ordering::Relaxed),
+            window_growths: WINDOW_GROWTHS.load(Ordering::Relaxed),
             history_scans: HISTORY_SCANS.load(Ordering::Relaxed),
             history_entries: HISTORY_ENTRIES.load(Ordering::Relaxed),
             history_bytes: HISTORY_BYTES.load(Ordering::Relaxed),
@@ -418,6 +432,8 @@ impl SettleCounts {
             locator_ladder_recoveries: self
                 .locator_ladder_recoveries
                 .saturating_sub(base.locator_ladder_recoveries),
+            include_rebuilds: self.include_rebuilds.saturating_sub(base.include_rebuilds),
+            window_growths: self.window_growths.saturating_sub(base.window_growths),
             history_scans: self.history_scans.saturating_sub(base.history_scans),
             history_entries: self.history_entries.saturating_sub(base.history_entries),
             history_bytes: self.history_bytes.saturating_sub(base.history_bytes),
@@ -514,6 +530,8 @@ impl Drop for SettlePass {
             index_reads = cost.index_reads,
             rows_emitted = cost.rows_emitted,
             locator_ladder_recoveries = cost.locator_ladder_recoveries,
+            include_rebuilds = cost.include_rebuilds,
+            window_growths = cost.window_growths,
             history_scans = cost.history_scans,
             history_entries = cost.history_entries,
             history_bytes = cost.history_bytes,

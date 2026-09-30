@@ -204,6 +204,7 @@ fn rebac_inherited_insert_uses_requested_branch_instead_of_reusing_cached_branch
     );
     QueryManager::update_indices_for_insert_on_branch(
         &mut storage,
+        &crate::query_manager::index_declarations::IndexDeclarations::empty(),
         "folders",
         &branch,
         folder_id,

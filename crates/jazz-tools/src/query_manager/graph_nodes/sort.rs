@@ -141,6 +141,19 @@ impl SortNode {
     }
 
     /// Full current ordering after sort has been applied.
+    /// The first sort key's column value in the tuple at `position`, when the first key
+    /// is a column.
+    pub(crate) fn first_key_value_at(
+        &self,
+        position: usize,
+    ) -> Option<crate::query_manager::types::Value> {
+        let SortTarget::Column(column) = self.sort_keys.first()?.target else {
+            return None;
+        };
+        let data = self.sorted_tuples.get(position)?.get(0)?.content()?;
+        crate::row_format::decode_column(&self.descriptor, data, column).ok()
+    }
+
     pub fn sorted_tuples(&self) -> &[Tuple] {
         &self.sorted_tuples
     }

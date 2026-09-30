@@ -1654,3 +1654,1364 @@ fn a_hub_sends_nothing_upstream_for_a_subscription_withdrawn_before_registration
         "the hub never registered the subscription, yet sent upstream: {upstream:?}"
     );
 }
+
+fn subscribe_page_as(
+    server_qm: &mut QueryManager,
+    storage: &mut CountingCatalogueUpsertsStorage,
+    client_id: crate::sync_manager::ClientId,
+    user: &str,
+    offset: usize,
+    page: usize,
+) {
+    let query = server_qm
+        .query("items")
+        .order_by("name")
+        .offset(offset)
+        .limit(page)
+        .build();
+    subscribe_query_as(server_qm, storage, client_id, user, query);
+}
+
+fn subscribe_query_as(
+    server_qm: &mut QueryManager,
+    storage: &mut CountingCatalogueUpsertsStorage,
+    client_id: crate::sync_manager::ClientId,
+    user: &str,
+    query: Query,
+) {
+    use crate::query_manager::session::Session;
+    use crate::sync_manager::{QueryId, QueryPropagation};
+
+    server_qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: QueryId(1),
+            query: Box::new(query),
+            session: Some(Session::new(user)),
+            required_tier: None,
+            propagation: QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    server_qm.process(storage);
+    let outbox = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(server_qm, &outbox);
+    server_qm.process(storage);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+}
+
+fn insert_item(
+    server_qm: &mut QueryManager,
+    storage: &mut CountingCatalogueUpsertsStorage,
+    owner: &str,
+    name: &str,
+) -> ObjectId {
+    server_qm
+        .insert(
+            storage,
+            "items",
+            &[
+                Value::Text(owner.to_string()),
+                Value::Text(name.to_string()),
+            ],
+        )
+        .expect("insert item")
+        .row_id
+}
+
+fn server_page_scope(server_qm: &QueryManager) -> std::collections::HashSet<ObjectId> {
+    server_qm
+        .server_subscriptions
+        .values()
+        .flat_map(|sub| sub.last_scope.iter().map(|(id, _)| *id))
+        .collect()
+}
+
+/// A page subscription (`order_by … limit n`) replays only its ordered prefix, so the server
+/// needs the read verdicts of the first `offset + limit` readable rows and no others. A write
+/// that lands outside the page must not re-authorize every row the query's filters match:
+/// on linsa-v22 that made one message written into a 100k-message chat cost ~0.7 s of server
+/// CPU per live page subscription over it (profiled 2026-09-30).
+#[test]
+fn a_write_outside_a_page_authorizes_only_the_page() {
+    use crate::sync_manager::ClientId;
+
+    const ROWS: usize = 300;
+    const PAGE: usize = 5;
+
+    let mut server_qm = QueryManager::new(SyncManager::new());
+    server_qm.set_current_schema(owned_items_schema(), "dev", "main");
+    let inner = seeded_memory_storage(&server_qm.schema_context().current_schema);
+    let mut storage = CountingCatalogueUpsertsStorage::with_inner(inner);
+
+    let ids: Vec<ObjectId> = (0..ROWS)
+        .map(|index| {
+            insert_item(
+                &mut server_qm,
+                &mut storage,
+                "alice",
+                &format!("Item {index:03}"),
+            )
+        })
+        .collect();
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    subscribe_page_as(&mut server_qm, &mut storage, client_id, "alice", 0, PAGE);
+
+    let page: std::collections::HashSet<ObjectId> = ids[..PAGE].iter().copied().collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        page,
+        "fixture: the page is the first {PAGE} rows"
+    );
+
+    storage.reset_visible_query_loads();
+    insert_item(&mut server_qm, &mut storage, "alice", "Item 999");
+    server_qm.process(&mut storage);
+    let loads = storage.visible_query_loads();
+
+    assert_eq!(
+        server_page_scope(&server_qm),
+        page,
+        "a write outside the page leaves the page as it was"
+    );
+    assert!(
+        loads <= 4 * PAGE,
+        "a write outside a {PAGE}-row page loaded {loads} rows (of {ROWS} matching) to re-authorize it"
+    );
+}
+
+/// Rows the session may not read never count toward a page: when the head of the ordering
+/// belongs to someone else, the page is still the first `limit` rows the session CAN read,
+/// and a readable row written ahead of them pushes the last one out.
+#[test]
+fn a_page_prefix_counts_only_rows_the_session_may_read() {
+    use crate::sync_manager::ClientId;
+
+    const PAGE: usize = 5;
+
+    let mut server_qm = QueryManager::new(SyncManager::new());
+    server_qm.set_current_schema(owned_items_schema(), "dev", "main");
+    let inner = seeded_memory_storage(&server_qm.schema_context().current_schema);
+    let mut storage = CountingCatalogueUpsertsStorage::with_inner(inner);
+
+    let mut alice_ids = Vec::new();
+    for index in 0..40 {
+        let owner = if index % 2 == 0 { "bob" } else { "alice" };
+        let id = insert_item(
+            &mut server_qm,
+            &mut storage,
+            owner,
+            &format!("Item {index:03}"),
+        );
+        if owner == "alice" {
+            alice_ids.push(id);
+        }
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    subscribe_page_as(&mut server_qm, &mut storage, client_id, "alice", 0, PAGE);
+
+    let page: std::collections::HashSet<ObjectId> = alice_ids[..PAGE].iter().copied().collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        page,
+        "the page holds the first {PAGE} rows alice may read, skipping bob's"
+    );
+
+    insert_item(&mut server_qm, &mut storage, "bob", "Item 000a");
+    server_qm.process(&mut storage);
+    assert_eq!(
+        server_page_scope(&server_qm),
+        page,
+        "a denied row written at the head of the ordering does not enter or shift the page"
+    );
+
+    let head = insert_item(&mut server_qm, &mut storage, "alice", "Item 000b");
+    server_qm.process(&mut storage);
+    let shifted: std::collections::HashSet<ObjectId> = std::iter::once(head)
+        .chain(alice_ids[..PAGE - 1].iter().copied())
+        .collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        shifted,
+        "a readable row written at the head enters the page and pushes its last row out"
+    );
+}
+
+/// xorshift64* — deterministic, dependency-free.
+struct PagePrng(u64);
+
+impl PagePrng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+/// Differential for a page's authorized sync scope. A seeded stream of inserts, renames
+/// (moves within the ordering), owner flips (visibility changes) and deletes runs against a
+/// model of the intended semantics: the scope of an `order_by(name) offset o limit n` page is
+/// the first `o + n` rows the session may read, in (name, id) order — the ordered prefix the
+/// client needs to replay the window, with rows it may not read never counted.
+#[test]
+fn page_scope_matches_the_first_readable_rows_under_random_writes() {
+    use crate::sync_manager::ClientId;
+    use std::collections::{BTreeMap, HashSet};
+
+    const STEPS: usize = 300;
+    const NAMES: usize = 40;
+
+    for seed in [1u64, 7, 42, 1337, 9001, 65_537] {
+        let mut rng = PagePrng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let offset = rng.below(4);
+        let page = 1 + rng.below(8);
+
+        let mut server_qm = QueryManager::new(SyncManager::new());
+        server_qm.set_current_schema(owned_items_schema(), "dev", "main");
+        let inner = seeded_memory_storage(&server_qm.schema_context().current_schema);
+        let mut storage = CountingCatalogueUpsertsStorage::with_inner(inner);
+
+        let mut model: BTreeMap<ObjectId, (&'static str, String)> = BTreeMap::new();
+        let owners = ["alice", "bob"];
+        for _ in 0..30 {
+            let owner = owners[rng.below(2)];
+            let name = format!("Item {:02}", rng.below(NAMES));
+            let id = insert_item(&mut server_qm, &mut storage, owner, &name);
+            model.insert(id, (owner, name));
+        }
+        server_qm.process(&mut storage);
+
+        let client_id = ClientId::new();
+        connect_client(&mut server_qm, &storage, client_id);
+        let _ = server_qm.sync_manager_mut().take_outbox();
+        subscribe_page_as(
+            &mut server_qm,
+            &mut storage,
+            client_id,
+            "alice",
+            offset,
+            page,
+        );
+
+        let expected = |model: &BTreeMap<ObjectId, (&'static str, String)>| -> HashSet<ObjectId> {
+            let mut readable: Vec<(&String, ObjectId)> = model
+                .iter()
+                .filter(|(_, (owner, _))| *owner == "alice")
+                .map(|(id, (_, name))| (name, *id))
+                .collect();
+            readable.sort();
+            readable
+                .into_iter()
+                .take(offset + page)
+                .map(|(_, id)| id)
+                .collect()
+        };
+
+        for step in 0..STEPS {
+            let live: Vec<ObjectId> = model.keys().copied().collect();
+            let roll = rng.below(100);
+            let op = if roll < 40 || live.is_empty() {
+                let owner = owners[rng.below(2)];
+                let name = format!("Item {:02}", rng.below(NAMES));
+                let id = insert_item(&mut server_qm, &mut storage, owner, &name);
+                model.insert(id, (owner, name.clone()));
+                format!("insert {owner} {name}")
+            } else if roll < 60 {
+                let id = live[rng.below(live.len())];
+                let owner = model[&id].0;
+                let name = format!("Item {:02}", rng.below(NAMES));
+                server_qm
+                    .update(
+                        &mut storage,
+                        id,
+                        &[Value::Text(owner.to_string()), Value::Text(name.clone())],
+                    )
+                    .expect("rename");
+                model.insert(id, (owner, name.clone()));
+                format!("rename {id} -> {name}")
+            } else if roll < 75 {
+                let id = live[rng.below(live.len())];
+                let (owner, name) = model[&id].clone();
+                let flipped = if owner == "alice" { "bob" } else { "alice" };
+                server_qm
+                    .update(
+                        &mut storage,
+                        id,
+                        &[Value::Text(flipped.to_string()), Value::Text(name.clone())],
+                    )
+                    .expect("flip owner");
+                model.insert(id, (flipped, name));
+                format!("flip {id} -> {flipped}")
+            } else if roll < 90 {
+                let id = live[rng.below(live.len())];
+                server_qm.delete(&mut storage, id).expect("delete");
+                model.remove(&id);
+                format!("delete {id}")
+            } else {
+                "process".to_string()
+            };
+            server_qm.process(&mut storage);
+            let outbox = server_qm.sync_manager_mut().take_outbox();
+            confirm_delivered(&mut server_qm, &outbox);
+
+            assert_eq!(
+                server_page_scope(&server_qm),
+                expected(&model),
+                "seed {seed} (offset {offset}, limit {page}), step {step} after `{op}`: \
+                 the page scope is not the first {} rows alice may read",
+                offset + page,
+            );
+        }
+    }
+}
+
+/// `items` pages with their `tags` included. Tags are readable by everyone; `item_select` is
+/// the read policy of the items.
+fn items_with_tags_schema(item_select: PolicyExpr) -> Schema {
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("items"),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("owner_id", ColumnType::Text),
+                ColumnDescriptor::new("name", ColumnType::Text),
+            ]),
+            TablePolicies::new().with_select(item_select),
+        ),
+    );
+    schema.insert(
+        TableName::new("tags"),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("item_id", ColumnType::Uuid).references("items"),
+                ColumnDescriptor::new("label", ColumnType::Text),
+            ]),
+            TablePolicies::new().with_select(PolicyExpr::True),
+        ),
+    );
+    schema
+}
+
+fn structural(schema: &Schema) -> Schema {
+    schema
+        .iter()
+        .map(|(table_name, table_schema)| {
+            let mut structural = table_schema.clone();
+            structural.policies = TablePolicies::default();
+            (*table_name, structural)
+        })
+        .collect()
+}
+
+/// A server in the shape production runs: it compiles queries against the structural
+/// schema and authorizes the sync scope against a separate authorization schema — so its
+/// graphs carry no policy filter, and rows the session may not read stay in the ordering.
+fn server_with_authorization(
+    authorization: Schema,
+) -> (QueryManager, CountingCatalogueUpsertsStorage) {
+    let mut server_qm = QueryManager::new(SyncManager::new());
+    server_qm.set_current_schema(structural(&authorization), "dev", "main");
+    server_qm.set_authorization_schema(authorization);
+    let inner = seeded_memory_storage(&server_qm.schema_context().current_schema);
+    (
+        server_qm,
+        CountingCatalogueUpsertsStorage::with_inner(inner),
+    )
+}
+
+fn items_page_with_tags(qm: &QueryManager, offset: usize, page: usize) -> Query {
+    qm.query("items")
+        .order_by("name")
+        .offset(offset)
+        .limit(page)
+        .with_array("tags", |sub| {
+            sub.from("tags").correlate("item_id", "items.id")
+        })
+        .build()
+}
+
+fn insert_tag<H: Storage>(
+    qm: &mut QueryManager,
+    storage: &mut H,
+    item: ObjectId,
+    label: &str,
+) -> ObjectId {
+    qm.insert(
+        storage,
+        "tags",
+        &[Value::Uuid(item), Value::Text(label.to_string())],
+    )
+    .expect("insert tag")
+    .row_id
+}
+
+fn server_include_instances(server_qm: &QueryManager) -> usize {
+    use crate::query_manager::graph::GraphNode;
+
+    server_qm
+        .server_subscriptions
+        .values()
+        .flat_map(|sub| sub.graph.nodes.iter())
+        .map(|node| match &node.node {
+            GraphNode::ArraySubquery(array) => array.cached_subgraph_count(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A page with includes builds them for the page's rows, not for every row the query's
+/// filters match: on linsa-v22 a 40-row page with the thread include over a 10k-message
+/// chat held 10k include instances, took ~2.3 s of server CPU to open and ~640 MB of RSS,
+/// and re-evaluated them on each write (measured 2026-09-30). Production shape: rows every
+/// session may read, a separate authorization schema.
+#[test]
+fn a_page_builds_its_includes_for_its_own_rows_only() {
+    use crate::sync_manager::ClientId;
+
+    // Includes must track their rows precisely: a parallel test may otherwise hold the
+    // legacy coarse path, which has known staleness of its own (and fails this identically
+    // without deferred includes).
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    const ROWS: usize = 300;
+    const PAGE: usize = 5;
+
+    let (mut server_qm, mut storage) =
+        server_with_authorization(items_with_tags_schema(PolicyExpr::True));
+    let mut expected = std::collections::HashSet::new();
+    for index in 0..ROWS {
+        let item = insert_item(
+            &mut server_qm,
+            &mut storage,
+            "alice",
+            &format!("Item {index:03}"),
+        );
+        let tag = insert_tag(
+            &mut server_qm,
+            &mut storage,
+            item,
+            &format!("tag {index:03}"),
+        );
+        if index < PAGE {
+            expected.extend([item, tag]);
+        }
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    let query = items_page_with_tags(&server_qm, 0, PAGE);
+    subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "the page scope is its {PAGE} rows and their tags"
+    );
+    let instances = server_include_instances(&server_qm);
+    assert!(
+        instances <= PAGE,
+        "a {PAGE}-row page over {ROWS} matching rows holds {instances} include instances"
+    );
+
+    let outside = insert_item(&mut server_qm, &mut storage, "alice", "Item 999");
+    insert_tag(&mut server_qm, &mut storage, outside, "tag 999");
+    server_qm.process(&mut storage);
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "a write outside the page leaves it"
+    );
+    let instances = server_include_instances(&server_qm);
+    assert!(
+        instances <= PAGE,
+        "a write outside a {PAGE}-row page left {instances} include instances"
+    );
+}
+
+/// When the authorization schema denies rows ahead of the page, the page is the first rows
+/// the session may read — past the graph's own window — and every one of them still carries
+/// its includes to the client. Production shape: the graph has no policy filter, so the
+/// denied rows sit in its ordering.
+#[test]
+fn a_page_past_denied_rows_carries_the_includes_of_every_row() {
+    use crate::sync_manager::ClientId;
+
+    // Includes must track their rows precisely: a parallel test may otherwise hold the
+    // legacy coarse path, which has known staleness of its own (and fails this identically
+    // without deferred includes).
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    const PAGE: usize = 5;
+
+    let (mut server_qm, mut storage) = server_with_authorization(items_with_tags_schema(
+        PolicyExpr::eq_session("owner_id", vec!["user_id".into()]),
+    ));
+    let mut expected = std::collections::HashSet::new();
+    let mut alice_rows = 0;
+    for index in 0..40 {
+        let owner = if index % 2 == 0 { "bob" } else { "alice" };
+        let item = insert_item(
+            &mut server_qm,
+            &mut storage,
+            owner,
+            &format!("Item {index:03}"),
+        );
+        let tag = insert_tag(
+            &mut server_qm,
+            &mut storage,
+            item,
+            &format!("tag {index:03}"),
+        );
+        if owner == "alice" {
+            if alice_rows < PAGE {
+                expected.extend([item, tag]);
+            }
+            alice_rows += 1;
+        }
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    let query = items_page_with_tags(&server_qm, 0, PAGE);
+    subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "the page is alice's first {PAGE} rows, each with its tag"
+    );
+}
+
+/// Differential for the sync scope of a page with includes, on a production-shape server,
+/// once with rows everyone may read (the includes are built for the page alone) and once
+/// with rows owned per session (denied rows sit in the ordering). A seeded stream of item
+/// inserts, renames, owner flips and deletes and of tag inserts, moves and deletes runs
+/// against a model: the scope holds the first `offset + limit` items alice may read and the
+/// tags of the page's items, and may hold the tags of the offset's items — the client needs
+/// those rows to place the page, not their includes.
+#[test]
+fn page_scope_with_includes_matches_the_model_under_random_writes() {
+    use crate::sync_manager::ClientId;
+    use std::collections::{BTreeMap, HashSet};
+
+    // Includes must track their rows precisely: a parallel test may otherwise hold the
+    // legacy coarse path, which has known staleness of its own (and fails this identically
+    // without deferred includes).
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    const STEPS: usize = 300;
+    const NAMES: usize = 40;
+
+    use crate::query_manager::graph::IncludePlacement;
+
+    let owned_policy = PolicyExpr::eq_session("owner_id", vec!["user_id".into()]);
+    // The last variant makes the server predict wrongly that no row can be denied, so the
+    // scope walk has to catch every overrun and rebuild the graph.
+    let policies = [
+        ("readable", PolicyExpr::True, None),
+        ("owned", owned_policy.clone(), None),
+        (
+            "owned, mispredicted",
+            owned_policy,
+            Some(IncludePlacement::PageRows),
+        ),
+    ];
+    for (policy_name, item_select, placement_override) in policies {
+        for seed in [1u64, 7, 42, 1337, 9001, 65_537] {
+            let mut rng = PagePrng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let offset = rng.below(4);
+            let page = 1 + rng.below(8);
+            let owned = policy_name != "readable";
+
+            let (mut server_qm, mut storage) =
+                server_with_authorization(items_with_tags_schema(item_select.clone()));
+            server_qm.include_placement_override = placement_override;
+
+            let owners = ["alice", "bob"];
+            let mut items: BTreeMap<ObjectId, (&'static str, String)> = BTreeMap::new();
+            let mut tags: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
+            for index in 0..30 {
+                let owner = owners[rng.below(2)];
+                let name = format!("Item {:02}", rng.below(NAMES));
+                let item = insert_item(&mut server_qm, &mut storage, owner, &name);
+                items.insert(item, (owner, name));
+                if rng.below(3) > 0 {
+                    let tag = insert_tag(&mut server_qm, &mut storage, item, &format!("t{index}"));
+                    tags.insert(tag, item);
+                }
+            }
+            server_qm.process(&mut storage);
+
+            let client_id = ClientId::new();
+            connect_client(&mut server_qm, &storage, client_id);
+            let _ = server_qm.sync_manager_mut().take_outbox();
+            let query = items_page_with_tags(&server_qm, offset, page);
+            subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+            // (required, allowed)
+            let model = |items: &BTreeMap<ObjectId, (&'static str, String)>,
+                         tags: &BTreeMap<ObjectId, ObjectId>|
+             -> (HashSet<ObjectId>, HashSet<ObjectId>) {
+                let mut readable: Vec<(&String, ObjectId)> = items
+                    .iter()
+                    .filter(|(_, (owner, _))| !owned || *owner == "alice")
+                    .map(|(id, (_, name))| (name, *id))
+                    .collect();
+                readable.sort();
+                let prefix: Vec<ObjectId> = readable
+                    .into_iter()
+                    .take(offset + page)
+                    .map(|(_, id)| id)
+                    .collect();
+                let page_items: HashSet<ObjectId> = prefix.iter().skip(offset).copied().collect();
+                let offset_items: HashSet<ObjectId> = prefix.iter().take(offset).copied().collect();
+                let mut required: HashSet<ObjectId> = prefix.iter().copied().collect();
+                required.extend(
+                    tags.iter()
+                        .filter(|(_, item)| page_items.contains(item))
+                        .map(|(tag, _)| *tag),
+                );
+                let mut allowed = required.clone();
+                allowed.extend(
+                    tags.iter()
+                        .filter(|(_, item)| offset_items.contains(item))
+                        .map(|(tag, _)| *tag),
+                );
+                (required, allowed)
+            };
+
+            for step in 0..STEPS {
+                let live_items: Vec<ObjectId> = items.keys().copied().collect();
+                let live_tags: Vec<ObjectId> = tags.keys().copied().collect();
+                let roll = rng.below(100);
+                let op = if roll < 20 || live_items.is_empty() {
+                    let owner = owners[rng.below(2)];
+                    let name = format!("Item {:02}", rng.below(NAMES));
+                    let item = insert_item(&mut server_qm, &mut storage, owner, &name);
+                    items.insert(item, (owner, name.clone()));
+                    format!("insert item {owner} {name}")
+                } else if roll < 32 {
+                    let item = live_items[rng.below(live_items.len())];
+                    let owner = items[&item].0;
+                    let name = format!("Item {:02}", rng.below(NAMES));
+                    server_qm
+                        .update(
+                            &mut storage,
+                            item,
+                            &[Value::Text(owner.to_string()), Value::Text(name.clone())],
+                        )
+                        .expect("rename");
+                    items.insert(item, (owner, name.clone()));
+                    format!("rename {item} -> {name}")
+                } else if roll < 42 {
+                    let item = live_items[rng.below(live_items.len())];
+                    let (owner, name) = items[&item].clone();
+                    let flipped = if owner == "alice" { "bob" } else { "alice" };
+                    server_qm
+                        .update(
+                            &mut storage,
+                            item,
+                            &[Value::Text(flipped.to_string()), Value::Text(name.clone())],
+                        )
+                        .expect("flip owner");
+                    items.insert(item, (flipped, name));
+                    format!("flip {item} -> {flipped}")
+                } else if roll < 50 {
+                    let item = live_items[rng.below(live_items.len())];
+                    server_qm.delete(&mut storage, item).expect("delete item");
+                    items.remove(&item);
+                    format!("delete item {item}")
+                } else if roll < 72 {
+                    let item = live_items[rng.below(live_items.len())];
+                    let tag = insert_tag(&mut server_qm, &mut storage, item, &format!("s{step}"));
+                    tags.insert(tag, item);
+                    format!("tag {item}")
+                } else if roll < 84 && !live_tags.is_empty() {
+                    let tag = live_tags[rng.below(live_tags.len())];
+                    let item = live_items[rng.below(live_items.len())];
+                    server_qm
+                        .update(
+                            &mut storage,
+                            tag,
+                            &[Value::Uuid(item), Value::Text(format!("m{step}"))],
+                        )
+                        .expect("move tag");
+                    tags.insert(tag, item);
+                    format!("move tag {tag} -> {item}")
+                } else if roll < 94 && !live_tags.is_empty() {
+                    let tag = live_tags[rng.below(live_tags.len())];
+                    server_qm.delete(&mut storage, tag).expect("delete tag");
+                    tags.remove(&tag);
+                    format!("delete tag {tag}")
+                } else {
+                    "process".to_string()
+                };
+                server_qm.process(&mut storage);
+                let outbox = server_qm.sync_manager_mut().take_outbox();
+                confirm_delivered(&mut server_qm, &outbox);
+
+                if placement_override.is_none() {
+                    assert!(
+                        server_qm
+                            .server_subscriptions
+                            .values()
+                            .all(|sub| !sub.includes_past_page),
+                        "{policy_name} rows, seed {seed}, step {step} after `{op}`: the policies \
+                         predicted where the includes go, yet the page ran past them"
+                    );
+                }
+                let scope = server_page_scope(&server_qm);
+                let (required, allowed) = model(&items, &tags);
+                assert!(
+                    required.is_subset(&scope) && scope.is_subset(&allowed),
+                    "{policy_name} rows, seed {seed} (offset {offset}, limit {page}), step {step} \
+                     after `{op}`: missing {:?}, unexpected {:?}",
+                    required.difference(&scope).collect::<Vec<_>>(),
+                    scope.difference(&allowed).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+}
+
+/// Differential for what a page with includes emits: a local subscription over a seeded
+/// stream of writes must show, in order, the page's items each with exactly its tags —
+/// both in its current result and in the deltas it sends, applied one after another.
+#[test]
+fn page_with_includes_emits_the_model_page_under_random_writes() {
+    use std::collections::{BTreeMap, HashMap};
+
+    // Includes must track their rows precisely: a parallel test may otherwise hold the
+    // legacy coarse path, which has known staleness of its own (and fails this identically
+    // without deferred includes).
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    const STEPS: usize = 300;
+    const NAMES: usize = 40;
+
+    fn decode(values: &[Value]) -> (String, Vec<String>) {
+        let name = match &values[1] {
+            Value::Text(name) => name.clone(),
+            other => panic!("expected a name, got {other:?}"),
+        };
+        let mut labels: Vec<String> = values[2]
+            .as_array()
+            .expect("tags is an array")
+            .iter()
+            .map(|tag| match &tag.as_row().expect("a tag row")[1] {
+                Value::Text(label) => label.clone(),
+                other => panic!("expected a label, got {other:?}"),
+            })
+            .collect();
+        labels.sort();
+        (name, labels)
+    }
+
+    for seed in [3u64, 11, 99, 2024, 31_337, 77_777] {
+        let mut rng = PagePrng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let offset = rng.below(4);
+        let page = 1 + rng.below(8);
+
+        let (mut qm, mut storage) = create_query_manager(
+            SyncManager::new(),
+            structural(&items_with_tags_schema(PolicyExpr::True)),
+        );
+
+        let mut items: BTreeMap<ObjectId, String> = BTreeMap::new();
+        let mut tags: BTreeMap<ObjectId, (ObjectId, String)> = BTreeMap::new();
+        for index in 0..30 {
+            let name = format!("Item {:02}", rng.below(NAMES));
+            let item = qm
+                .insert(
+                    &mut storage,
+                    "items",
+                    &[Value::Text("alice".into()), Value::Text(name.clone())],
+                )
+                .expect("insert item")
+                .row_id;
+            items.insert(item, name);
+            if rng.below(3) > 0 {
+                let label = format!("t{index}");
+                let tag = insert_tag(&mut qm, &mut storage, item, &label);
+                tags.insert(tag, (item, label));
+            }
+        }
+        let query = items_page_with_tags(&qm, offset, page);
+        let sub_id = qm.subscribe(query).expect("subscribe");
+        qm.process(&mut storage);
+
+        let expected = |items: &BTreeMap<ObjectId, String>,
+                        tags: &BTreeMap<ObjectId, (ObjectId, String)>|
+         -> Vec<(ObjectId, (String, Vec<String>))> {
+            let mut ordered: Vec<(&String, ObjectId)> =
+                items.iter().map(|(id, name)| (name, *id)).collect();
+            ordered.sort();
+            ordered
+                .into_iter()
+                .skip(offset)
+                .take(page)
+                .map(|(name, id)| {
+                    let mut labels: Vec<String> = tags
+                        .values()
+                        .filter(|(item, _)| *item == id)
+                        .map(|(_, label)| label.clone())
+                        .collect();
+                    labels.sort();
+                    (id, (name.clone(), labels))
+                })
+                .collect()
+        };
+
+        let mut emitted: HashMap<ObjectId, (String, Vec<String>)> = HashMap::new();
+        for step in 0..=STEPS {
+            let op = if step == 0 {
+                "subscribe".to_string()
+            } else {
+                let live_items: Vec<ObjectId> = items.keys().copied().collect();
+                let live_tags: Vec<ObjectId> = tags.keys().copied().collect();
+                let roll = rng.below(100);
+                let op = if roll < 20 || live_items.is_empty() {
+                    let name = format!("Item {:02}", rng.below(NAMES));
+                    let item = qm
+                        .insert(
+                            &mut storage,
+                            "items",
+                            &[Value::Text("alice".into()), Value::Text(name.clone())],
+                        )
+                        .expect("insert item")
+                        .row_id;
+                    items.insert(item, name.clone());
+                    format!("insert item {name}")
+                } else if roll < 35 {
+                    let item = live_items[rng.below(live_items.len())];
+                    let name = format!("Item {:02}", rng.below(NAMES));
+                    qm.update(
+                        &mut storage,
+                        item,
+                        &[Value::Text("alice".into()), Value::Text(name.clone())],
+                    )
+                    .expect("rename");
+                    items.insert(item, name.clone());
+                    format!("rename {item} -> {name}")
+                } else if roll < 45 {
+                    let item = live_items[rng.below(live_items.len())];
+                    qm.delete(&mut storage, item).expect("delete item");
+                    items.remove(&item);
+                    format!("delete item {item}")
+                } else if roll < 70 {
+                    let item = live_items[rng.below(live_items.len())];
+                    let label = format!("s{step}");
+                    let tag = insert_tag(&mut qm, &mut storage, item, &label);
+                    tags.insert(tag, (item, label));
+                    format!("tag {item}")
+                } else if roll < 85 && !live_tags.is_empty() {
+                    let tag = live_tags[rng.below(live_tags.len())];
+                    let item = live_items[rng.below(live_items.len())];
+                    let label = format!("m{step}");
+                    qm.update(
+                        &mut storage,
+                        tag,
+                        &[Value::Uuid(item), Value::Text(label.clone())],
+                    )
+                    .expect("move tag");
+                    tags.insert(tag, (item, label));
+                    format!("move tag {tag} -> {item}")
+                } else if roll < 95 && !live_tags.is_empty() {
+                    let tag = live_tags[rng.below(live_tags.len())];
+                    qm.delete(&mut storage, tag).expect("delete tag");
+                    tags.remove(&tag);
+                    format!("delete tag {tag}")
+                } else {
+                    "process".to_string()
+                };
+                qm.process(&mut storage);
+                op
+            };
+
+            for update in qm
+                .take_updates()
+                .into_iter()
+                .filter(|u| u.subscription_id == sub_id)
+            {
+                for row in &update.delta.removed {
+                    emitted.remove(&row.id);
+                }
+                for row in &update.delta.added {
+                    let values = decode_row(&update.descriptor, &row.data).expect("decode added");
+                    emitted.insert(row.id, decode(&values));
+                }
+                for (_, row) in &update.delta.updated {
+                    let values = decode_row(&update.descriptor, &row.data).expect("decode updated");
+                    emitted.insert(row.id, decode(&values));
+                }
+            }
+
+            let want = expected(&items, &tags);
+            let current: Vec<(ObjectId, (String, Vec<String>))> = qm
+                .get_subscription_results(sub_id)
+                .into_iter()
+                .map(|(id, values)| (id, decode(&values)))
+                .collect();
+            assert_eq!(
+                current, want,
+                "seed {seed} (offset {offset}, limit {page}), step {step} after `{op}`: \
+                 the current page"
+            );
+            let want_map: HashMap<ObjectId, (String, Vec<String>)> = want.into_iter().collect();
+            assert_eq!(
+                emitted, want_map,
+                "seed {seed} (offset {offset}, limit {page}), step {step} after `{op}`: \
+                 the page the deltas add up to"
+            );
+        }
+    }
+}
+
+/// The server predicts from the policies alone whether rows ahead of a page can be
+/// denied, and a row can be denied for a reason no policy shows (it fails to load, or has
+/// no lens into the authorization schema). When the prediction misses, the scope walk
+/// finds a page row past the rows whose includes were built, and the subscription is
+/// rebuilt with includes for every matching row before its first scope goes out.
+#[test]
+fn a_mispredicted_page_is_rebuilt_with_includes_before_its_scope_goes_out() {
+    use crate::query_manager::graph::IncludePlacement;
+    use crate::sync_manager::ClientId;
+
+    const PAGE: usize = 5;
+
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    let (mut server_qm, mut storage) = server_with_authorization(items_with_tags_schema(
+        PolicyExpr::eq_session("owner_id", vec!["user_id".into()]),
+    ));
+    server_qm.include_placement_override = Some(IncludePlacement::PageRows);
+    let mut expected = std::collections::HashSet::new();
+    let mut alice_rows = 0;
+    for index in 0..40 {
+        let owner = if index % 2 == 0 { "bob" } else { "alice" };
+        let item = insert_item(
+            &mut server_qm,
+            &mut storage,
+            owner,
+            &format!("Item {index:03}"),
+        );
+        let tag = insert_tag(
+            &mut server_qm,
+            &mut storage,
+            item,
+            &format!("tag {index:03}"),
+        );
+        if owner == "alice" {
+            if alice_rows < PAGE {
+                expected.extend([item, tag]);
+            }
+            alice_rows += 1;
+        }
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    let query = items_page_with_tags(&server_qm, 0, PAGE);
+    subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "the page is alice's first {PAGE} rows, each with its tag"
+    );
+    assert!(
+        server_qm
+            .server_subscriptions
+            .values()
+            .all(|sub| sub.includes_past_page),
+        "the subscription now builds includes for every matching row"
+    );
+}
+
+/// The same miss on a live subscription: a row of the page becomes one the session may not
+/// read, the page slides one row past the graph's window, and the settle rebuilds the
+/// graph in that pass rather than sending the new row without its includes.
+#[test]
+fn a_page_that_slides_past_its_includes_is_rebuilt_in_the_same_pass() {
+    use crate::query_manager::graph::IncludePlacement;
+    use crate::sync_manager::ClientId;
+
+    const PAGE: usize = 5;
+
+    let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+    let _routing = crate::query_manager::graph_nodes::include_routing::force_include_routing(true);
+
+    let (mut server_qm, mut storage) = server_with_authorization(items_with_tags_schema(
+        PolicyExpr::eq_session("owner_id", vec!["user_id".into()]),
+    ));
+    server_qm.include_placement_override = Some(IncludePlacement::PageRows);
+    let mut rows = Vec::new();
+    for index in 0..20 {
+        let name = format!("Item {index:03}");
+        let item = insert_item(&mut server_qm, &mut storage, "alice", &name);
+        let tag = insert_tag(
+            &mut server_qm,
+            &mut storage,
+            item,
+            &format!("tag {index:03}"),
+        );
+        rows.push((item, tag, name));
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    let query = items_page_with_tags(&server_qm, 0, PAGE);
+    subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+    assert!(
+        server_qm
+            .server_subscriptions
+            .values()
+            .all(|sub| !sub.includes_past_page),
+        "fixture: nothing ahead of the page is denied yet, so its includes stay on the page"
+    );
+
+    let (head, _, head_name) = &rows[0];
+    server_qm
+        .update(
+            &mut storage,
+            *head,
+            &[
+                Value::Text("bob".to_string()),
+                Value::Text(head_name.clone()),
+            ],
+        )
+        .expect("give the head row to bob");
+    server_qm.process(&mut storage);
+
+    let expected: std::collections::HashSet<ObjectId> = rows[1..=PAGE]
+        .iter()
+        .flat_map(|(item, tag, _)| [*item, *tag])
+        .collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "the page slid one row, and its new last row came with its tag"
+    );
+    assert!(
+        server_qm
+            .server_subscriptions
+            .values()
+            .all(|sub| sub.includes_past_page),
+        "the subscription now builds includes for every matching row"
+    );
+
+    // A recompile (a schema or permissions change) keeps that placement.
+    for sub in server_qm.server_subscriptions.values_mut() {
+        sub.needs_recompile = true;
+    }
+    server_qm.process(&mut storage);
+    assert!(
+        server_qm
+            .server_subscriptions
+            .values()
+            .all(|sub| sub.includes_past_page && sub.graph.deferred_arrays_tail.is_none()),
+        "a recompiled subscription still builds includes for every matching row"
+    );
+    let (second, _, second_name) = &rows[1];
+    server_qm
+        .update(
+            &mut storage,
+            *second,
+            &[
+                Value::Text("bob".to_string()),
+                Value::Text(second_name.clone()),
+            ],
+        )
+        .expect("give the next head row to bob");
+    server_qm.process(&mut storage);
+    let expected: std::collections::HashSet<ObjectId> = rows[2..=PAGE + 1]
+        .iter()
+        .flat_map(|(item, tag, _)| [*item, *tag])
+        .collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "after the recompile the page slides again with its includes"
+    );
+}
+
+/// `wmsgs` (the tests declare its `chat+at` composite index, `declare_indexes`) with
+/// rows readable by the session named in `body`.
+fn owned_window_messages_schema() -> Schema {
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("wmsgs"),
+        TableSchema::with_policies(
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("chat", ColumnType::Uuid),
+                ColumnDescriptor::new("at", ColumnType::Timestamp),
+                ColumnDescriptor::new("dead", ColumnType::Boolean),
+                ColumnDescriptor::new("body", ColumnType::Text),
+            ]),
+            TablePolicies::new()
+                .with_select(PolicyExpr::eq_session("body", vec!["user_id".into()])),
+        ),
+    );
+    schema
+}
+
+fn window_message_values(chat: ObjectId, at: u64, dead: bool, owner: &str) -> [Value; 4] {
+    [
+        Value::Uuid(chat),
+        Value::Timestamp(at),
+        Value::Boolean(dead),
+        Value::Text(owner.to_string()),
+    ]
+}
+
+fn window_page_query(
+    qm: &QueryManager,
+    chat: ObjectId,
+    desc: bool,
+    offset: usize,
+    limit: usize,
+) -> Query {
+    let builder = qm
+        .query("wmsgs")
+        .filter_eq("chat", Value::Uuid(chat))
+        .filter_eq("dead", Value::Boolean(false));
+    let builder = if desc {
+        builder.order_by_desc("at")
+    } else {
+        builder.order_by("at")
+    };
+    builder.offset(offset).limit(limit).build()
+}
+
+/// A page read through a composite-index window (`IndexScanNode::new_window`) on a
+/// production-shape server. The graph carries no policy filter, so the window holds rows
+/// the session may not read, and the page is the first rows the session may read — past
+/// the window's first walk when the rows ahead of them are denied. The window has to walk
+/// on until it holds them: sized for the page alone, it left the scope empty.
+#[test]
+fn a_windowed_page_past_denied_rows_is_the_first_readable_rows() {
+    use crate::sync_manager::ClientId;
+
+    const ROWS: u64 = 300;
+    const DENIED_AHEAD: u64 = 60;
+    const PAGE: usize = 10;
+
+    let (mut server_qm, mut storage) = server_with_authorization(owned_window_messages_schema());
+
+    declare_indexes(&mut server_qm, &mut storage, wmsgs_index_declarations());
+    let chat = ObjectId::new();
+    let mut alice = Vec::new();
+    for index in 0..ROWS {
+        // The newest rows are bob's, so a newest-first page walks them first.
+        let owner = if index >= ROWS - DENIED_AHEAD {
+            "bob"
+        } else {
+            "alice"
+        };
+        let id = server_qm
+            .insert(
+                &mut storage,
+                "wmsgs",
+                &window_message_values(chat, index * 10, false, owner),
+            )
+            .expect("insert message")
+            .row_id;
+        if owner == "alice" {
+            alice.push(id);
+        }
+    }
+    server_qm.process(&mut storage);
+
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+    let query = window_page_query(&server_qm, chat, true, 0, PAGE);
+    subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+    let expected: std::collections::HashSet<ObjectId> =
+        alice.iter().rev().take(PAGE).copied().collect();
+    assert_eq!(
+        server_page_scope(&server_qm),
+        expected,
+        "the page is alice's newest {PAGE} rows, behind {DENIED_AHEAD} of bob's"
+    );
+    // The page came through the window, not through a scan of the chat.
+    let mut scanned = Vec::new();
+    for sub in server_qm.server_subscriptions.values() {
+        sub.graph.collect_scanned_row_ids(&mut scanned);
+    }
+    assert!(
+        scanned.len() < ROWS as usize / 2,
+        "the windowed page scanned {} of the chat's {ROWS} rows",
+        scanned.len()
+    );
+}
+
+/// Differential for a windowed page's sync scope on a production-shape server: a seeded
+/// stream of inserts (ties included), owner flips and `dead` flips against a model — the
+/// scope is the first `offset + limit` rows alice may read, in the page's order. Most
+/// rows are bob's on half the seeds, so the rows alice may read sit past the window's
+/// first walk.
+#[test]
+fn windowed_page_scope_matches_the_model_under_random_writes() {
+    use crate::sync_manager::ClientId;
+    use std::collections::{BTreeMap, HashSet};
+
+    for seed in [1u64, 7, 42, 1337, 9001, 65_537, 3, 11, 101, 4096] {
+        let mut rng = PagePrng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let desc = rng.below(2) == 0;
+        let offset = rng.below(4);
+        let limit = 1 + rng.below(10);
+        let bob_share = if seed % 2 == 0 { 50 } else { 90 };
+
+        let (mut server_qm, mut storage) =
+            server_with_authorization(owned_window_messages_schema());
+
+        declare_indexes(&mut server_qm, &mut storage, wmsgs_index_declarations());
+        let chat = ObjectId::new();
+        let other = ObjectId::new();
+        // id -> (chat, at, dead, owner)
+        let mut rows: BTreeMap<ObjectId, (ObjectId, u64, bool, &'static str)> = BTreeMap::new();
+        let write = |server_qm: &mut QueryManager,
+                     storage: &mut CountingCatalogueUpsertsStorage,
+                     rows: &mut BTreeMap<ObjectId, (ObjectId, u64, bool, &'static str)>,
+                     id: Option<ObjectId>,
+                     row: (ObjectId, u64, bool, &'static str)| {
+            let values = window_message_values(row.0, row.1, row.2, row.3);
+            let id = match id {
+                Some(id) => {
+                    server_qm
+                        .update(storage, id, &values)
+                        .expect("update message");
+                    id
+                }
+                None => {
+                    server_qm
+                        .insert(storage, "wmsgs", &values)
+                        .expect("insert message")
+                        .row_id
+                }
+            };
+            rows.insert(id, row);
+        };
+        for _ in 0..(120 + rng.below(120)) {
+            let owner = if rng.below(100) < bob_share {
+                "bob"
+            } else {
+                "alice"
+            };
+            let owner_chat = if rng.below(5) == 0 { other } else { chat };
+            // Ties: groups of rows share an `at`.
+            let at = (rng.below(80) * 10) as u64;
+            let dead = rng.below(6) == 0;
+            write(
+                &mut server_qm,
+                &mut storage,
+                &mut rows,
+                None,
+                (owner_chat, at, dead, owner),
+            );
+        }
+        server_qm.process(&mut storage);
+
+        let client_id = ClientId::new();
+        connect_client(&mut server_qm, &storage, client_id);
+        let _ = server_qm.sync_manager_mut().take_outbox();
+        let query = window_page_query(&server_qm, chat, desc, offset, limit);
+        subscribe_query_as(&mut server_qm, &mut storage, client_id, "alice", query);
+
+        let model = |rows: &BTreeMap<ObjectId, (ObjectId, u64, bool, &'static str)>| {
+            let mut readable: Vec<(u64, ObjectId)> = rows
+                .iter()
+                .filter(|(_, (row_chat, _, dead, owner))| {
+                    *row_chat == chat && !dead && *owner == "alice"
+                })
+                .map(|(id, (_, at, _, _))| (*at, *id))
+                .collect();
+            readable.sort_by(|left, right| {
+                let by_at = if desc {
+                    right.0.cmp(&left.0)
+                } else {
+                    left.0.cmp(&right.0)
+                };
+                by_at.then(left.1.cmp(&right.1))
+            });
+            readable
+                .into_iter()
+                .take(offset + limit)
+                .map(|(_, id)| id)
+                .collect::<HashSet<ObjectId>>()
+        };
+
+        for step in 0..120 {
+            let scope = server_page_scope(&server_qm);
+            let want = model(&rows);
+            assert_eq!(
+                scope,
+                want,
+                "seed {seed} (desc {desc}, offset {offset}, limit {limit}), step {step}: \
+                 missing {:?}, unexpected {:?}",
+                want.difference(&scope).collect::<Vec<_>>(),
+                scope.difference(&want).collect::<Vec<_>>(),
+            );
+
+            let ids: Vec<ObjectId> = rows.keys().copied().collect();
+            let roll = rng.below(100);
+            if roll < 30 || ids.is_empty() {
+                let owner = if rng.below(100) < bob_share {
+                    "bob"
+                } else {
+                    "alice"
+                };
+                let at = (rng.below(90) * 10) as u64;
+                write(
+                    &mut server_qm,
+                    &mut storage,
+                    &mut rows,
+                    None,
+                    (chat, at, false, owner),
+                );
+            } else {
+                let id = ids[rng.below(ids.len())];
+                let mut row = rows[&id];
+                if roll < 65 {
+                    row.3 = if row.3 == "alice" { "bob" } else { "alice" };
+                } else {
+                    row.2 = !row.2;
+                }
+                write(&mut server_qm, &mut storage, &mut rows, Some(id), row);
+            }
+            server_qm.process(&mut storage);
+            let outbox = server_qm.sync_manager_mut().take_outbox();
+            confirm_delivered(&mut server_qm, &outbox);
+        }
+    }
+}

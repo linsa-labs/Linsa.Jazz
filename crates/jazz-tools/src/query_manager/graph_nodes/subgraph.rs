@@ -5,6 +5,7 @@
 //! a SubgraphInstance with its own state.
 
 use crate::query_manager::graph::QueryGraph;
+use crate::query_manager::index_declarations::IndexDeclarations;
 use crate::query_manager::query::{Query, QueryBuilder};
 use crate::query_manager::session::Session;
 use crate::query_manager::types::{RowDescriptor, RowPolicyMode, Schema, Value};
@@ -35,6 +36,10 @@ pub struct SubgraphTemplate {
     session: Option<Session>,
     /// Policy mode inherited from the parent graph compile.
     row_policy_mode: RowPolicyMode,
+    /// Declared indexes inherited from the parent graph compile. Not in
+    /// `semantic_fingerprint`: they choose how an instance reads its rows, never
+    /// which rows it computes.
+    declarations: Arc<IndexDeclarations>,
 }
 
 impl SubgraphTemplate {
@@ -45,6 +50,7 @@ impl SubgraphTemplate {
     /// * `inner_column` - Column in the inner table to match against outer value
     /// * `select_columns` - Columns to include in results (empty = all)
     /// * `output_descriptor` - Descriptor for result rows
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_query: Query,
         inner_column: String,
@@ -53,6 +59,7 @@ impl SubgraphTemplate {
         schema_context: Arc<SchemaContext>,
         session: Option<Session>,
         row_policy_mode: RowPolicyMode,
+        declarations: Arc<IndexDeclarations>,
     ) -> Self {
         Self {
             base_query,
@@ -62,6 +69,7 @@ impl SubgraphTemplate {
             schema_context,
             session,
             row_policy_mode,
+            declarations,
         }
     }
 
@@ -181,6 +189,7 @@ impl SubgraphTemplate {
             self.session.clone(),
             &self.schema_context,
             self.row_policy_mode,
+            &self.declarations,
         )
         .ok()?;
 
@@ -435,6 +444,7 @@ impl SubgraphBuilder {
             Arc::new(SchemaContext::with_defaults(schema.clone(), "main")),
             self.session,
             self.row_policy_mode,
+            Arc::new(IndexDeclarations::empty()),
         ))
     }
 }
@@ -701,6 +711,7 @@ mod tests {
             Arc::new(schema_context),
             None,
             RowPolicyMode::PermissiveLocal,
+            Arc::new(IndexDeclarations::empty()),
         );
 
         let instance = template
@@ -757,6 +768,7 @@ mod tests {
                 Arc::new(SchemaContext::with_defaults(schema.clone(), "main")),
                 None,
                 RowPolicyMode::PermissiveLocal,
+                Arc::new(IndexDeclarations::empty()),
             )
         };
 

@@ -1224,10 +1224,13 @@ impl QueryManager {
 
         self.persist_row_locator(storage, object_id, &table_write.row_locator);
 
+        // Owned: the mutations borrow it across the `&mut self` write below.
+        let declarations = Arc::clone(&self.written_index_declarations);
         let index_mutations = if Self::write_context_is_open_batch(write_context) {
             Vec::new()
         } else {
             Self::index_mutations_for_insert_on_branch_with_layout(
+                &declarations,
                 table,
                 branch,
                 object_id,
@@ -1943,10 +1946,13 @@ impl QueryManager {
             .as_ref()
             .map(QueryRowBatch::is_soft_deleted)
             .unwrap_or_else(|| self.row_is_deleted_on_branch(storage, table, branch, id));
+        // Owned: the mutations borrow it across the `&mut self` write below.
+        let declarations = Arc::clone(&self.written_index_declarations);
         let index_mutations = if Self::write_context_is_open_batch(write_context) {
             Vec::new()
         } else if was_soft_deleted {
             Self::index_mutations_for_restore_on_branch(
+                &declarations,
                 table,
                 branch,
                 id,
@@ -1956,6 +1962,7 @@ impl QueryManager {
             )
         } else if let Some(old_branch_data) = existing_branch_data.as_deref() {
             Self::index_mutations_for_update_on_branch(
+                &declarations,
                 table,
                 branch,
                 id,
@@ -1966,6 +1973,7 @@ impl QueryManager {
             )
         } else {
             Self::index_mutations_for_insert_on_branch_with_layout(
+                &declarations,
                 table,
                 branch,
                 id,
@@ -2195,10 +2203,13 @@ impl QueryManager {
             old_data_for_policy.to_vec(),
             self.row_batch_authoring(&delete_provenance, Some(DeleteKind::Soft), write_context),
         );
+        // Owned: the mutations borrow it across the `&mut self` write below.
+        let declarations = Arc::clone(&self.written_index_declarations);
         let index_mutations = if Self::write_context_is_open_batch(write_context) {
             Vec::new()
         } else {
             Self::index_mutations_for_soft_delete_on_branch(
+                &declarations,
                 table,
                 branch,
                 id,
@@ -2333,10 +2344,13 @@ impl QueryManager {
             new_data.clone(),
             self.row_batch_authoring(&row_provenance, None, write_context),
         );
+        // Owned: the mutations borrow it across the `&mut self` write below.
+        let declarations = Arc::clone(&self.written_index_declarations);
         let index_mutations = if Self::write_context_is_open_batch(write_context) {
             Vec::new()
         } else {
             Self::index_mutations_for_restore_on_branch(
+                &declarations,
                 table,
                 branch,
                 id,
@@ -2438,7 +2452,10 @@ impl QueryManager {
             vec![],
             self.row_batch_authoring(&delete_provenance, Some(DeleteKind::Hard), None),
         );
+        // Owned: the mutations borrow it across the `&mut self` write below.
+        let declarations = Arc::clone(&self.written_index_declarations);
         let index_mutations = Self::index_mutations_for_hard_delete_on_branch(
+            &declarations,
             &table,
             branch.as_str(),
             id,

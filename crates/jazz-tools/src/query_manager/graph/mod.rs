@@ -16,7 +16,6 @@ use crate::object::{BranchName, ObjectId};
 use crate::query_manager::query::ArraySubquerySpec;
 use crate::query_manager::types::{Row, RowDelta, RowDescriptor, TableName, Tuple, TupleDelta};
 
-use super::graph_nodes::NodeId;
 use super::graph_nodes::alias::AliasNode;
 use super::graph_nodes::array_subquery::ArraySubqueryNode;
 use super::graph_nodes::exists_output::ExistsOutputNode;
@@ -33,6 +32,7 @@ use super::graph_nodes::recursive_relation::RecursiveRelationNode;
 use super::graph_nodes::select_element::SelectElementNode;
 use super::graph_nodes::sort::SortNode;
 use super::graph_nodes::union::UnionNode;
+use super::graph_nodes::{NodeId, RowNode};
 use super::types::{ColumnName, TupleProvenance};
 
 pub mod compile;
@@ -81,6 +81,19 @@ pub enum GraphNode {
     ExistsOutput(ExistsOutputNode),
 }
 
+/// Which rows of a paginated query get their includes built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludePlacement {
+    /// Only the page's rows, when the plan allows it: the includes are attached past
+    /// the LimitOffset.
+    PageRows,
+    /// Every row the query's filters match: the includes are attached ahead of the
+    /// LimitOffset. Needed when the sync scope can take rows past the page — a server
+    /// graph compiled without the policy filter walks over rows the authorization
+    /// schema denies to fill its prefix, and those rows need their includes too.
+    MatchingRows,
+}
+
 /// Compact node with inline edge storage.
 /// Most nodes have 0-2 inputs/outputs, so inline storage avoids heap allocation.
 #[derive(Debug)]
@@ -103,6 +116,15 @@ pub struct QueryGraph {
     pub output_node: NodeId,
     /// The pagination node, when the query applies limit/offset.
     pub(super) pagination_node: Option<NodeId>,
+    /// The last include node of a page whose includes are built past the pagination
+    /// node (for the page's rows only). Its current tuples carry the includes'
+    /// provenance for the page's rows; the rows ahead of the page carry none.
+    pub(super) deferred_arrays_tail: Option<NodeId>,
+    /// Ordered-window index scans (`IndexScanNode::new_window`), grown after a settle
+    /// that leaves the page short of its rows.
+    pub(super) window_scans: Vec<NodeId>,
+    /// The ordered node the windows feed, whose prefix the page takes.
+    pub(super) window_sort: Option<NodeId>,
     /// Table this query operates on.
     pub table: TableName,
     /// Index scan nodes for this query (for marking dirty on updates).
@@ -135,6 +157,9 @@ impl QueryGraph {
             dirty_bitmap: BitVec::new(),
             output_node: NodeId(0),
             pagination_node: None,
+            deferred_arrays_tail: None,
+            window_scans: Vec::new(),
+            window_sort: None,
             table,
             index_scan_nodes: Vec::new(),
             array_subquery_tables: Vec::new(),
@@ -228,19 +253,56 @@ impl QueryGraph {
         if let Some(node_id) = self.pagination_node
             && let Some(GraphNode::LimitOffset(limit_offset)) = self.get_node(node_id)
         {
-            return limit_offset.sync_input_tuples().to_vec();
+            return limit_offset
+                .sync_input_tuples()
+                .iter()
+                .map(|tuple| self.with_deferred_includes(tuple))
+                .collect();
         }
 
         self.current_output_tuples()
     }
 
+    /// A pagination-prefix tuple as the client must receive it: when the page's
+    /// includes are built past the pagination node, a row of the page is taken from the
+    /// last include node, carrying the provenance of its included rows; rows ahead of
+    /// the page (the offset) have no includes and stay as they are.
+    fn deferred_includes_cover(&self, tuple: &Tuple) -> bool {
+        self.deferred_arrays_tail
+            .and_then(|tail| match self.get_node(tail) {
+                Some(GraphNode::ArraySubquery(node)) => Some(node),
+                _ => None,
+            })
+            .is_some_and(|node| RowNode::current_tuples(node).contains(tuple))
+    }
+
+    fn with_deferred_includes(&self, tuple: &Tuple) -> Tuple {
+        if let Some(tail) = self.deferred_arrays_tail
+            && let Some(GraphNode::ArraySubquery(node)) = self.get_node(tail)
+            && let Some(full) = RowNode::current_tuples(node).get(tuple)
+        {
+            return full.clone();
+        }
+        tuple.clone()
+    }
+
     /// Returns sync-scope tuples after applying a caller-provided visibility
     /// filter. For paginated queries, filtering must happen before selecting the
     /// ordered prefix so denied rows do not count toward offset/limit replay.
+    ///
+    /// The flag is set when a row of the page lies past the rows whose includes were
+    /// built — the page's includes are built past the pagination node and rows ahead
+    /// of it were denied, so the page runs beyond the graph's own window. Such a row is
+    /// returned without its included rows; the caller must build the includes for
+    /// every matching row instead (`IncludePlacement::MatchingRows`).
+    ///
+    /// The position is that of the prefix's last tuple in the ordered input when the
+    /// prefix filled the page, `None` when the input ran out first. A window that stops
+    /// short of it (`grow_windows_short_of`) may hold back readable rows the page needs.
     pub fn filtered_sync_scope_tuples(
         &self,
         mut tuple_is_visible: impl FnMut(&Tuple) -> bool,
-    ) -> Vec<Tuple> {
+    ) -> (Vec<Tuple>, bool, Option<usize>) {
         if let Some(node_id) = self.pagination_node
             && let Some(GraphNode::LimitOffset(limit_offset)) = self.get_node(node_id)
         {
@@ -252,20 +314,39 @@ impl QueryGraph {
                     _ => None,
                 })
                 .unwrap_or_else(|| limit_offset.sync_input_tuples());
-            let visible_ordered_tuples: Vec<_> = ordered_input
-                .iter()
-                .filter(|tuple| tuple_is_visible(tuple))
-                .cloned()
-                .collect();
-            return limit_offset
-                .filtered_sync_input_tuples(&visible_ordered_tuples)
-                .to_vec();
+            // Only the first `offset + limit` visible tuples make the prefix, so the
+            // visibility check stops once it has them. Checking the rest of the ordered
+            // input — every row the query's filters match, not just the page — costs a
+            // row load and a policy evaluation per row on every settle, which made one
+            // write into a large table cost O(matching rows) per live page subscription.
+            let cap = limit_offset.sync_prefix_cap();
+            let mut visible_prefix = Vec::new();
+            let mut includes_past_page = false;
+            let mut filled_at = None;
+            for (position, tuple) in ordered_input.iter().enumerate() {
+                if cap.is_some_and(|cap| visible_prefix.len() >= cap) {
+                    break;
+                }
+                let tuple = self.with_deferred_includes(tuple);
+                if tuple_is_visible(&tuple) {
+                    includes_past_page |= self.deferred_arrays_tail.is_some()
+                        && visible_prefix.len() >= limit_offset.offset()
+                        && !self.deferred_includes_cover(&tuple);
+                    visible_prefix.push(tuple);
+                    if cap.is_some_and(|cap| visible_prefix.len() == cap) {
+                        filled_at = Some(position);
+                    }
+                }
+            }
+            return (visible_prefix, includes_past_page, filled_at);
         }
 
-        self.current_output_tuples()
+        let tuples = self
+            .current_output_tuples()
             .into_iter()
             .filter(|tuple| tuple_is_visible(tuple))
-            .collect()
+            .collect();
+        (tuples, false, None)
     }
 
     fn scope_from_tuples(&self, tuples: &[Tuple]) -> HashSet<(ObjectId, BranchName)> {

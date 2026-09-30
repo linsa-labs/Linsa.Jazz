@@ -1558,3 +1558,245 @@ fn a_visible_write_aimed_by_a_stale_locator_moves_the_head_instead_of_forking_it
         "the authoritative locator must name it too"
     );
 }
+
+/// `wmsgs` in two generations (B adds a table, so the family differs while the row's
+/// bytes stay comparable). The store declares its `chat+at` composite and `chat>body`
+/// trigram indexes (`split_window_messages_store`).
+fn window_messages_generations() -> (
+    crate::query_manager::types::Schema,
+    crate::query_manager::types::Schema,
+) {
+    let wmsgs = || {
+        TableSchema::builder("wmsgs")
+            .column("chat", ColumnType::Uuid)
+            .column("at", ColumnType::Timestamp)
+            .column("dead", ColumnType::Boolean)
+            .column("body", ColumnType::Text)
+    };
+    (
+        SchemaBuilder::new().table(wmsgs()).build(),
+        SchemaBuilder::new()
+            .table(wmsgs())
+            .table(TableSchema::builder("tags").column("label", ColumnType::Text))
+            .build(),
+    )
+}
+
+/// A store where one `wmsgs` row has a head in both generations — the stale one at
+/// `at = 10` saying "alpha", the live one at `at = 20` saying "alpine", in the same
+/// chat — with both heads' declared-index entries filed the way the write path files
+/// them.
+fn split_window_messages_store() -> (SqliteStorage, ObjectId, ObjectId, SchemaHash, SchemaHash) {
+    let mut io = split_capable_storage();
+    let (schema_a, schema_b) = window_messages_generations();
+    crate::test_support::persist_test_schema(&mut io, &schema_a);
+    crate::test_support::persist_test_schema(&mut io, &schema_b);
+    let (hash_a, hash_b) = (
+        SchemaHash::compute(&schema_a),
+        SchemaHash::compute(&schema_b),
+    );
+
+    // The store maintains them, so the repair paths retire their entries.
+    let declarations = crate::query_manager::index_declarations::IndexDeclarations::empty()
+        .with_composite("wmsgs", "chat", "at")
+        .and_then(|declarations| declarations.with_trigram("wmsgs", "chat", "body"))
+        .expect("declarations");
+    crate::query_manager::declared_index::propose(&mut io, &declarations)
+        .expect("declare the indexes");
+
+    let row_id = ObjectId::new();
+    let chat = ObjectId::new();
+    let key = format!("main:{}", row_id.uuid().simple());
+    for (schema, hash, at, body) in [
+        (&schema_a, hash_a, 10, "alpha"),
+        (&schema_b, hash_b, 20, "alpine"),
+    ] {
+        let columns = &schema[&"wmsgs".into()].columns;
+        let bytes = crate::query_manager::encoding::encode_row(
+            columns,
+            &[
+                Value::Uuid(chat),
+                Value::Timestamp(at),
+                Value::Boolean(false),
+                Value::Text(body.to_string()),
+            ],
+        )
+        .expect("wmsgs row should encode");
+        // The family's header, so the store enumerates it as a family holding the row.
+        let family = crate::storage::RowRawTableId::new(
+            crate::storage::RowRawTableKind::Visible,
+            "wmsgs",
+            hash,
+        );
+        io.upsert_raw_table_header(
+            family.raw_table_name(),
+            &crate::storage::RawTableHeader::row_raw_table(
+                crate::storage::RowRawTableKind::Visible,
+                "wmsgs",
+                hash,
+                columns,
+            ),
+        )
+        .expect("family header write");
+        io.raw_table_put(family.raw_table_name(), &key, &bytes)
+            .expect("head write");
+        let mut mutations = Vec::new();
+        crate::query_manager::declared_index::push_mutations(
+            &mut mutations,
+            &declarations,
+            "wmsgs",
+            "main",
+            row_id,
+            columns,
+            None,
+            Some(&bytes),
+        );
+        io.apply_index_mutations(&mutations)
+            .expect("declared entries");
+    }
+    (io, row_id, chat, hash_a, hash_b)
+}
+
+fn window_entry_holds(io: &SqliteStorage, row_id: ObjectId, chat: ObjectId, at: u64) -> bool {
+    let value = crate::query_manager::composite_index::composite_value(
+        &Value::Uuid(chat),
+        &Value::Timestamp(at),
+    )
+    .expect("a composite value");
+    io.index_lookup("wmsgs", "chat+at", "main", &value)
+        .contains(&row_id)
+}
+
+fn trigram_entry_holds(
+    io: &SqliteStorage,
+    row_id: ObjectId,
+    chat: ObjectId,
+    trigram: &str,
+) -> bool {
+    let value = crate::query_manager::trigram_index::entry_value(&Value::Uuid(chat), trigram)
+        .expect("a trigram entry value");
+    io.index_lookup("wmsgs", "chat>body", "main", &value)
+        .contains(&row_id)
+}
+
+/// Declared-index entries follow a dropped head out, as column entries do: a window
+/// over the stale `at` or a search for the stale text would otherwise return the row
+/// for values it no longer holds — and when the window covers the whole predicate, no
+/// filter re-reads the row to catch it. What both heads justify stays.
+#[test]
+fn a_moved_head_retires_its_declared_index_entries_and_only_its_own() {
+    let (mut io, row_id, chat, hash_a, hash_b) = split_window_messages_store();
+    assert!(
+        window_entry_holds(&io, row_id, chat, 10) && trigram_entry_holds(&io, row_id, chat, "pha"),
+        "the stale head's entries must be filed before the head move, or the gate proves nothing"
+    );
+
+    crate::storage::drop_stale_visible_row_family_entry(
+        &mut io,
+        "wmsgs",
+        "main",
+        row_id,
+        hash_a,
+        Some(hash_b),
+    )
+    .expect("the head move should succeed");
+
+    assert!(
+        !window_entry_holds(&io, row_id, chat, 10),
+        "the dropped head's window entry (at = 10) must be retired"
+    );
+    assert!(
+        !trigram_entry_holds(&io, row_id, chat, "pha"),
+        "the dropped head's trigram \"pha\" must be retired"
+    );
+    assert!(
+        window_entry_holds(&io, row_id, chat, 20),
+        "the surviving head's window entry must remain"
+    );
+    for trigram in ["alp", "ine"] {
+        assert!(
+            trigram_entry_holds(&io, row_id, chat, trigram),
+            "the surviving head's trigram {trigram:?} must remain"
+        );
+    }
+}
+
+/// Deleting a row that is still split retires every head's declared-index entries,
+/// not only those of the version the delete read.
+#[test]
+fn deleting_a_split_row_retires_every_heads_declared_index_entries() {
+    let (mut io, row_id, chat, _, _) = split_window_messages_store();
+
+    crate::storage::retire_index_entries_for_extra_visible_heads(&mut io, "wmsgs", "main", row_id)
+        .expect("the retirement should succeed");
+
+    for at in [10, 20] {
+        assert!(
+            !window_entry_holds(&io, row_id, chat, at),
+            "the window entry at = {at} outlived the delete"
+        );
+    }
+    for trigram in ["alp", "pha", "ine"] {
+        assert!(
+            !trigram_entry_holds(&io, row_id, chat, trigram),
+            "the trigram {trigram:?} outlived the delete"
+        );
+    }
+}
+
+/// A store whose declared-index record cannot be decoded trusts none of its declared
+/// indexes, and nothing rewrites the record. A repair of a split row then retires the
+/// dropped head's column entries alone, rather than failing, and with it the write
+/// that moved the head or the delete.
+#[test]
+fn an_unreadable_index_record_does_not_block_a_split_rows_repair() {
+    // The split store, its heads' `at` column entries filed, its record garbled.
+    let unreadable_split_store = || {
+        let (mut io, row_id, _, hash_a, hash_b) = split_window_messages_store();
+        for at in [10, 20] {
+            io.index_insert("wmsgs", "at", "main", &Value::Timestamp(at), row_id)
+                .expect("column entry");
+        }
+        io.raw_table_put("declared_indexes", "record", &[0xff])
+            .expect("garble the record");
+        assert!(
+            crate::query_manager::declared_index::load_record(&io).is_err(),
+            "the record must be unreadable, or the gate proves nothing"
+        );
+        (io, row_id, hash_a, hash_b)
+    };
+    let at_holds = |io: &SqliteStorage, row_id: ObjectId, at: u64| {
+        io.index_lookup("wmsgs", "at", "main", &Value::Timestamp(at))
+            .contains(&row_id)
+    };
+
+    let (mut io, row_id, hash_a, hash_b) = unreadable_split_store();
+
+    crate::storage::drop_stale_visible_row_family_entry(
+        &mut io,
+        "wmsgs",
+        "main",
+        row_id,
+        hash_a,
+        Some(hash_b),
+    )
+    .expect("the head move should succeed");
+    assert!(
+        !at_holds(&io, row_id, 10),
+        "the dropped head's column entry (at = 10) must be retired"
+    );
+    assert!(
+        at_holds(&io, row_id, 20),
+        "the surviving head's column entry must remain"
+    );
+
+    let (mut io, row_id, _, _) = unreadable_split_store();
+    crate::storage::retire_index_entries_for_extra_visible_heads(&mut io, "wmsgs", "main", row_id)
+        .expect("the retirement should succeed");
+    for at in [10, 20] {
+        assert!(
+            !at_holds(&io, row_id, at),
+            "the column entry at = {at} outlived the delete"
+        );
+    }
+}

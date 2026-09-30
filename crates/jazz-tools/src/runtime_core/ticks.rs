@@ -735,6 +735,13 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         //    compile on first pass (schema wasn't available yet, e.g. catalogue
         //    was just processed and made the schema available).
         self.schema_manager.process(&mut self.storage);
+        if self
+            .schema_manager
+            .query_manager_mut()
+            .take_declared_index_writes()
+        {
+            self.mark_storage_write_pending_flush();
+        }
 
         // 2b. Release QuerySettled notifications whose upstream stream watermark
         // has definitely been applied.
@@ -925,9 +932,15 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             }
         }
 
-        // 4. Schedule batched_tick if outbound messages exist or a WAL flush
-        // barrier is pending.
-        if self.has_outbound() || self.storage_write_pending_flush {
+        // 4. Schedule batched_tick if outbound messages exist, a WAL flush
+        // barrier is pending, or declared-index work is left for more passes.
+        if self.has_outbound()
+            || self.storage_write_pending_flush
+            || self
+                .schema_manager
+                .query_manager()
+                .has_declared_index_work()
+        {
             self.scheduler.schedule_batched_tick();
         }
 
@@ -947,6 +960,19 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         let _span = debug_span!("batched_tick", tier = self.tier_label).entered();
 
         self.handle_transport_messages();
+
+        // Declared-index work (`declared_index::advance`) takes one step per batched
+        // tick, so a large fill never holds the runtime for more than a page at a time.
+        let declared_index_work = self
+            .schema_manager
+            .query_manager()
+            .has_declared_index_work();
+        if declared_index_work {
+            self.schema_manager
+                .query_manager_mut()
+                .grant_declared_index_step();
+            self.immediate_tick();
+        }
 
         if !self.has_outbound()
             && self
@@ -1009,6 +1035,15 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         // same loss the confirmation exists to prevent, from the other side.
         if !barrier_failed {
             self.confirm_applied_rows_upstream();
+        }
+
+        if declared_index_work
+            && self
+                .schema_manager
+                .query_manager()
+                .has_declared_index_work()
+        {
+            self.scheduler.schedule_batched_tick();
         }
     }
 

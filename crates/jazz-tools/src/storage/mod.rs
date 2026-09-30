@@ -172,7 +172,13 @@ const VISIBLE_FAMILY_SWEEP_TABLE: &str = "__visible_family_sweep";
 const BRANCH_ORD_NEXT_ORD_KEY: &str = "next_ord";
 pub(crate) const STORE_MANIFEST_KEY: &str = "__jazz_store_manifest";
 const STORE_MANIFEST_MAGIC: &[u8; 10] = b"JAZZSTORE1";
-const STORE_FORMAT_V3: i32 = 3;
+pub(crate) const STORE_FORMAT_V3: i32 = 3;
+/// A store that maintains declared indexes (`query_manager::declared_index`): format 3
+/// plus their entries and the record of what is maintained. Engines that do not
+/// maintain them accept exactly 3, so they refuse to open such a store instead of
+/// writing rows without the entries its complete indexes promise. A store goes back to
+/// 3 once it maintains none.
+pub(crate) const STORE_FORMAT_V4_DECLARED_INDEXES: i32 = 4;
 const ROW_STORAGE_FORMAT_V3: i32 = 3;
 const ROW_LOCATOR_STORAGE_FORMAT_V1: i32 = 1;
 const EXACT_ROW_TABLE_LOCATOR_STORAGE_FORMAT_V1: i32 = 1;
@@ -281,7 +287,13 @@ pub(crate) fn validate_store_manifest(
             expected.store_kind, actual.store_kind
         )));
     }
-    if actual.store_format_version != expected.store_format_version {
+    // Both formats this engine writes open; which one a store is in follows what it
+    // maintains (`query_manager::declared_index`), not the engine.
+    let accepted = [STORE_FORMAT_V3, STORE_FORMAT_V4_DECLARED_INDEXES];
+    if actual.store_format_version != expected.store_format_version
+        && !(accepted.contains(&expected.store_format_version)
+            && accepted.contains(&actual.store_format_version))
+    {
         return Err(StorageError::IoError(format!(
             "store manifest version mismatch for {}: expected {}, got {}",
             expected.store_kind, expected.store_format_version, actual.store_format_version
@@ -1585,7 +1597,13 @@ pub(crate) fn visible_row_raw_tables_holding<H: Storage + ?Sized>(
 /// not consulting the list makes this correct even when `indexed_columns` has
 /// changed since the row was written — which, on a repair path for rows written
 /// under a previous schema generation, is the normal case.
+///
+/// The row's entries in the declared indexes the store maintains
+/// (`query_manager::declared_index::row_entries`) come with them: a composite window or
+/// a trigram search trusts its entries as a single-column scan does.
 fn column_index_entries_for_row_bytes(
+    declarations: &crate::query_manager::index_declarations::IndexDeclarations,
+    table: &str,
     descriptor: &RowDescriptor,
     data: &[u8],
 ) -> Vec<(ColumnName, Value)> {
@@ -1613,6 +1631,11 @@ fn column_index_entries_for_row_bytes(
             }
         }
         entries.push((column.name, value));
+    }
+    for (index, bytes) in
+        crate::query_manager::declared_index::row_entries(declarations, table, descriptor, data)
+    {
+        entries.push((ColumnName::new(index), Value::Bytea(bytes)));
     }
     entries
 }
@@ -1722,9 +1745,13 @@ fn retire_index_entries_for_dropped_visible_head<H: Storage + ?Sized>(
     dropped: (&RowDescriptor, &[u8]),
     surviving: Option<(&RowDescriptor, &[u8])>,
 ) -> Result<usize, StorageError> {
-    let dropped_entries = column_index_entries_for_row_bytes(dropped.0, dropped.1);
+    let declarations = crate::query_manager::declared_index::repair_declarations(storage)?;
+    let dropped_entries =
+        column_index_entries_for_row_bytes(&declarations, table, dropped.0, dropped.1);
     let surviving_entries = surviving
-        .map(|(descriptor, bytes)| column_index_entries_for_row_bytes(descriptor, bytes))
+        .map(|(descriptor, bytes)| {
+            column_index_entries_for_row_bytes(&declarations, table, descriptor, bytes)
+        })
         .unwrap_or_default();
 
     let mut retired = 0usize;
@@ -1779,6 +1806,7 @@ pub(crate) fn retire_index_entries_for_extra_visible_heads<H: Storage + ?Sized>(
     if holders.len() < 2 {
         return Ok(());
     }
+    let declarations = crate::query_manager::declared_index::repair_declarations(storage)?;
     let key = key_codec::visible_row_raw_table_key(branch, row_id);
     for schema_hash in holders {
         let raw_table = visible_row_raw_table_id(table, schema_hash);
@@ -1789,7 +1817,9 @@ pub(crate) fn retire_index_entries_for_extra_visible_heads<H: Storage + ?Sized>(
         else {
             continue;
         };
-        for (column, value) in column_index_entries_for_row_bytes(descriptor.as_ref(), &bytes) {
+        for (column, value) in
+            column_index_entries_for_row_bytes(&declarations, table, descriptor.as_ref(), &bytes)
+        {
             remove_index_entry_including_signed_zero(
                 storage,
                 table,
@@ -2791,6 +2821,16 @@ fn catalogue_row_descriptors_for_table<H: Storage + ?Sized>(
         .expect("table catalogue descriptor cache poisoned")
         .insert(cache_key, candidates.clone());
     Ok(candidates)
+}
+
+/// The descriptor `row`'s bytes were written in.
+pub(crate) fn row_user_descriptor<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    row: &StoredRowBatch,
+) -> Result<Arc<RowDescriptor>, StorageError> {
+    required_history_user_descriptor_and_schema_hash_for_row(storage, table, row)
+        .map(|(_, descriptor)| descriptor)
 }
 
 fn required_history_user_descriptor_and_schema_hash_for_row<H: Storage + ?Sized>(

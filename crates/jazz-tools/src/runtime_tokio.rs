@@ -308,11 +308,17 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
             crate::query_manager::types::TableName,
             crate::query_manager::types::TablePolicies,
         >,
+        declared_indexes: Option<crate::query_manager::index_declarations::IndexDeclarations>,
         expected_parent_bundle_object_id: Option<ObjectId>,
     ) -> Result<Option<ObjectId>, RuntimeError> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
-        core.publish_permissions_bundle(schema_hash, permissions, expected_parent_bundle_object_id)
-            .map_err(|error| RuntimeError::WriteError(error.to_string()))
+        core.publish_permissions_bundle(
+            schema_hash,
+            permissions,
+            declared_indexes,
+            expected_parent_bundle_object_id,
+        )
+        .map_err(|error| RuntimeError::WriteError(error.to_string()))
     }
 
     pub fn current_permissions_head(&self) -> Result<Option<PermissionsHeadSummary>, RuntimeError> {

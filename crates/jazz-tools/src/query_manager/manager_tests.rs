@@ -126,6 +126,38 @@ fn get_branch(qm: &QueryManager) -> String {
     qm.schema_context().branch_name().as_str().to_string()
 }
 
+/// `wmsgs`'s declared indexes in the unit tests: the composite `chat+at` a page walks,
+/// and the trigram `chat>body` a search reads.
+fn wmsgs_index_declarations() -> crate::query_manager::index_declarations::IndexDeclarations {
+    crate::query_manager::index_declarations::IndexDeclarations::empty()
+        .with_composite("wmsgs", "chat", "at")
+        .expect("composite declaration")
+        .with_trigram("wmsgs", "chat", "body")
+        .expect("trigram declaration")
+}
+
+/// Declare `declarations` on the store, as an app's permissions head does, and process
+/// until the store has made them complete.
+fn declare_indexes<H: Storage>(
+    qm: &mut QueryManager,
+    storage: &mut H,
+    declarations: crate::query_manager::index_declarations::IndexDeclarations,
+) {
+    qm.propose_index_declarations(declarations);
+    qm.process(storage);
+    let mut passes = 1;
+    while qm.has_declared_index_work() {
+        assert!(passes < 10_000, "the declared indexes never completed");
+        qm.process(storage);
+        passes += 1;
+    }
+    let record = crate::query_manager::declared_index::load_record(storage).expect("record");
+    assert!(
+        !record.has_work() && !record.declarations.is_empty(),
+        "the declared indexes are complete: {record:?}"
+    );
+}
+
 struct CountingCatalogueUpsertsStorage {
     inner: MemoryStorage,
     catalogue_upserts: Cell<usize>,
@@ -286,6 +318,19 @@ impl Storage for CountingCatalogueUpsertsStorage {
         self.visible_query_loads
             .set(self.visible_query_loads.get() + 1);
         self.inner.load_visible_query_row(table, branch, row_id)
+    }
+
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        self.inner.raw_table_family_keys(name_prefix, after, limit)
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        self.inner.raw_table_family_last_key(name_prefix)
     }
 
     fn scan_visible_region(
@@ -1301,6 +1346,8 @@ mod branches;
 mod client_lifecycle;
 mod contributing_ids;
 mod crud_queries;
+mod declared_index_differential;
+mod declared_index_fill;
 mod deletes;
 mod delivery_confirmation_differential;
 mod e2e_sync;
@@ -1316,4 +1363,6 @@ mod server_subscriptions;
 mod stuck_local_updates;
 mod subscription_output_oracle;
 mod subscriptions;
+mod trigram_search;
 mod updates;
+mod window_scan;

@@ -230,8 +230,13 @@ impl FilterNode {
             Predicate::Contains { col_index, value } => {
                 match self.get_column_value(tuple, *col_index) {
                     Some(Value::Array(elements)) => elements.iter().any(|element| element == value),
+                    // Case-insensitive: both sides folded as a trigram index folds them
+                    // (`trigram_index::fold`), so an index-served search and a scan agree.
                     Some(Value::Text(text)) => match value {
-                        Value::Text(substr) => text.contains(substr),
+                        Value::Text(substr) => {
+                            use crate::query_manager::trigram_index::fold;
+                            fold(&text).contains(fold(substr).as_str())
+                        }
                         _ => false,
                     },
                     _ => false,

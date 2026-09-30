@@ -1,9 +1,12 @@
 pub mod authz_cache;
 pub mod bindings;
+pub(crate) mod composite_index;
+pub(crate) mod declared_index;
 pub mod encoding;
 pub mod graph;
 pub mod graph_nodes;
 pub mod index;
+pub mod index_declarations;
 pub mod indices;
 pub mod magic_columns;
 pub mod manager;
@@ -23,6 +26,7 @@ pub mod session;
 pub mod settle_cost;
 pub mod settlement_eval_cache;
 pub mod subscriptions;
+pub(crate) mod trigram_index;
 pub mod types;
 pub mod writes;
 

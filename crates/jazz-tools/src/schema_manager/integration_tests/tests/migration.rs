@@ -476,8 +476,14 @@ fn materialize_nodes_carry_concrete_table_name() {
     ctx.add_live_schema(v1.clone(), lens);
 
     let query = QueryBuilder::new("users").build();
-    let graph = QueryGraph::compile_with_schema_context(&query, &v2, None, &ctx)
-        .expect("query graph compile should succeed");
+    let graph = QueryGraph::compile_with_schema_context(
+        &query,
+        &v2,
+        None,
+        &ctx,
+        &std::sync::Arc::new(crate::query_manager::index_declarations::IndexDeclarations::empty()),
+    )
+    .expect("query graph compile should succeed");
 
     let mut materialize_count = 0;
     for compact in &graph.nodes {

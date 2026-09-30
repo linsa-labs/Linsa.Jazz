@@ -30,15 +30,27 @@ use super::super::graph_nodes::subgraph::SubgraphTemplate;
 use super::super::graph_nodes::union::UnionNode;
 use super::super::graph_nodes::{NodeId, RowNode};
 use super::super::index::ScanCondition;
+use super::super::index_declarations::IndexDeclarations;
 use super::super::magic_columns::{MagicColumnKind, magic_column_descriptor, magic_column_kind};
 use super::super::policy::PolicyExpr;
-use super::super::query::{ArraySubquerySpec, Condition, Conjunction, Query, QueryBuilder};
+use super::super::query::{
+    ArraySubqueryRequirement, ArraySubquerySpec, Condition, Conjunction, Query, QueryBuilder,
+};
 use super::super::relation_ir::{ProjectColumn, ProjectExpr, RelExpr};
 use super::super::relation_ir_query_plan::{ExecutionQueryPlan, lower_relation_to_execution_plan};
 use super::super::session::Session;
 use uuid::Uuid;
 
-use super::{CompactNode, GraphNode, QueryCompileError, QueryGraph, RelationCompileFeatures};
+use super::{
+    CompactNode, GraphNode, IncludePlacement, QueryCompileError, QueryGraph,
+    RelationCompileFeatures,
+};
+
+/// The declared indexes of the compile entries that have no store behind them — the
+/// query and relation-IR conveniences tests use: none, so their plans read none.
+fn no_declared_indexes() -> Arc<IndexDeclarations> {
+    Arc::new(IndexDeclarations::empty())
+}
 
 fn resolve_branch_schema_hash(schema_context: &SchemaContext, branch: &str) -> Option<SchemaHash> {
     let branch_name = BranchName::new(branch);
@@ -285,9 +297,22 @@ fn selected_output_descriptor(
 }
 
 impl QueryGraph {
-    pub(super) fn absorb_compiled_subgraph(&mut self, other: Self) -> Option<NodeId> {
+    pub(super) fn absorb_compiled_subgraph(&mut self, mut other: Self) -> Option<NodeId> {
         let offset = self.nodes.len() as u64;
         let remap = |id: NodeId| NodeId(id.0 + offset);
+
+        // A graph grows its windows against its own page only (`window_page`), and the
+        // absorbed graph's page is not this graph's: its windows could stop short with
+        // nothing to grow them, so they walk their whole range instead.
+        for window_id in &other.window_scans {
+            if let Some(GraphNode::IndexScan(scan)) = other
+                .nodes
+                .get_mut(window_id.0 as usize)
+                .map(|compact| &mut compact.node)
+            {
+                scan.walk_whole_window();
+            }
+        }
 
         for compact in other.nodes {
             self.nodes.push(CompactNode {
@@ -344,6 +369,7 @@ impl QueryGraph {
             None,
             &schema_context,
             RowPolicyMode::PermissiveLocal,
+            &no_declared_indexes(),
         )
         .ok()
     }
@@ -361,6 +387,7 @@ impl QueryGraph {
             None,
             &schema_context,
             RowPolicyMode::PermissiveLocal,
+            &no_declared_indexes(),
         )
     }
 
@@ -408,6 +435,7 @@ impl QueryGraph {
             &schema_context,
             features,
             row_policy_mode,
+            &no_declared_indexes(),
         )
     }
 
@@ -427,9 +455,11 @@ impl QueryGraph {
             schema_context,
             RelationCompileFeatures::default(),
             RowPolicyMode::PermissiveLocal,
+            &no_declared_indexes(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_relation_ir_with_schema_context_and_features(
         relation: &RelExpr,
         schema: &Schema,
@@ -438,6 +468,7 @@ impl QueryGraph {
         schema_context: &SchemaContext,
         features: RelationCompileFeatures,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         if let RelExpr::Union { inputs } = relation {
             return Self::compile_relation_ir_union_with_schema_context_and_features(
@@ -447,6 +478,7 @@ impl QueryGraph {
                 session,
                 schema_context,
                 row_policy_mode,
+                declarations,
             );
         }
         let plan = lower_relation_to_execution_plan(
@@ -464,6 +496,7 @@ impl QueryGraph {
             session,
             schema_context,
             row_policy_mode,
+            declarations,
         )
     }
 
@@ -474,6 +507,7 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         let mut compiled_inputs = inputs
             .iter()
@@ -486,6 +520,7 @@ impl QueryGraph {
                     schema_context,
                     RelationCompileFeatures::default(),
                     row_policy_mode,
+                    declarations,
                 )
             })
             .collect::<Option<Vec<_>>>()?;
@@ -539,6 +574,7 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         Self::compile_execution_plan_with_schema_context_shared(
             plan,
@@ -546,6 +582,8 @@ impl QueryGraph {
             session,
             &Arc::new(schema_context.clone()),
             row_policy_mode,
+            IncludePlacement::PageRows,
+            declarations,
         )
     }
 
@@ -555,6 +593,8 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
+        include_placement: IncludePlacement,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         // Settle-cost accounting: the innermost compile, so nested include
         // plans are counted individually.
@@ -592,6 +632,7 @@ impl QueryGraph {
                 session.clone(),
                 schema_context,
                 row_policy_mode,
+                declarations,
             );
         }
 
@@ -611,6 +652,24 @@ impl QueryGraph {
             .map(|disjunct| index_scan_plan(disjunct, table_schema))
             .collect();
 
+        // A disjunct whose own scan is empty (a contradiction, or a value no row can
+        // hold) matches nothing, and the Filter below is dropped as covered by that
+        // scan. A window or a search would read the chat in its place, unfiltered.
+        let matches_nothing = scan_plans
+            .iter()
+            .all(|scan_plan| matches!(scan_plan.condition, ScanCondition::Empty));
+        let trigram_plan = if matches_nothing {
+            None
+        } else {
+            trigram_scan_plan(plan, table_schema, declarations)
+        };
+        let window_plan = if matches_nothing || trigram_plan.is_some() {
+            None
+        } else {
+            window_scan_plan(plan, table_schema, declarations)
+        };
+        let mut window_scans: Vec<NodeId> = Vec::new();
+
         for branch in &branches {
             // Get schema hash for this branch to determine if column translation is needed
             let branch_schema_hash = branch_schema_map
@@ -622,6 +681,77 @@ impl QueryGraph {
             else {
                 continue;
             };
+
+            // A trigram search, on every branch whose rows name both columns as the
+            // current schema does.
+            if let Some(trigram_plan) = &trigram_plan {
+                let same_names = match branch_schema_hash {
+                    Some(hash) if hash != schema_context.current_hash => [
+                        trigram_plan.scope_name.as_str(),
+                        trigram_plan.text_name.as_str(),
+                    ]
+                    .iter()
+                    .all(|column| {
+                        translate_column_for_index(schema_context, table_str, column, &hash)
+                            .as_deref()
+                            == Some(*column)
+                    }),
+                    _ => true,
+                };
+                if same_names && let Some(trigram) = trigram_plan.scan() {
+                    let column = ColumnName::new(trigram_plan.index.as_str());
+                    let scan_node = IndexScanNode::new_trigram(
+                        scan_table_name,
+                        column,
+                        branch,
+                        trigram,
+                        descriptor.clone(),
+                    );
+                    let scan_id = graph.add_node(GraphNode::IndexScan(scan_node));
+                    graph
+                        .index_scan_nodes
+                        .push((scan_id, scan_table_name, column));
+                    phase1_outputs.push(scan_id);
+                    continue;
+                }
+            }
+
+            // An ordered window over the composite index, on every branch whose rows
+            // name both columns as the current schema does (the index entries are
+            // written under the row's own column names).
+            if let Some(window_plan) = &window_plan {
+                let same_names = match branch_schema_hash {
+                    Some(hash) if hash != schema_context.current_hash => [
+                        window_plan.first_name.as_str(),
+                        window_plan.second_name.as_str(),
+                    ]
+                    .iter()
+                    .all(|column| {
+                        translate_column_for_index(schema_context, table_str, column, &hash)
+                            .as_deref()
+                            == Some(*column)
+                    }),
+                    _ => true,
+                };
+                if same_names && let Some(window) = window_plan.window() {
+                    let column = ColumnName::new(window_plan.index.as_str());
+                    let scan_node = IndexScanNode::new_window(
+                        scan_table_name,
+                        column,
+                        branch,
+                        window,
+                        descriptor.clone(),
+                    );
+                    let scan_id = graph.add_node(GraphNode::IndexScan(scan_node));
+                    graph
+                        .index_scan_nodes
+                        .push((scan_id, scan_table_name, column));
+                    phase1_outputs.push(scan_id);
+                    window_scans.push(scan_id);
+                    continue;
+                }
+            }
+
             for scan_plan in &scan_plans {
                 let scan_column = &scan_plan.column;
 
@@ -736,40 +866,41 @@ impl QueryGraph {
             phase2_input = policy_id;
         }
 
-        // Array subqueries: insert ArraySubqueryNode for each array subquery
-        for subquery_spec in &plan.array_subqueries {
-            if let Some((node, new_descriptor)) = graph.compile_array_subquery(
-                subquery_spec,
-                &current_descriptor,
+        // A page builds its includes for the page only — past the LimitOffset — when
+        // nothing ahead of the limit can depend on them: every include is optional (a
+        // required one drops parent rows, so it is a filter and must run before the
+        // limit), and the remaining filter and the ordering read root columns only —
+        // and when the caller does not need includes past the page (see
+        // `IncludePlacement::MatchingRows`).
+        // Built ahead of the limit, an include instance exists for EVERY row the query's
+        // filters match, not just the page: a 40-row page over a 10k-message chat held
+        // 10k subgraphs, cost ~2 s to open and re-evaluated all of them on each write.
+        let defer_arrays = include_placement == IncludePlacement::PageRows
+            && (plan.limit.is_some() || plan.offset > 0)
+            && !plan.array_subqueries.is_empty()
+            && plan.recursive.is_none()
+            && plan
+                .array_subqueries
+                .iter()
+                .all(|spec| spec.requirement == ArraySubqueryRequirement::Optional)
+            && collect_magic_refs_from_disjuncts(&plan.disjuncts).is_empty()
+            && collect_magic_refs_from_order_by(&plan.order_by).is_empty()
+            && plan_reads_root_columns_only(&plan.disjuncts, &plan.order_by, &current_descriptor);
+
+        if !defer_arrays {
+            phase2_input = graph.attach_array_subqueries(
+                &plan.array_subqueries,
+                phase2_input,
+                plan.base_scope.as_str(),
+                &mut current_descriptor,
+                &mut current_tuple_descriptor,
                 schema,
                 &branches,
                 schema_context,
                 session.as_ref(),
                 row_policy_mode,
-            ) {
-                let node_id = graph.add_node(GraphNode::ArraySubquery(node));
-                graph.add_edge(node_id, phase2_input);
-                graph
-                    .array_subquery_tables
-                    .push((node_id, subquery_spec.table));
-                // Nested arrays live inside this node's inner subgraph, so
-                // their tables won't otherwise appear in the outer graph's
-                // dependency list — register them against this node so a
-                // mutation deep in the chain still drives re-evaluation.
-                let mut nested_stack: Vec<&ArraySubquerySpec> =
-                    subquery_spec.nested_arrays.iter().collect();
-                while let Some(nested) = nested_stack.pop() {
-                    graph.array_subquery_tables.push((node_id, nested.table));
-                    nested_stack.extend(nested.nested_arrays.iter());
-                }
-                phase2_input = node_id;
-                current_descriptor = new_descriptor;
-                current_tuple_descriptor = TupleDescriptor::single_with_materialization(
-                    plan.base_scope.as_str(),
-                    current_descriptor.clone(),
-                    true,
-                );
-            }
+                declarations,
+            );
         }
 
         let filter_magic_refs = collect_magic_refs_from_disjuncts(&plan.disjuncts);
@@ -848,6 +979,12 @@ impl QueryGraph {
             phase2_input = sort_id;
         }
 
+        // The windows grow against the ordered input of the page.
+        if !window_scans.is_empty() {
+            graph.window_scans = window_scans;
+            graph.window_sort = Some(phase2_input);
+        }
+
         // LimitOffset node (if limit or offset specified)
         if plan.limit.is_some() || plan.offset > 0 {
             let limit_offset_node = LimitOffsetNode::with_tuple_descriptor(
@@ -859,6 +996,26 @@ impl QueryGraph {
             graph.add_edge(limit_offset_id, phase2_input);
             graph.pagination_node = Some(limit_offset_id);
             phase2_input = limit_offset_id;
+        }
+
+        if defer_arrays {
+            let tail = graph.attach_array_subqueries(
+                &plan.array_subqueries,
+                phase2_input,
+                plan.base_scope.as_str(),
+                &mut current_descriptor,
+                &mut current_tuple_descriptor,
+                schema,
+                &branches,
+                schema_context,
+                session.as_ref(),
+                row_policy_mode,
+                declarations,
+            );
+            if tail != phase2_input {
+                graph.deferred_arrays_tail = Some(tail);
+            }
+            phase2_input = tail;
         }
 
         if !needs_magic_before_filter && !project_magic_refs.is_empty() {
@@ -922,6 +1079,7 @@ impl QueryGraph {
                 schema_context,
                 session.as_ref(),
                 row_policy_mode,
+                declarations,
             )
         {
             let node_id = graph.add_node(GraphNode::RecursiveRelation(node));
@@ -957,6 +1115,7 @@ impl QueryGraph {
         schema: &Schema,
         session: Option<Session>,
         schema_context: &SchemaContext,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         Self::try_compile_with_schema_context(
             query,
@@ -964,6 +1123,7 @@ impl QueryGraph {
             session,
             schema_context,
             RowPolicyMode::PermissiveLocal,
+            declarations,
         )
         .ok()
     }
@@ -977,6 +1137,7 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Result<Self, QueryCompileError> {
         // One-time promotion into shared handles; the per-instantiation hot path
         // (SubgraphTemplate::instantiate) calls the `_shared` variant directly so
@@ -987,6 +1148,7 @@ impl QueryGraph {
             session,
             &Arc::new(schema_context.clone()),
             row_policy_mode,
+            declarations,
         )
     }
 
@@ -1003,6 +1165,29 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
+    ) -> Result<Self, QueryCompileError> {
+        Self::try_compile_with_include_placement(
+            query,
+            schema,
+            session,
+            schema_context,
+            row_policy_mode,
+            IncludePlacement::PageRows,
+            declarations,
+        )
+    }
+
+    /// [`Self::try_compile_with_schema_context_shared`] with the caller choosing which
+    /// rows of a paginated query get their includes built.
+    pub fn try_compile_with_include_placement(
+        query: &Query,
+        schema: &Arc<Schema>,
+        session: Option<Session>,
+        schema_context: &Arc<SchemaContext>,
+        row_policy_mode: RowPolicyMode,
+        include_placement: IncludePlacement,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Result<Self, QueryCompileError> {
         let branches: Vec<String> = if query.branches.is_empty() {
             schema_context
@@ -1037,12 +1222,69 @@ impl QueryGraph {
             session,
             schema_context,
             row_policy_mode,
+            include_placement,
+            declarations,
         )
         .ok_or_else(|| {
             QueryCompileError::InvalidPlan(
                 "unsupported relation_ir shape for schema-context query compilation".to_string(),
             )
         })
+    }
+
+    /// Chain one ArraySubqueryNode per include onto `input`, widening the descriptors
+    /// by each include's array column. Returns the last node, or `input` when none
+    /// compiled.
+    #[allow(clippy::too_many_arguments)]
+    fn attach_array_subqueries(
+        &mut self,
+        specs: &[ArraySubquerySpec],
+        mut input: NodeId,
+        base_scope: &str,
+        current_descriptor: &mut RowDescriptor,
+        current_tuple_descriptor: &mut TupleDescriptor,
+        schema: &Arc<Schema>,
+        branches: &[String],
+        schema_context: &Arc<SchemaContext>,
+        session: Option<&Session>,
+        row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
+    ) -> NodeId {
+        for subquery_spec in specs {
+            if let Some((node, new_descriptor)) = self.compile_array_subquery(
+                subquery_spec,
+                current_descriptor,
+                schema,
+                branches,
+                schema_context,
+                session,
+                row_policy_mode,
+                declarations,
+            ) {
+                let node_id = self.add_node(GraphNode::ArraySubquery(node));
+                self.add_edge(node_id, input);
+                self.array_subquery_tables
+                    .push((node_id, subquery_spec.table));
+                // Nested arrays live inside this node's inner subgraph, so
+                // their tables won't otherwise appear in the outer graph's
+                // dependency list — register them against this node so a
+                // mutation deep in the chain still drives re-evaluation.
+                let mut nested_stack: Vec<&ArraySubquerySpec> =
+                    subquery_spec.nested_arrays.iter().collect();
+                while let Some(nested) = nested_stack.pop() {
+                    self.array_subquery_tables.push((node_id, nested.table));
+                    nested_stack.extend(nested.nested_arrays.iter());
+                }
+                input = node_id;
+                *current_descriptor = new_descriptor;
+                *current_tuple_descriptor = TupleDescriptor::single_with_materialization(
+                    base_scope,
+                    current_descriptor.clone(),
+                    true,
+                );
+            }
+        }
+        input
     }
 
     /// Compile an array subquery specification into an ArraySubqueryNode.
@@ -1057,6 +1299,7 @@ impl QueryGraph {
         schema_context: &Arc<SchemaContext>,
         session: Option<&Session>,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<(ArraySubqueryNode, RowDescriptor)> {
         // Get inner table descriptor
         let inner_descriptor = schema.get(&spec.table)?.columns.clone();
@@ -1145,6 +1388,7 @@ impl QueryGraph {
             Arc::clone(schema_context),
             session.cloned(),
             row_policy_mode,
+            Arc::clone(declarations),
         );
 
         // Create outer tuple descriptor
@@ -1215,6 +1459,7 @@ impl QueryGraph {
         schema_context: &Arc<SchemaContext>,
         session: Option<&Session>,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<(RecursiveRelationNode, RowDescriptor, TableName)> {
         let step_table_schema = schema.get(&spec.table)?;
         let step_table_descriptor = step_table_schema.columns.clone();
@@ -1315,6 +1560,7 @@ impl QueryGraph {
             Arc::clone(schema_context),
             session.cloned(),
             row_policy_mode,
+            Arc::clone(declarations),
         );
 
         let input_descriptor =
@@ -1339,6 +1585,7 @@ impl QueryGraph {
         session: Option<Session>,
         schema_context: &Arc<SchemaContext>,
         row_policy_mode: RowPolicyMode,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Option<Self> {
         let mut branch_schema_map: HashMap<String, SchemaHash> = HashMap::new();
         for schema_hash in schema_context.all_live_hashes() {
@@ -1378,6 +1625,7 @@ impl QueryGraph {
                 schema_context,
                 RelationCompileFeatures::default(),
                 row_policy_mode,
+                declarations,
             )?;
             let seed_output_id = graph.absorb_compiled_subgraph(seed_graph)?;
             let seed_output_descriptor = match graph
@@ -1480,6 +1728,7 @@ impl QueryGraph {
                 schema_context,
                 session.as_ref(),
                 row_policy_mode,
+                declarations,
             )
         {
             let node_id = graph.add_node(GraphNode::RecursiveRelation(node));
@@ -1862,6 +2111,24 @@ fn ensure_relation_tables_exist(
     }
 }
 
+/// Whether every remaining condition and every sort key of a plan reads a column of
+/// `root` (or the row id), i.e. nothing ahead of the limit reads an include's column.
+fn plan_reads_root_columns_only(
+    disjuncts: &[Conjunction],
+    order_by: &[(String, SortDirection)],
+    root: &RowDescriptor,
+) -> bool {
+    let is_root = |column: &str| {
+        let column = unqualify_column_name(column);
+        matches!(column, "id" | "_id") || root.column(column).is_some()
+    };
+    disjuncts
+        .iter()
+        .flat_map(|disjunct| disjunct.conditions.iter())
+        .all(|condition| is_root(condition.column()))
+        && order_by.iter().all(|(column, _)| is_root(column))
+}
+
 fn unqualify_column_name(column: &str) -> &str {
     column.split('.').next_back().unwrap_or(column)
 }
@@ -2131,6 +2398,261 @@ impl Default for ScanIntersection {
             empty: false,
         }
     }
+}
+
+/// A query that reads one ordered window of a declared composite index: the first
+/// column pinned by an exact `=`, ordered by the second, and bounded — by a limit, or
+/// by a range on the second column. Its rows come from the window alone instead of
+/// every row the first column matches (see `IndexScanNode::new_window`).
+#[derive(Debug)]
+struct WindowScanPlan {
+    index: String,
+    first_name: String,
+    second_name: String,
+    first_column: usize,
+    second_column: usize,
+    first_value: Value,
+    lower: Bound<Value>,
+    upper: Bound<Value>,
+    reverse: bool,
+    want: usize,
+}
+
+/// Rows a window fetches past `offset + limit` on its first walk, so that a few rows
+/// the filters drop do not cost a second walk.
+const WINDOW_SLACK: usize = 16;
+
+impl WindowScanPlan {
+    fn window(&self) -> Option<super::super::graph_nodes::index_scan::WindowScan> {
+        super::super::graph_nodes::index_scan::WindowScan::new(
+            self.first_column,
+            self.second_column,
+            self.first_value.clone(),
+            self.lower.clone(),
+            self.upper.clone(),
+            self.reverse,
+            self.want,
+        )
+    }
+}
+
+/// `value` when it is a value of `column_type` whose index encoding is fixed-width, or
+/// `None`. Never converted: the plain plan looks a literal up by its own encoding and
+/// the Filter compares it as written, so a window that converted one would answer
+/// differently from them.
+fn window_value(value: &Value, column_type: &ColumnType) -> Option<Value> {
+    match (value, column_type) {
+        (Value::Timestamp(_), ColumnType::Timestamp)
+        | (Value::Integer(_), ColumnType::Integer)
+        | (Value::BigInt(_), ColumnType::BigInt)
+        | (Value::Uuid(_), ColumnType::Uuid)
+        | (Value::Boolean(_), ColumnType::Boolean) => {
+            crate::query_manager::composite_index::fixed_width_encoding(value)
+                .map(|_| value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// A substring search inside one scope value, served by a declared trigram index:
+/// the scope column pinned by an exact `=`, the text column tested by `contains`
+/// with a needle of at least one trigram once folded (see `trigram_index`).
+#[derive(Debug)]
+struct TrigramScanPlan {
+    index: String,
+    scope_name: String,
+    text_name: String,
+    scope_column: usize,
+    text_column: usize,
+    scope_value: Value,
+    needle: String,
+}
+
+impl TrigramScanPlan {
+    fn scan(&self) -> Option<super::super::graph_nodes::index_scan::TrigramScan> {
+        super::super::graph_nodes::index_scan::TrigramScan::new(
+            self.scope_column,
+            self.text_column,
+            self.scope_value.clone(),
+            &self.needle,
+        )
+    }
+}
+
+/// Until a declared index is complete, and whenever it is not, its scan reads the rows
+/// of the first (scope) column's value through that column's own index
+/// (`IndexScanNode::undeclared_scan_ids`), so a plan is only made where that index
+/// exists. Declarations are checked for it when published; this holds the planner to it
+/// whatever reached the store.
+fn trigram_scan_plan(
+    plan: &ExecutionQueryPlan,
+    table_schema: &crate::query_manager::types::TableSchema,
+    declarations: &IndexDeclarations,
+) -> Option<TrigramScanPlan> {
+    if plan.disjuncts.len() != 1 || plan.include_deleted || plan.recursive.is_some() {
+        return None;
+    }
+    let disjunct = &plan.disjuncts[0];
+    let descriptor = &table_schema.columns;
+    for index in declarations.trigrams(plan.table.as_str()) {
+        if !table_schema.is_indexed_column(&index.scope) {
+            continue;
+        }
+        let Some(needle) = disjunct
+            .conditions
+            .iter()
+            .find_map(|condition| match condition {
+                // `column()`, not the raw field: a query from the client names the column
+                // with its scope (`messages.text`).
+                Condition::Contains {
+                    value: Value::Text(needle),
+                    ..
+                } if condition.column() == index.text
+                    && condition
+                        .column_scope()
+                        .is_none_or(|scope| scope == plan.base_scope) =>
+                {
+                    Some(needle.clone())
+                }
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let folded = crate::query_manager::trigram_index::fold(&needle);
+        if crate::query_manager::trigram_index::trigrams(&folded).is_empty() {
+            continue;
+        }
+        let (Some(scope_column), Some(text_column)) = (
+            descriptor.column_index(&index.scope),
+            descriptor.column_index(&index.text),
+        ) else {
+            continue;
+        };
+        if !matches!(
+            descriptor.columns[text_column].column_type,
+            ColumnType::Text
+        ) {
+            continue;
+        }
+        let scope = column_scan_plan(disjunct, table_schema, &index.scope);
+        let (true, ScanCondition::Eq(scope_value)) = (scope.exact, scope.condition) else {
+            continue;
+        };
+        let Some(scope_value) =
+            window_value(&scope_value, &descriptor.columns[scope_column].column_type)
+        else {
+            continue;
+        };
+        return Some(TrigramScanPlan {
+            index: index.name.clone(),
+            scope_name: index.scope.clone(),
+            text_name: index.text.clone(),
+            scope_column,
+            text_column,
+            scope_value,
+            needle,
+        });
+    }
+    None
+}
+
+/// See `trigram_scan_plan` on the first column's own index.
+fn window_scan_plan(
+    plan: &ExecutionQueryPlan,
+    table_schema: &crate::query_manager::types::TableSchema,
+    declarations: &IndexDeclarations,
+) -> Option<WindowScanPlan> {
+    if plan.disjuncts.len() != 1
+        || plan.include_deleted
+        || plan.recursive.is_some()
+        || plan.order_by.len() != 1
+    {
+        return None;
+    }
+    let disjunct = &plan.disjuncts[0];
+    let (order_column, direction) = &plan.order_by[0];
+    let scope_prefix = format!("{}.", plan.base_scope);
+    let order_column = order_column
+        .strip_prefix(scope_prefix.as_str())
+        .unwrap_or(order_column);
+    let descriptor = &table_schema.columns;
+    for composite in declarations.composites(plan.table.as_str()) {
+        if composite.second != order_column || !table_schema.is_indexed_column(&composite.first) {
+            continue;
+        }
+        let (Some(first_column), Some(second_column)) = (
+            descriptor.column_index(&composite.first),
+            descriptor.column_index(&composite.second),
+        ) else {
+            continue;
+        };
+        let first_descriptor = &descriptor.columns[first_column];
+        let second_descriptor = &descriptor.columns[second_column];
+
+        let first = column_scan_plan(disjunct, table_schema, &composite.first);
+        let (true, ScanCondition::Eq(first_value)) = (first.exact, first.condition) else {
+            continue;
+        };
+        let Some(first_value) = window_value(&first_value, &first_descriptor.column_type) else {
+            continue;
+        };
+
+        let second = column_scan_plan(disjunct, table_schema, &composite.second);
+        if !second.exact {
+            continue;
+        }
+        let (lower, upper) = match second.condition {
+            ScanCondition::All => (Bound::Unbounded, Bound::Unbounded),
+            ScanCondition::Range { min, max } => (min, max),
+            ScanCondition::Eq(value) => (Bound::Included(value.clone()), Bound::Included(value)),
+            _ => continue,
+        };
+        let coerce = |bound: Bound<Value>| -> Option<Bound<Value>> {
+            Some(match bound {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(v) => {
+                    Bound::Included(window_value(&v, &second_descriptor.column_type)?)
+                }
+                Bound::Excluded(v) => {
+                    Bound::Excluded(window_value(&v, &second_descriptor.column_type)?)
+                }
+            })
+        };
+        let (Some(lower), Some(upper)) = (coerce(lower), coerce(upper)) else {
+            continue;
+        };
+        let bounded = !matches!(lower, Bound::Unbounded) || !matches!(upper, Bound::Unbounded);
+        // A row with a null second column has no entry, yet the query returns it unless
+        // a lower bound excludes it: a null sorts below every value, so `at <= t`
+        // matches it (`compare_column_to_value`).
+        if second_descriptor.nullable && matches!(lower, Bound::Unbounded) {
+            continue;
+        }
+        let want = match plan.limit {
+            Some(limit) => plan
+                .offset
+                .saturating_add(limit)
+                .saturating_add(WINDOW_SLACK),
+            // Without a limit only a range makes the window smaller than the first
+            // column's whole set.
+            None if bounded => usize::MAX,
+            None => continue,
+        };
+        return Some(WindowScanPlan {
+            index: composite.name.clone(),
+            first_name: composite.first.clone(),
+            second_name: composite.second.clone(),
+            first_column,
+            second_column,
+            first_value,
+            lower,
+            upper,
+            reverse: *direction == SortDirection::Descending,
+            want,
+        });
+    }
+    None
 }
 
 fn index_scan_plan(

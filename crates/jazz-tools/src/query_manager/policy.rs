@@ -1614,8 +1614,14 @@ fn evaluate_contains_with_row_id(
 
     match column_value {
         Value::Array(elements) => elements.iter().any(|element| element == &right_value),
+        // Case-insensitive, as a query's `contains` on text is (`graph_nodes/filter.rs`):
+        // a policy's EXISTS subquery runs through a Filter node, so one policy must not
+        // read two ways.
         Value::Text(text) => match right_value {
-            Value::Text(substr) => text.contains(&substr),
+            Value::Text(substr) => {
+                use crate::query_manager::trigram_index::fold;
+                fold(&text).contains(fold(&substr).as_str())
+            }
             _ => false,
         },
         _ => false,
@@ -2835,6 +2841,38 @@ mod tests {
         };
         let result = evaluate_simple_parts(&missing, &content, &desc, &session);
         assert!(!result.passed);
+    }
+
+    /// A policy's text `contains` means what a query's does (`graph_nodes/filter.rs`):
+    /// case-insensitive, through `trigram_index::fold`. A policy's EXISTS subquery is
+    /// evaluated by a Filter node and its direct `Contains` here, so two meanings would
+    /// grant differently for the same policy text.
+    #[test]
+    fn test_policy_text_contains_reads_as_a_query_does() {
+        use crate::query_manager::trigram_index::fold;
+
+        let desc = RowDescriptor::new(vec![ColumnDescriptor::new("title", ColumnType::Text)]);
+        let session = Session::new("user1");
+        for (text, needle) in [
+            ("hello world", "World"),
+            ("HELLO WORLD", "lo wo"),
+            ("ΟΣ", "Σ"),
+            ("λογος", "ΓΟΣ"),
+            ("hello world", "worlds"),
+            ("abc", "abd"),
+        ] {
+            let content = encode_row(&desc, &[Value::Text(text.into())]).unwrap();
+            let expr = PolicyExpr::Contains {
+                column: "title".into(),
+                value: PolicyValue::Literal(Value::Text(needle.into())),
+            };
+            let result = evaluate_simple_parts(&expr, &content, &desc, &session);
+            assert_eq!(
+                result.passed,
+                fold(text).contains(fold(needle).as_str()),
+                "{text:?} contains {needle:?}"
+            );
+        }
     }
 
     #[test]

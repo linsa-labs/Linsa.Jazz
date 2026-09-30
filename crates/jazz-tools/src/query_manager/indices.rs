@@ -5,6 +5,7 @@ use crate::storage::{IndexMutation, Storage, StorageError, validate_index_value_
 use crate::row_format::CompiledRowLayout;
 
 use super::encoding::decode_column;
+use super::index_declarations::IndexDeclarations;
 use super::manager::{QueryError, QueryManager};
 use super::types::{ColumnDescriptor, ColumnName, ColumnType, RowDescriptor, TableName, Value};
 
@@ -158,6 +159,7 @@ impl QueryManager {
     }
 
     pub(super) fn index_mutations_for_insert_on_branch<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -167,6 +169,7 @@ impl QueryManager {
     ) -> Vec<IndexMutation<'a>> {
         let layout = crate::row_format::compiled_row_layout(descriptor);
         Self::index_mutations_for_insert_on_branch_with_layout(
+            declarations,
             table,
             branch,
             object_id,
@@ -177,7 +180,9 @@ impl QueryManager {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn index_mutations_for_insert_on_branch_with_layout<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -213,10 +218,23 @@ impl QueryManager {
             }
         }
 
+        super::declared_index::push_mutations(
+            &mut mutations,
+            declarations,
+            table,
+            branch,
+            object_id,
+            descriptor,
+            None,
+            Some(data),
+        );
+
         mutations
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn index_mutations_for_update_on_branch<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -264,10 +282,22 @@ impl QueryManager {
             }
         }
 
+        super::declared_index::push_mutations(
+            &mut mutations,
+            declarations,
+            table,
+            branch,
+            object_id,
+            descriptor,
+            Some(old_data),
+            Some(new_data),
+        );
+
         mutations
     }
 
     pub(super) fn index_mutations_for_soft_delete_on_branch<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -309,10 +339,22 @@ impl QueryManager {
             row_id: object_id,
         });
 
+        super::declared_index::push_mutations(
+            &mut mutations,
+            declarations,
+            table,
+            branch,
+            object_id,
+            descriptor,
+            Some(old_data),
+            None,
+        );
+
         mutations
     }
 
     pub(super) fn index_mutations_for_hard_delete_on_branch<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -356,10 +398,22 @@ impl QueryManager {
             row_id: object_id,
         });
 
+        super::declared_index::push_mutations(
+            &mut mutations,
+            declarations,
+            table,
+            branch,
+            object_id,
+            descriptor,
+            old_data,
+            None,
+        );
+
         mutations
     }
 
     pub(super) fn index_mutations_for_restore_on_branch<'a>(
+        declarations: &'a IndexDeclarations,
         table: &'a str,
         branch: &'a str,
         object_id: ObjectId,
@@ -402,12 +456,25 @@ impl QueryManager {
             }
         }
 
+        super::declared_index::push_mutations(
+            &mut mutations,
+            declarations,
+            table,
+            branch,
+            object_id,
+            descriptor,
+            None,
+            Some(new_data),
+        );
+
         mutations
     }
 
     /// Update indices when a row is inserted on a specific branch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_indices_for_insert_on_branch(
         storage: &mut dyn Storage,
+        declarations: &IndexDeclarations,
         table: &str,
         branch: &str,
         object_id: ObjectId,
@@ -416,6 +483,7 @@ impl QueryManager {
         indexed_columns: Option<&[ColumnName]>,
     ) -> Result<(), IndexUpdateError> {
         let mutations = Self::index_mutations_for_insert_on_branch(
+            declarations,
             table,
             branch,
             object_id,
@@ -442,12 +510,14 @@ impl QueryManager {
     /// Update indices when a row is updated on a specific branch.
     pub(super) fn update_indices_for_update_on_branch(
         storage: &mut dyn Storage,
+        declarations: &IndexDeclarations,
         target: BranchIndexTarget<'_>,
         object_id: ObjectId,
         old_data: &[u8],
         new_data: &[u8],
     ) -> Result<(), QueryError> {
         let mutations = Self::index_mutations_for_update_on_branch(
+            declarations,
             target.table,
             target.branch,
             object_id,
@@ -462,8 +532,10 @@ impl QueryManager {
     }
 
     /// Update indices for soft delete on a specific branch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_indices_for_soft_delete_on_branch(
         storage: &mut dyn Storage,
+        declarations: &IndexDeclarations,
         table: &str,
         branch: &str,
         object_id: ObjectId,
@@ -472,6 +544,7 @@ impl QueryManager {
         indexed_columns: Option<&[ColumnName]>,
     ) -> Result<(), QueryError> {
         let mutations = Self::index_mutations_for_soft_delete_on_branch(
+            declarations,
             table,
             branch,
             object_id,
@@ -485,8 +558,10 @@ impl QueryManager {
     }
 
     /// Update indices for hard delete on a specific branch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_indices_for_hard_delete_on_branch(
         storage: &mut dyn Storage,
+        declarations: &IndexDeclarations,
         table: &str,
         branch: &str,
         object_id: ObjectId,
@@ -495,6 +570,7 @@ impl QueryManager {
         indexed_columns: Option<&[ColumnName]>,
     ) -> Result<(), QueryError> {
         let mutations = Self::index_mutations_for_hard_delete_on_branch(
+            declarations,
             table,
             branch,
             object_id,
@@ -508,8 +584,10 @@ impl QueryManager {
     }
 
     /// Update indices for restore on a specific branch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn update_indices_for_restore_on_branch(
         storage: &mut dyn Storage,
+        declarations: &IndexDeclarations,
         table: &str,
         branch: &str,
         object_id: ObjectId,
@@ -518,6 +596,7 @@ impl QueryManager {
         indexed_columns: Option<&[ColumnName]>,
     ) -> Result<(), QueryError> {
         let mutations = Self::index_mutations_for_restore_on_branch(
+            declarations,
             table,
             branch,
             object_id,
@@ -553,6 +632,7 @@ impl QueryManager {
 
         if let Err(error) = Self::update_indices_for_hard_delete_on_branch(
             storage,
+            &self.written_index_declarations,
             table,
             branch,
             row_id,
@@ -611,6 +691,7 @@ impl QueryManager {
         if let Some(table_schema) = self.schema.get(&table_name)
             && let Err(error) = Self::update_indices_for_restore_on_branch(
                 storage,
+                &self.written_index_declarations,
                 table,
                 branch,
                 row_id,

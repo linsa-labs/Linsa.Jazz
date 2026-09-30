@@ -290,6 +290,76 @@ pub trait Storage {
             .map(|rows| rows.into_iter().map(|(key, _)| key).collect())
     }
 
+    /// Keys of `[start, end)` in key order, or in reverse key order when
+    /// `reverse`, stopping after `limit` keys.
+    ///
+    /// The ordered-window index scan reads through this, so a page of a large
+    /// index costs O(page) rather than O(index). The default is correct on
+    /// every backend but reads the whole range first; a backend that can seek
+    /// should override it.
+    fn raw_table_scan_range_keys_limited(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<RawTableKeys, StorageError> {
+        let mut keys = self.raw_table_scan_range_keys(table, start, end)?;
+        if reverse {
+            keys.reverse();
+        }
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
+    /// Keys of every raw table whose NAME starts with `name_prefix`, as one sequence in
+    /// flat key order: each is what follows `name_prefix` in the flat key,
+    /// `{rest of the table name}:{key}`, strictly after `after`, at most `limit` of them.
+    ///
+    /// Walks a family of raw tables a page at a time with a cursor no write moves: an
+    /// index's per-branch tables (`idx:{table}:{column}:`), for the declared-index clear
+    /// and fill (`query_manager::declared_index`).
+    ///
+    /// The default refuses: only a backend that can enumerate its raw tables answers it.
+    fn raw_table_family_keys(
+        &self,
+        _name_prefix: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        Err(StorageError::IoError(
+            "raw table family scans are not implemented for this backend".to_string(),
+        ))
+    }
+
+    /// The last key of `raw_table_family_keys(name_prefix, ..)`, or `None` when the
+    /// family holds none.
+    fn raw_table_family_last_key(
+        &self,
+        _name_prefix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        Err(StorageError::IoError(
+            "raw table family scans are not implemented for this backend".to_string(),
+        ))
+    }
+
+    /// The format version in the store's manifest, or `None` for a backend that keeps no
+    /// manifest (memory).
+    fn store_format_version(&self) -> Result<Option<i32>, StorageError> {
+        Ok(None)
+    }
+
+    /// Rewrite the format version in the store's manifest (`STORE_FORMAT_V3`, or
+    /// `STORE_FORMAT_V4_DECLARED_INDEXES` while declared indexes are maintained), inside
+    /// the write transaction of the writes around it where the backend has one. Asked
+    /// only of a backend whose `store_format_version` is `Some`.
+    fn set_store_format_version(&mut self, _version: i32) -> Result<(), StorageError> {
+        Err(StorageError::IoError(
+            "store manifest writes are not implemented for this backend".to_string(),
+        ))
+    }
+
     fn load_branch_ord(&self, branch_name: BranchName) -> Result<Option<BranchOrd>, StorageError> {
         self.raw_table_get(
             BRANCH_ORD_BY_NAME_TABLE,
@@ -1902,6 +1972,44 @@ pub trait Storage {
             .unwrap_or_default()
     }
 
+    /// Entry keys (`{value_segment}:{uuid}`) of one index between two
+    /// entry-key bounds, `[start, end)`, walked forward or in reverse and cut
+    /// after `limit` keys when one is given.
+    ///
+    /// The bounds are value-segment strings the caller builds itself: this is
+    /// the primitive under the composite ordered-window scan, whose segments
+    /// are fixed-width concatenations the per-value helpers do not model.
+    #[allow(clippy::too_many_arguments)]
+    fn index_window_keys(
+        &self,
+        table: &str,
+        column: &str,
+        branch: &str,
+        start: &str,
+        end: &str,
+        reverse: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>, StorageError> {
+        let raw_table = key_codec::index_raw_table(table, column, branch);
+        match limit {
+            Some(limit) => self.raw_table_scan_range_keys_limited(
+                &raw_table,
+                Some(start),
+                Some(end),
+                reverse,
+                limit,
+            ),
+            None => {
+                let mut keys =
+                    self.raw_table_scan_range_keys(&raw_table, Some(start), Some(end))?;
+                if reverse {
+                    keys.reverse();
+                }
+                Ok(keys)
+            }
+        }
+    }
+
     /// Flush buffered data to persistent storage. No-op for in-memory storage.
     fn flush(&self) -> Result<(), StorageError> {
         Ok(())
@@ -2008,6 +2116,38 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         end: Option<&str>,
     ) -> Result<RawTableKeys, StorageError> {
         (**self).raw_table_scan_range_keys(table, start, end)
+    }
+
+    fn raw_table_scan_range_keys_limited(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<RawTableKeys, StorageError> {
+        (**self).raw_table_scan_range_keys_limited(table, start, end, reverse, limit)
+    }
+
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        (**self).raw_table_family_keys(name_prefix, after, limit)
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        (**self).raw_table_family_last_key(name_prefix)
+    }
+
+    fn store_format_version(&self) -> Result<Option<i32>, StorageError> {
+        (**self).store_format_version()
+    }
+
+    fn set_store_format_version(&mut self, version: i32) -> Result<(), StorageError> {
+        (**self).set_store_format_version(version)
     }
 
     fn upsert_catalogue_entry(&mut self, entry: &CatalogueEntry) -> Result<(), StorageError> {

@@ -47,6 +47,200 @@ pub struct IndexScanNode {
     /// Whether at least one full scan has completed. Incremental deltas can only be
     /// applied on top of an exact baseline.
     has_scanned: bool,
+    /// Ordered-window mode over a composite index (see [`WindowScan`]). When set,
+    /// `condition` is unused.
+    window: Option<WindowScan>,
+    /// Substring-search mode over a trigram index (see [`TrigramScan`]). When set,
+    /// `condition` is unused.
+    trigram: Option<TrigramScan>,
+    /// The incarnation of the declared index a window or a search reads that this scan
+    /// last found complete in the store's record (`declared_index`). While there is
+    /// none the scan reads the first column's own index (`undeclared_scan_ids`).
+    ready_incarnation: Option<u64>,
+}
+
+/// The rows of one scope value whose case-folded text may hold a needle: the
+/// intersection of the needle's trigram posting lists in a trigram index
+/// (`query_manager::trigram_index`). A superset of the matches — the filter after
+/// the load keeps only real ones — read as index keys, without loading a row.
+#[derive(Debug, Clone)]
+pub struct TrigramScan {
+    /// The value segment of each of the needle's trigrams.
+    segments: Vec<String>,
+    /// For deciding overlay rows without the index.
+    scope_column: usize,
+    text_column: usize,
+    scope_value: Value,
+    folded_needle: String,
+}
+
+impl TrigramScan {
+    /// A search for `needle` among the rows whose `scope` column is `scope_value`.
+    /// Returns `None` when the folded needle has no trigram, or the scope value has no
+    /// fixed-width encoding.
+    pub fn new(
+        scope_column: usize,
+        text_column: usize,
+        scope_value: Value,
+        needle: &str,
+    ) -> Option<Self> {
+        use crate::query_manager::trigram_index::{entry_segment, fold, trigrams};
+        let folded_needle = fold(needle);
+        let segments = trigrams(&folded_needle)
+            .iter()
+            .map(|trigram| entry_segment(&scope_value, trigram))
+            .collect::<Option<Vec<_>>>()?;
+        if segments.is_empty() {
+            return None;
+        }
+        Some(Self {
+            segments,
+            scope_column,
+            text_column,
+            scope_value,
+            folded_needle,
+        })
+    }
+}
+
+/// An ordered window over a composite `(first, second)` index: the entries whose
+/// first component equals one value, walked in second-component order from one
+/// end of a range, and cut once enough of them are held.
+///
+/// Members are every entry between the walk's origin and the FRONTIER, which is the
+/// second-component value of the last group fetched. A cut never splits a group of
+/// equal second-component values, because the Sort downstream orders ties by id and
+/// a split group could leave out the row it ranks first.
+///
+/// A settle with changes rescans only up to the frontier, which is O(window). When
+/// the graph finds the window short after its filters (deleted or denied rows, rows
+/// that left the range), it calls [`IndexScanNode::grow_window`], and the next scan
+/// walks further.
+#[derive(Debug, Clone)]
+pub struct WindowScan {
+    /// `"09" ++ hex(encode(first))`: the value-segment prefix every member shares.
+    prefix_hex: String,
+    /// The range's entry-key bounds, `[start, end)`.
+    start: String,
+    end: String,
+    /// Walk from `end` towards `start` (descending second component).
+    reverse: bool,
+    /// How many entries the next extending walk must reach before it may stop.
+    want: usize,
+    /// Hex of the second component of the last group the walk fetched. `None`
+    /// until the first walk, and whenever the walk ran to the end of its range.
+    frontier: Option<String>,
+    /// The last walk reached the end of its range: every entry in `[start, end)`
+    /// is a member.
+    exhausted: bool,
+    /// Set by [`IndexScanNode::grow_window`]: the next scan walks past the
+    /// frontier instead of rescanning inside it.
+    extend: bool,
+    /// For deciding overlay rows without the index: the composite columns in the
+    /// row descriptor, the first component's value and the second component's
+    /// encoded bounds.
+    first_column: usize,
+    second_column: usize,
+    first_value: Value,
+    lower_hex: Bound<String>,
+    upper_hex: Bound<String>,
+}
+
+impl WindowScan {
+    /// A window over `first = first_value` with the second component in
+    /// `lower..upper`. Returns `None` when a value has no fixed-width encoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        first_column: usize,
+        second_column: usize,
+        first_value: Value,
+        lower: Bound<Value>,
+        upper: Bound<Value>,
+        reverse: bool,
+        want: usize,
+    ) -> Option<Self> {
+        use crate::query_manager::composite_index::{fixed_width_encoding, hex};
+        let prefix_hex = format!("09{}", hex(&fixed_width_encoding(&first_value)?));
+        let encode_bound = |bound: Bound<Value>| -> Option<Bound<String>> {
+            Some(match bound {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(value) => Bound::Included(hex(&fixed_width_encoding(&value)?)),
+                Bound::Excluded(value) => Bound::Excluded(hex(&fixed_width_encoding(&value)?)),
+            })
+        };
+        let lower_hex = encode_bound(lower)?;
+        let upper_hex = encode_bound(upper)?;
+        // Entry keys are `{prefix}{second}:{uuid}` with a fixed-width `second`, so
+        // `{prefix}{second};` sorts after every key of that second value and before
+        // any larger one (';' is the byte after ':'), and `{prefix}g` after every key
+        // of the prefix ('g' follows the hex digits).
+        let start = match &lower_hex {
+            Bound::Unbounded => prefix_hex.clone(),
+            Bound::Included(second) => format!("{prefix_hex}{second}"),
+            Bound::Excluded(second) => format!("{prefix_hex}{second};"),
+        };
+        let end = match &upper_hex {
+            Bound::Unbounded => format!("{prefix_hex}g"),
+            Bound::Included(second) => format!("{prefix_hex}{second};"),
+            Bound::Excluded(second) => format!("{prefix_hex}{second}"),
+        };
+        Some(Self {
+            prefix_hex,
+            start,
+            end,
+            reverse,
+            want: want.max(1),
+            frontier: None,
+            exhausted: false,
+            extend: true,
+            first_column,
+            second_column,
+            first_value,
+            lower_hex,
+            upper_hex,
+        })
+    }
+
+    /// The second component of an entry key, as hex.
+    fn second_of<'k>(&self, key: &'k str) -> Option<&'k str> {
+        let (segment, _) = key.rsplit_once(':')?;
+        segment.strip_prefix(self.prefix_hex.as_str())
+    }
+
+    /// The member bounds: the whole range when exhausted, else the range cut at the
+    /// frontier group.
+    fn member_bounds(&self) -> (String, String) {
+        match (&self.frontier, self.exhausted) {
+            (Some(frontier), false) if self.reverse => {
+                (format!("{}{frontier}", self.prefix_hex), self.end.clone())
+            }
+            (Some(frontier), false) => (
+                self.start.clone(),
+                format!("{}{frontier};", self.prefix_hex),
+            ),
+            _ => (self.start.clone(), self.end.clone()),
+        }
+    }
+
+    /// Whether a second-component value (hex) is inside the member bounds.
+    fn holds_second(&self, second_hex: &str) -> bool {
+        let lower_ok = match &self.lower_hex {
+            Bound::Unbounded => true,
+            Bound::Included(lower) => second_hex >= lower.as_str(),
+            Bound::Excluded(lower) => second_hex > lower.as_str(),
+        };
+        let upper_ok = match &self.upper_hex {
+            Bound::Unbounded => true,
+            Bound::Included(upper) => second_hex <= upper.as_str(),
+            Bound::Excluded(upper) => second_hex < upper.as_str(),
+        };
+        let frontier_ok = match (&self.frontier, self.exhausted) {
+            (Some(frontier), false) if self.reverse => second_hex >= frontier.as_str(),
+            (Some(frontier), false) => second_hex <= frontier.as_str(),
+            _ => true,
+        };
+        lower_ok && upper_ok && frontier_ok
+    }
 }
 
 /// Above this many accumulated changed rows a full rescan is cheaper and the set is
@@ -77,7 +271,94 @@ impl IndexScanNode {
             pending_changed_rows: AHashSet::new(),
             needs_full: true,
             has_scanned: false,
+            window: None,
+            trigram: None,
+            ready_incarnation: None,
         }
+    }
+
+    /// A substring-search scan over the trigram index `column` (see [`TrigramScan`]).
+    pub fn new_trigram(
+        table: impl Into<TableName>,
+        column: impl Into<ColumnName>,
+        branch: impl Into<String>,
+        trigram: TrigramScan,
+        row_descriptor: RowDescriptor,
+    ) -> Self {
+        let mut node =
+            Self::new_with_branch(table, column, branch, ScanCondition::All, row_descriptor);
+        node.trigram = Some(trigram);
+        node
+    }
+
+    /// An ordered-window scan over the composite index `column` (see [`WindowScan`]).
+    pub fn new_window(
+        table: impl Into<TableName>,
+        column: impl Into<ColumnName>,
+        branch: impl Into<String>,
+        window: WindowScan,
+        row_descriptor: RowDescriptor,
+    ) -> Self {
+        let mut node =
+            Self::new_with_branch(table, column, branch, ScanCondition::All, row_descriptor);
+        node.window = Some(window);
+        node
+    }
+
+    /// Whether the window must walk further for the page to be exact. `edge` is the
+    /// encoded (hex) second-component value of the page's last row, or `None` when the
+    /// ordered input holds fewer rows than the page. Rows past the frontier order after
+    /// it, so the page is exact once the frontier reaches the edge.
+    pub(crate) fn window_needs_growth(&self, edge: Option<&str>) -> bool {
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
+        if window.exhausted {
+            return false;
+        }
+        match (edge, window.frontier.as_deref()) {
+            (Some(edge), Some(frontier)) if window.reverse => frontier > edge,
+            (Some(edge), Some(frontier)) => frontier < edge,
+            _ => true,
+        }
+    }
+
+    /// Whether this scan reads an ordered window (`new_window`).
+    #[cfg(test)]
+    pub(crate) fn is_window(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Whether this is a window whose walk may stop before the end of its range, so that
+    /// its graph has to grow it (`QueryGraph::grow_windows_short_of`).
+    #[cfg(test)]
+    pub(crate) fn window_may_stop_short(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.want != usize::MAX && !window.exhausted)
+    }
+
+    /// Walk the window's whole range from now on, for a graph that cannot grow it.
+    pub(crate) fn walk_whole_window(&mut self) {
+        if let Some(window) = self.window.as_mut() {
+            window.want = usize::MAX;
+        }
+    }
+
+    /// Ask the next scan to walk past the frontier, twice as far as the last walk.
+    /// Returns false when the window already holds its whole range.
+    pub(crate) fn grow_window(&mut self) -> bool {
+        let Some(window) = self.window.as_mut() else {
+            return false;
+        };
+        if window.exhausted {
+            return false;
+        }
+        window.want = window.want.saturating_mul(2);
+        window.extend = true;
+        self.dirty = true;
+        self.needs_full = true;
+        true
     }
 
     /// Record that exactly `ids` changed in this node's table since the last scan.
@@ -175,6 +456,9 @@ impl IndexScanNode {
     /// reading the same raw table the full scan traverses is what makes the
     /// incremental path immune to row-encoding and schema-variant concerns.
     fn supports_incremental_membership(&self) -> bool {
+        if self.window.is_some() || self.trigram.is_some() {
+            return false;
+        }
         match &self.condition {
             ScanCondition::Empty | ScanCondition::Eq(_) => true,
             // An `All` scan over the `_id` index: a row's entry value is its own id.
@@ -213,6 +497,202 @@ impl IndexScanNode {
                 .unwrap_or(false),
             ScanCondition::Range { .. } => false,
         }
+    }
+
+    /// The window's members, walking past the frontier when asked to grow. Moves the
+    /// frontier, so it runs once per scan (the parity harness never reaches it: a
+    /// window has no incremental path).
+    fn window_scan_ids(&mut self, ctx: &SourceContext) -> AHashSet<ObjectId> {
+        let Some(window) = self.window.as_mut() else {
+            return AHashSet::new();
+        };
+        let reverse = window.reverse;
+        let read = |start: &str, end: &str, limit: Option<usize>| {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::INDEX_READS,
+            );
+            ctx.storage
+                .index_window_keys(
+                    self.table.as_str(),
+                    self.column.as_str(),
+                    &self.branch,
+                    start,
+                    end,
+                    reverse,
+                    limit,
+                )
+                .unwrap_or_default()
+        };
+        let keys: Vec<String> = if window.extend || window.frontier.is_none() && !window.exhausted {
+            window.extend = false;
+            let limit = (window.want != usize::MAX).then_some(window.want);
+            let mut keys = read(&window.start, &window.end, limit);
+            if keys.len() < window.want {
+                window.exhausted = true;
+                window.frontier = None;
+            } else {
+                window.exhausted = false;
+                let last_second = keys
+                    .last()
+                    .and_then(|key| window.second_of(key))
+                    .map(str::to_string);
+                if let Some(second) = last_second {
+                    // Finish the last group so a tie is never split.
+                    let group_start = format!("{}{second}", window.prefix_hex);
+                    let group_end = format!("{}{second};", window.prefix_hex);
+                    for key in read(&group_start, &group_end, None) {
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
+                    window.frontier = Some(second);
+                }
+            }
+            keys
+        } else {
+            let (start, end) = window.member_bounds();
+            read(&start, &end, None)
+        };
+        keys.iter()
+            .filter_map(|key| crate::query_manager::composite_index::entry_row_id(key))
+            .collect()
+    }
+
+    /// The candidates of a trigram search: the posting lists intersected, smallest
+    /// first.
+    fn trigram_scan_ids(&self, ctx: &SourceContext) -> AHashSet<ObjectId> {
+        let Some(trigram) = self.trigram.as_ref() else {
+            return AHashSet::new();
+        };
+        let mut lists: Vec<AHashSet<ObjectId>> = Vec::with_capacity(trigram.segments.len());
+        for segment in &trigram.segments {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::INDEX_READS,
+            );
+            let keys = ctx
+                .storage
+                .index_window_keys(
+                    self.table.as_str(),
+                    self.column.as_str(),
+                    &self.branch,
+                    &format!("{segment}:"),
+                    &format!("{segment};"),
+                    false,
+                    None,
+                )
+                .unwrap_or_default();
+            let list: AHashSet<ObjectId> = keys
+                .iter()
+                .filter_map(|key| crate::query_manager::composite_index::entry_row_id(key))
+                .collect();
+            if list.is_empty() {
+                return AHashSet::new();
+            }
+            lists.push(list);
+        }
+        lists.sort_by_key(|list| list.len());
+        let mut lists = lists.into_iter();
+        let Some(mut candidates) = lists.next() else {
+            return AHashSet::new();
+        };
+        for list in lists {
+            candidates.retain(|id| list.contains(id));
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        candidates
+    }
+
+    /// Whether the declared index this window or search reads is complete. Asked of the
+    /// store's record on every scan and held to the incarnation seen complete: an index
+    /// removed, or re-added and so filled afresh, sends the scan back to the first
+    /// column's own index. A window starts its walk over whenever its source changes.
+    fn declared_index_ready(&mut self, ctx: &SourceContext) -> bool {
+        let complete = crate::query_manager::declared_index::load_record(ctx.storage)
+            .ok()
+            .and_then(|record| {
+                record.complete_incarnation(self.table.as_str(), self.column.as_str())
+            });
+        if complete != self.ready_incarnation {
+            self.ready_incarnation = complete;
+            if let Some(window) = self.window.as_mut() {
+                window.exhausted = false;
+                window.frontier = None;
+                window.extend = false;
+            }
+        }
+        self.ready_incarnation.is_some()
+    }
+
+    /// The rows of the first (scope) column's value, read through that column's own
+    /// index, as the plan read them before the declaration. A superset of the window's
+    /// or the search's rows, which the Filter, the Sort and the page after the scan
+    /// narrow exactly: the Filter is elided only when that one column covers the whole
+    /// predicate, and then these are exactly the rows.
+    fn undeclared_scan_ids(&mut self, ctx: &SourceContext) -> AHashSet<ObjectId> {
+        let (column, value) = if let Some(window) = self.window.as_mut() {
+            // It holds its whole range, so nothing grows it.
+            window.exhausted = true;
+            window.frontier = None;
+            (window.first_column, window.first_value.clone())
+        } else if let Some(trigram) = self.trigram.as_ref() {
+            (trigram.scope_column, trigram.scope_value.clone())
+        } else {
+            return AHashSet::new();
+        };
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::INDEX_READS);
+        let name = self.row_descriptor.columns[column].name;
+        ctx.storage
+            .index_lookup(self.table.as_str(), name.as_str(), &self.branch, &value)
+            .into_iter()
+            .collect()
+    }
+
+    /// Overlay membership for a trigram search: decided from the row itself.
+    fn trigram_holds_row(&self, data: &[u8]) -> bool {
+        let Some(trigram) = self.trigram.as_ref() else {
+            return false;
+        };
+        let Ok(values) = decode_row(&self.row_descriptor, data) else {
+            return false;
+        };
+        match (
+            values.get(trigram.scope_column),
+            values.get(trigram.text_column),
+        ) {
+            (Some(scope), Some(Value::Text(text))) => {
+                *scope == trigram.scope_value
+                    && crate::query_manager::trigram_index::fold(text)
+                        .contains(trigram.folded_needle.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    /// Overlay membership for a window: decided from the row itself, since the
+    /// overlay row's index entry may not exist yet.
+    fn window_holds_row(&self, data: &[u8]) -> bool {
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
+        let Ok(values) = decode_row(&self.row_descriptor, data) else {
+            return false;
+        };
+        let (Some(first), Some(second)) = (
+            values.get(window.first_column),
+            values.get(window.second_column),
+        ) else {
+            return false;
+        };
+        if *first != window.first_value {
+            return false;
+        }
+        let Some(second) = crate::query_manager::composite_index::fixed_width_encoding(second)
+        else {
+            return false;
+        };
+        window.holds_second(&crate::query_manager::composite_index::hex(&second))
     }
 
     /// The full-scan membership computation, factored out so the incremental path can
@@ -290,7 +770,13 @@ impl IndexScanNode {
                 new_ids.insert(row_id);
             } else if row.is_soft_deleted() || row.is_hard_deleted() {
                 new_ids.remove(&row_id);
-            } else if self.overlay_value_matches_condition(row_id, &row.data) {
+            } else if if self.window.is_some() {
+                self.window_holds_row(&row.data)
+            } else if self.trigram.is_some() {
+                self.trigram_holds_row(&row.data)
+            } else {
+                self.overlay_value_matches_condition(row_id, &row.data)
+            } {
                 new_ids.insert(row_id);
             } else {
                 new_ids.remove(&row_id);
@@ -430,8 +916,22 @@ impl SourceNode for IndexScanNode {
         // inside `full_scan_ids` so the debug-only parity harness above, which
         // calls the same function purely to check the incremental path, does
         // not make debug builds report reads a release build never does.
-        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::INDEX_READS);
-        let new_ids = self.full_scan_ids(ctx);
+        let new_ids = if self.window.is_some() || self.trigram.is_some() {
+            let mut ids = if !self.declared_index_ready(ctx) {
+                self.undeclared_scan_ids(ctx)
+            } else if self.window.is_some() {
+                self.window_scan_ids(ctx)
+            } else {
+                self.trigram_scan_ids(ctx)
+            };
+            self.apply_local_overlay_rows(ctx, &mut ids);
+            ids
+        } else {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::INDEX_READS,
+            );
+            self.full_scan_ids(ctx)
+        };
 
         // Diff against last scan
         let added: Vec<ObjectId> = new_ids

@@ -1507,6 +1507,142 @@ mod tests {
         );
     }
 
+    async fn admin_request(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(test_app_route(path))
+            .header("X-Jazz-Admin-Secret", "admin-secret");
+        if body.is_some() {
+            request = request.header("Content-Type", "application/json");
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .body(match body {
+                        Some(body) => axum::body::Body::from(body.to_string()),
+                        None => axum::body::Body::empty(),
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `declaredIndexes` on a permissions publish: present replaces the head's, absent
+    /// carries them forward, a declaration that does not fit the schema is a 400, and
+    /// the stored permissions return them.
+    #[tokio::test]
+    async fn permissions_publish_carries_declared_indexes() {
+        let schema = SchemaBuilder::new()
+            .table(
+                TableSchema::builder("users")
+                    .column("id", ColumnType::Uuid)
+                    .column("name", ColumnType::Text),
+            )
+            .build();
+        let schema_hash = SchemaHash::compute(&schema).to_string();
+        let state = make_state_with_schema(schema).await;
+        let app = make_test_router(state.clone());
+        let search = serde_json::json!({ "users": { "trigram": [["id", "name"]] } });
+
+        let (status, published) = admin_request(
+            &app,
+            "POST",
+            "/admin/permissions",
+            Some(serde_json::json!({
+                "schemaHash": schema_hash,
+                "permissions": { "users": { "select": { "using": { "type": "True" } } } },
+                "declaredIndexes": search,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{published}");
+        let first = published["head"]["bundleObjectId"].clone();
+        let (_, stored) = admin_request(&app, "GET", "/admin/permissions", None).await;
+        assert_eq!(stored["declaredIndexes"], search);
+
+        let (status, published) = admin_request(
+            &app,
+            "POST",
+            "/admin/permissions",
+            Some(serde_json::json!({
+                "schemaHash": schema_hash,
+                "permissions": { "users": { "select": { "using": { "type": "False" } } } },
+                "expectedParentBundleObjectId": first,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{published}");
+        assert_eq!(published["head"]["version"].as_u64(), Some(2));
+        let second = published["head"]["bundleObjectId"].clone();
+        let (_, stored) = admin_request(&app, "GET", "/admin/permissions", None).await;
+        assert_eq!(
+            stored["declaredIndexes"], search,
+            "absent carries them forward"
+        );
+
+        let (status, refused) = admin_request(
+            &app,
+            "POST",
+            "/admin/permissions",
+            Some(serde_json::json!({
+                "schemaHash": schema_hash,
+                "permissions": { "users": { "select": { "using": { "type": "False" } } } },
+                "declaredIndexes": { "users": { "trigram": [["id", "missing"]] } },
+                "expectedParentBundleObjectId": second,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+        let (status, published) = admin_request(
+            &app,
+            "POST",
+            "/admin/permissions",
+            Some(serde_json::json!({
+                "schemaHash": schema_hash,
+                "permissions": { "users": { "select": { "using": { "type": "False" } } } },
+                "declaredIndexes": {},
+                "expectedParentBundleObjectId": second,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{published}");
+        assert_eq!(published["head"]["version"].as_u64(), Some(3));
+        let (_, stored) = admin_request(&app, "GET", "/admin/permissions", None).await;
+        assert_eq!(stored["declaredIndexes"], serde_json::json!({}));
+
+        // An edge forwards the request re-serialized: absent and empty stay apart.
+        for (body, forwarded) in [
+            (
+                serde_json::json!({ "schemaHash": "h", "permissions": {} }),
+                None,
+            ),
+            (
+                serde_json::json!({ "schemaHash": "h", "permissions": {}, "declaredIndexes": {} }),
+                Some(serde_json::json!({})),
+            ),
+        ] {
+            let request: PublishPermissionsRequest = serde_json::from_value(body).unwrap();
+            let again: Value = serde_json::to_value(&request).unwrap();
+            assert_eq!(again.get("declaredIndexes").cloned(), forwarded);
+        }
+    }
+
     #[tokio::test]
     async fn permissions_handler_returns_nulls_before_any_publish() {
         let schema = SchemaBuilder::new()

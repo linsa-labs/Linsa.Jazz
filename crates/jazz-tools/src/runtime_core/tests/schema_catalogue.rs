@@ -498,6 +498,7 @@ fn test_publish_permissions_bundle_then_add_server_sends_head_and_bundle() {
             TablePolicies::new().with_select(PolicyExpr::True),
         )]),
         None,
+        None,
     )
     .expect("publish permissions bundle");
 

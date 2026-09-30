@@ -92,10 +92,14 @@ impl LimitOffsetNode {
         &self.all_tuples[..self.sync_input_len(self.all_tuples.len())]
     }
 
-    /// Tuples from an already-filtered ordered input that must be present locally
-    /// to reproduce this paginated window.
-    pub fn filtered_sync_input_tuples<'a>(&self, ordered_tuples: &'a [Tuple]) -> &'a [Tuple] {
-        &ordered_tuples[..self.sync_input_len(ordered_tuples.len())]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// How many tuples of an ordered input the sync prefix can hold: `offset + limit`,
+    /// or `None` when the query has no limit and the prefix is the whole input.
+    pub fn sync_prefix_cap(&self) -> Option<usize> {
+        self.limit.map(|limit| self.offset.saturating_add(limit))
     }
 
     fn sync_input_len(&self, input_len: usize) -> usize {

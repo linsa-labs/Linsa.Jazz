@@ -39,6 +39,7 @@ use tracing::{debug, debug_span, info, trace, trace_span};
 use crate::batch_fate::BatchMode;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::QuerySubscriptionId;
+use crate::query_manager::index_declarations::IndexDeclarations;
 use crate::query_manager::manager::{QueryError, QueryUpdate};
 use crate::query_manager::query::Query;
 use crate::query_manager::session::{Session, WriteContext};
@@ -618,6 +619,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     /// Create a new RuntimeCore.
     pub fn new(mut schema_manager: SchemaManager, mut storage: S, scheduler: Sch) -> Self {
         let _ = schema_manager.ensure_current_schema_persisted(&mut storage);
+        // Before any write or compile: which declared indexes this store maintains.
+        schema_manager
+            .query_manager_mut()
+            .open_declared_indexes(&mut storage);
+        // Their work goes a step per batched tick (`batched_tick`), never inside a write.
+        schema_manager
+            .query_manager_mut()
+            .pace_declared_index_steps();
         // Heal defect 27's damage before anything reads: a store that was
         // written by an engine older than this one can hold a `(row, branch)`
         // with a visible head in two schema-generation families, and every read
@@ -918,18 +927,24 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         id
     }
 
+    /// `declared_indexes`: `None` carries the current head's forward, `Some` replaces
+    /// them (`SchemaManager::publish_permissions_bundle_with_indexes`).
     pub fn publish_permissions_bundle(
         &mut self,
         schema_hash: SchemaHash,
         permissions: HashMap<TableName, TablePolicies>,
+        declared_indexes: Option<IndexDeclarations>,
         expected_parent_bundle_object_id: Option<ObjectId>,
     ) -> Result<Option<ObjectId>, crate::schema_manager::SchemaError> {
-        let id = self.schema_manager.publish_permissions_bundle(
-            &mut self.storage,
-            schema_hash,
-            permissions,
-            expected_parent_bundle_object_id,
-        )?;
+        let id = self
+            .schema_manager
+            .publish_permissions_bundle_with_indexes(
+                &mut self.storage,
+                schema_hash,
+                permissions,
+                declared_indexes,
+                expected_parent_bundle_object_id,
+            )?;
         if id.is_some() {
             self.mark_storage_write_pending_flush();
             self.refresh_transport_catalogue_state_hash();

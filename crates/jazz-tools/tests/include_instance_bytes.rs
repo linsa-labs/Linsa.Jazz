@@ -57,6 +57,7 @@ use jazz_tools::object::{BranchName, ObjectId};
 use jazz_tools::query_manager::graph::{CompactNode, GraphNode, QueryGraph};
 use jazz_tools::query_manager::graph_nodes::array_subquery::ArraySubqueryNode;
 use jazz_tools::query_manager::graph_nodes::subgraph::{SubgraphInstance, SubgraphTemplate};
+use jazz_tools::query_manager::index_declarations::IndexDeclarations;
 use jazz_tools::query_manager::manager::QueryManager;
 use jazz_tools::query_manager::query::{Query, QueryBuilder};
 use jazz_tools::query_manager::settle_cost::{LIVE_SUBQUERY_INSTANCES, LIVE_SUBQUERY_NODES};
@@ -152,6 +153,9 @@ struct Fixture {
     storage: MemoryStorage,
     schema: Arc<Schema>,
     schema_context: Arc<SchemaContext>,
+    /// One shared set, as a query manager holds it: an allocation inside a measured
+    /// compile would be charged to the plan.
+    declarations: Arc<IndexDeclarations>,
     branch: String,
     message_ids: Vec<ObjectId>,
     asset_ids: Vec<ObjectId>,
@@ -229,6 +233,7 @@ impl Fixture {
             storage,
             schema: Arc::new(schema),
             schema_context: Arc::new(schema_context),
+            declarations: Arc::new(IndexDeclarations::empty()),
             branch,
             message_ids,
             asset_ids,
@@ -414,6 +419,7 @@ impl Shape {
             Arc::clone(&fixture.schema_context),
             None,
             RowPolicyMode::PermissiveLocal,
+            Arc::clone(&fixture.declarations),
         )
     }
 }
@@ -483,6 +489,7 @@ fn measure(shape: &Shape, fixture: &Fixture, correlation: Value) -> Split {
             None,
             &fixture.schema_context,
             RowPolicyMode::PermissiveLocal,
+            &fixture.declarations,
         )
         .expect("the production include shape must compile")
     });

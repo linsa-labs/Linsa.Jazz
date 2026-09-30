@@ -16,6 +16,7 @@ use blake3::Hasher;
 
 use crate::catalogue::CatalogueEntry;
 use crate::object::{BranchName, ObjectId};
+use crate::query_manager::index_declarations::IndexDeclarations;
 use crate::query_manager::manager::{DeleteHandle, InsertResult, QueryError, QueryManager};
 use crate::query_manager::query::QueryBuilder;
 use crate::query_manager::session::WriteContext;
@@ -46,6 +47,9 @@ struct PermissionsBundleState {
     version: u64,
     parent_bundle_object_id: Option<ObjectId>,
     permissions: HashMap<TableName, TablePolicies>,
+    /// The indexes the app declares next to its tables, outside the hashed schema. A
+    /// head proposes them to every store that applies it (`declared_index`).
+    declared_indexes: IndexDeclarations,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +72,7 @@ pub struct PermissionsHeadSummary {
 pub struct CurrentPermissionsSummary {
     pub head: PermissionsHeadSummary,
     pub permissions: HashMap<TableName, TablePolicies>,
+    pub declared_indexes: IndexDeclarations,
 }
 
 #[derive(Clone, Debug)]
@@ -733,6 +738,7 @@ impl SchemaManager {
         Some(CurrentPermissionsSummary {
             head,
             permissions: bundle.permissions.clone(),
+            declared_indexes: bundle.declared_indexes.clone(),
         })
     }
 
@@ -1026,6 +1032,7 @@ impl SchemaManager {
             bundle.version,
             bundle.parent_bundle_object_id,
             &bundle.permissions,
+            &bundle.declared_indexes,
         );
         let bundle_timestamp = self.query_manager.sync_manager_mut().reserve_timestamp();
         self.catalogue_publish_timestamps
@@ -1057,11 +1064,33 @@ impl SchemaManager {
         Some(head_object_id)
     }
 
+    /// Publish `permissions`, carrying the current head's declared indexes forward.
     pub fn publish_permissions_bundle<H: Storage>(
         &mut self,
         storage: &mut H,
         schema_hash: SchemaHash,
         permissions: HashMap<TableName, TablePolicies>,
+        expected_parent_bundle_object_id: Option<ObjectId>,
+    ) -> Result<Option<ObjectId>, SchemaError> {
+        self.publish_permissions_bundle_with_indexes(
+            storage,
+            schema_hash,
+            permissions,
+            None,
+            expected_parent_bundle_object_id,
+        )
+    }
+
+    /// Publish `permissions` and the app's declared indexes: `None` carries the current
+    /// head's forward, `Some` replaces them (an empty set gives them up). They must fit
+    /// the schema published for (`IndexDeclarations::validate_against`), carried ones
+    /// included. A publish that changes neither is a no-op.
+    pub fn publish_permissions_bundle_with_indexes<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        schema_hash: SchemaHash,
+        permissions: HashMap<TableName, TablePolicies>,
+        declared_indexes: Option<IndexDeclarations>,
         expected_parent_bundle_object_id: Option<ObjectId>,
     ) -> Result<Option<ObjectId>, SchemaError> {
         let current_parent_bundle_object_id = self
@@ -1074,10 +1103,29 @@ impl SchemaManager {
             });
         }
 
+        let current_bundle = self
+            .current_permissions_head
+            .and_then(|head| self.known_permissions_bundles.get(&head.bundle_object_id));
+        let declared_indexes = match declared_indexes {
+            Some(declared_indexes) => declared_indexes,
+            None => current_bundle
+                .map(|bundle| bundle.declared_indexes.clone())
+                .unwrap_or_default(),
+        };
+        if !declared_indexes.is_empty() {
+            let schema = self
+                .schema_for_permissions_hash(schema_hash)
+                .ok_or(SchemaError::SchemaNotFound(schema_hash))?;
+            declared_indexes
+                .validate_against(&schema)
+                .map_err(|error| SchemaError::InvalidIndexDeclarations(error.0))?;
+        }
+
         if let Some(head) = self.current_permissions_head
             && head.schema_hash == schema_hash
-            && let Some(existing) = self.known_permissions_bundles.get(&head.bundle_object_id)
+            && let Some(existing) = current_bundle
             && existing.permissions == permissions
+            && existing.declared_indexes == declared_indexes
         {
             return Ok(Some(self.permissions_head_object_id()));
         }
@@ -1091,6 +1139,7 @@ impl SchemaManager {
             version,
             parent_bundle_object_id: current_parent_bundle_object_id,
             permissions,
+            declared_indexes,
         };
         let bundle_object_id = self.permissions_bundle_object_id(&bundle_state);
         self.known_permissions_bundles
@@ -1159,6 +1208,7 @@ impl SchemaManager {
             bundle.version,
             bundle.parent_bundle_object_id,
             &bundle.permissions,
+            &bundle.declared_indexes,
         ));
         ObjectId::from_uuid(Uuid::new_v5(&Uuid::NAMESPACE_DNS, &identity))
     }
@@ -1316,7 +1366,7 @@ impl SchemaManager {
             return Ok(());
         }
 
-        let (schema_hash, version, parent_bundle_object_id, permissions) =
+        let (schema_hash, version, parent_bundle_object_id, permissions, declared_indexes) =
             decode_permissions_bundle(content)
                 .map_err(|_| SchemaError::SchemaNotFound(SchemaHash::from_bytes([0; 32])))?;
         self.known_permissions_bundles.insert(
@@ -1326,6 +1376,7 @@ impl SchemaManager {
                 version,
                 parent_bundle_object_id,
                 permissions,
+                declared_indexes,
             },
         );
 
@@ -1428,6 +1479,7 @@ impl SchemaManager {
                 version: 1,
                 parent_bundle_object_id: None,
                 permissions,
+                declared_indexes: IndexDeclarations::empty(),
             },
         );
         let head = PermissionsHeadState {
@@ -1556,8 +1608,13 @@ impl SchemaManager {
         };
 
         let authorization_schema = merge_permissions_into_schema(&schema, &bundle.permissions);
+        let declared_indexes = bundle.declared_indexes.clone();
         self.query_manager
             .set_authorization_schema(authorization_schema);
+        // The store applies it at its next process; one that already maintains exactly
+        // these indexes does nothing.
+        self.query_manager
+            .propose_index_declarations(declared_indexes);
         true
     }
 
@@ -2692,6 +2749,7 @@ mod tests {
             version: 3,
             parent_bundle_object_id: Some(ObjectId::new()),
             permissions: permissions.clone(),
+            declared_indexes: IndexDeclarations::empty(),
         };
         let bundle_object_id = manager.permissions_bundle_object_id(&bundle);
         let head = PermissionsHeadState {
@@ -2725,6 +2783,7 @@ mod tests {
                     bundle.version,
                     bundle.parent_bundle_object_id,
                     &permissions,
+                    &bundle.declared_indexes,
                 ),
             )
             .expect("bundle should process");
@@ -2763,6 +2822,7 @@ mod tests {
             version: 1,
             parent_bundle_object_id: None,
             permissions: permissions.clone(),
+            declared_indexes: IndexDeclarations::empty(),
         };
         let bundle_object_id = manager.permissions_bundle_object_id(&bundle);
 
@@ -2812,6 +2872,7 @@ mod tests {
                     bundle.version,
                     bundle.parent_bundle_object_id,
                     &permissions,
+                    &bundle.declared_indexes,
                 ),
             )
             .expect("bundle should process");
@@ -3134,6 +3195,176 @@ mod tests {
             Some(head_a.bundle_object_id),
             "B must chain off A, not off the skipped no-op"
         );
+    }
+
+    fn user_name_search() -> IndexDeclarations {
+        IndexDeclarations::empty()
+            .with_trigram("users", "id", "name")
+            .expect("declaration")
+    }
+
+    fn maintained(storage: &crate::storage::MemoryStorage) -> IndexDeclarations {
+        crate::query_manager::declared_index::load_record(storage)
+            .expect("record")
+            .declarations
+    }
+
+    /// The declared indexes ride the permissions head: a publish that names them
+    /// replaces them, one that does not carries them forward, and the store adopts what
+    /// the head in force proposes.
+    #[test]
+    fn declared_indexes_ride_the_permissions_head() {
+        let schema = make_schema_v2();
+        let schema_hash = SchemaHash::compute(&schema);
+        let mut manager =
+            SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+        let mut storage = crate::storage::MemoryStorage::new();
+        let permissive = HashMap::from([(
+            TableName::new("users"),
+            TablePolicies::new().with_select(PolicyExpr::True),
+        )]);
+        let restrictive = HashMap::from([(
+            TableName::new("users"),
+            TablePolicies::new().with_select(PolicyExpr::False),
+        )]);
+
+        manager
+            .publish_permissions_bundle_with_indexes(
+                &mut storage,
+                schema_hash,
+                permissive.clone(),
+                Some(user_name_search()),
+                None,
+            )
+            .expect("publish with declared indexes");
+        manager.process(&mut storage);
+        assert_eq!(maintained(&storage), user_name_search());
+        let head_a = manager.current_permissions_head().expect("head A");
+
+        manager
+            .publish_permissions_bundle(
+                &mut storage,
+                schema_hash,
+                permissive,
+                Some(head_a.bundle_object_id),
+            )
+            .expect("republish");
+        assert_eq!(
+            manager.current_permissions_head(),
+            Some(head_a),
+            "the same permissions with the declarations carried is a no-op"
+        );
+
+        manager
+            .publish_permissions_bundle(
+                &mut storage,
+                schema_hash,
+                restrictive.clone(),
+                Some(head_a.bundle_object_id),
+            )
+            .expect("changed permissions");
+        let head_b = manager.current_permissions_head().expect("head B");
+        assert_eq!(head_b.version, head_a.version + 1);
+        assert_eq!(
+            manager
+                .current_permissions()
+                .expect("current permissions")
+                .declared_indexes,
+            user_name_search(),
+            "a publish that does not name them carries them forward"
+        );
+        manager.process(&mut storage);
+        assert_eq!(maintained(&storage), user_name_search());
+
+        manager
+            .publish_permissions_bundle_with_indexes(
+                &mut storage,
+                schema_hash,
+                restrictive,
+                Some(IndexDeclarations::empty()),
+                Some(head_b.bundle_object_id),
+            )
+            .expect("give them up");
+        let head_c = manager.current_permissions_head().expect("head C");
+        assert_eq!(
+            head_c.version,
+            head_b.version + 1,
+            "the same permissions with other declarations is a new head"
+        );
+        manager.process(&mut storage);
+        assert!(maintained(&storage).is_empty());
+    }
+
+    #[test]
+    fn declared_indexes_that_do_not_fit_the_schema_are_refused_at_publish() {
+        let schema = make_schema_v2();
+        let schema_hash = SchemaHash::compute(&schema);
+        let mut manager =
+            SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+        let mut storage = crate::storage::MemoryStorage::new();
+        let refused = manager.publish_permissions_bundle_with_indexes(
+            &mut storage,
+            schema_hash,
+            HashMap::new(),
+            Some(
+                IndexDeclarations::empty()
+                    .with_trigram("users", "id", "missing")
+                    .expect("well-formed"),
+            ),
+            None,
+        );
+        assert!(
+            matches!(refused, Err(SchemaError::InvalidIndexDeclarations(_))),
+            "{refused:?}"
+        );
+        assert_eq!(manager.current_permissions_head(), None);
+    }
+
+    /// A store that learns the head through the catalogue — a client, a restarted
+    /// server — maintains what the head declares.
+    #[test]
+    fn a_head_received_from_the_catalogue_proposes_its_declared_indexes() {
+        let schema = make_schema_v2();
+        let schema_hash = SchemaHash::compute(&schema);
+        let mut storage = crate::storage::MemoryStorage::new();
+        let mut manager =
+            SchemaManager::new(SyncManager::new(), schema, test_app_id(), "dev", "main").unwrap();
+        let permissions = HashMap::from([(
+            TableName::new("users"),
+            TablePolicies::new().with_select(PolicyExpr::True),
+        )]);
+        let bundle = PermissionsBundleState {
+            schema_hash,
+            version: 1,
+            parent_bundle_object_id: None,
+            permissions: permissions.clone(),
+            declared_indexes: user_name_search(),
+        };
+        let bundle_object_id = manager.permissions_bundle_object_id(&bundle);
+        manager
+            .process_catalogue_update(
+                bundle_object_id,
+                &manager.permissions_bundle_metadata(),
+                &encode_permissions_bundle(
+                    schema_hash,
+                    bundle.version,
+                    bundle.parent_bundle_object_id,
+                    &permissions,
+                    &bundle.declared_indexes,
+                ),
+            )
+            .expect("bundle should process");
+        manager
+            .process_catalogue_update(
+                manager.permissions_head_object_id(),
+                &manager.permissions_head_metadata(),
+                &encode_permissions_head(schema_hash, 1, None, bundle_object_id),
+            )
+            .expect("head should process");
+        assert_eq!(manager.pending_permissions_head, None);
+
+        manager.process(&mut storage);
+        assert_eq!(maintained(&storage), user_name_search());
     }
 
     #[test]

@@ -1781,3 +1781,106 @@ fn compile_query_with_unsupported_relation_ir_is_rejected() {
         "unsupported relation_ir should not silently fallback"
     );
 }
+
+/// A graph grows its windows against its own page only (`window_page`), so a window
+/// that lands in another graph — an input of a relation union, or a recursive seed —
+/// has no page to grow against there. It must not be able to stop short: it walks its
+/// whole range. `wmsgs` carries a declared `chat+at` composite index.
+#[test]
+fn a_window_absorbed_into_another_graph_walks_its_whole_range() {
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("wmsgs"),
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("chat", ColumnType::Uuid),
+            ColumnDescriptor::new("at", ColumnType::Timestamp),
+            ColumnDescriptor::new("dead", ColumnType::Boolean),
+            ColumnDescriptor::new("body", ColumnType::Text),
+        ])
+        .into(),
+    );
+    let page = |chat: ObjectId| RelExpr::Limit {
+        input: Box::new(RelExpr::OrderBy {
+            input: Box::new(RelExpr::Filter {
+                input: Box::new(RelExpr::TableScan {
+                    table: TableName::new("wmsgs"),
+                }),
+                predicate: PredicateExpr::And(vec![
+                    PredicateExpr::Cmp {
+                        left: ColumnRef::scoped("wmsgs", "chat"),
+                        op: PredicateCmpOp::Eq,
+                        right: ValueRef::Literal(Value::Uuid(chat)),
+                    },
+                    PredicateExpr::Cmp {
+                        left: ColumnRef::scoped("wmsgs", "dead"),
+                        op: PredicateCmpOp::Eq,
+                        right: ValueRef::Literal(Value::Boolean(false)),
+                    },
+                ]),
+            }),
+            terms: vec![OrderByExpr {
+                column: ColumnRef::scoped("wmsgs", "at"),
+                direction: OrderDirection::Desc,
+            }],
+        }),
+        limit: 10,
+    };
+    let branches = vec!["main".to_string()];
+    let declarations = std::sync::Arc::new(
+        crate::query_manager::index_declarations::IndexDeclarations::empty()
+            .with_composite("wmsgs", "chat", "at")
+            .expect("declaration"),
+    );
+    let context = crate::schema_manager::SchemaContext::with_defaults(schema.clone(), "main");
+    let compile = |relation: &RelExpr| {
+        QueryGraph::compile_relation_ir_with_schema_context_and_features(
+            relation,
+            &schema,
+            &branches,
+            None,
+            &context,
+            RelationCompileFeatures::default(),
+            RowPolicyMode::PermissiveLocal,
+            &declarations,
+        )
+    };
+
+    // The page on its own compiles to a window its graph grows.
+    let alone = compile(&page(ObjectId::new())).expect("a page relation compiles");
+    let windows = |graph: &QueryGraph| -> Vec<(NodeId, bool)> {
+        graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ctx)| match &ctx.node {
+                GraphNode::IndexScan(scan) if scan.is_window() => {
+                    Some((NodeId(index as u64), scan.window_may_stop_short()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let alone_windows = windows(&alone);
+    assert_eq!(alone_windows.len(), 1, "the page reads through one window");
+    assert!(
+        alone.window_scans.contains(&alone_windows[0].0),
+        "the page's own graph grows its window"
+    );
+
+    let union = RelExpr::Union {
+        inputs: vec![page(ObjectId::new()), page(ObjectId::new())],
+    };
+    let graph = compile(&union).expect("a union of pages compiles");
+    let union_windows = windows(&graph);
+    assert_eq!(
+        union_windows.len(),
+        2,
+        "each input reads through its window"
+    );
+    for (id, may_stop_short) in union_windows {
+        assert!(
+            graph.window_scans.contains(&id) || !may_stop_short,
+            "window {id:?} of a union input can stop short, and no page grows it"
+        );
+    }
+}

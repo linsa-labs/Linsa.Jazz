@@ -621,8 +621,8 @@ fn report(label: &str, outer_rows: usize, measured: Measured) {
 /// Which subscription shape a measurement runs against.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
-    /// The gate's shape: the include, with the OUTER query windowed to one
-    /// row. See [`include_inner_write_is_flat_in_cached_instance_count`] for
+    /// The gate's shape: a required include, with the OUTER query windowed
+    /// to one row. See [`include_inner_write_is_flat_in_cached_instance_count`] for
     /// why the window is what isolates the axis.
     Windowed,
     /// The include with no window: every outer row is also a DELIVERED row.
@@ -680,16 +680,27 @@ fn measure_shape(outer_rows: usize, shape: Shape) -> Measured {
     let builder = qm.query("users");
     let builder = match shape {
         Shape::UnwindowedWithoutInclude => builder,
-        Shape::Windowed | Shape::Unwindowed => builder.with_array("posts", |sub| {
+        // The windowed include is REQUIRED: whether an outer row survives
+        // depends on its include, so the plan has to build one for every
+        // outer row before it can take the window. An optional include under
+        // a limit is built for the window's rows only (`compile.rs` attaches
+        // it after the limit), which would leave one instance for any
+        // `outer_rows`. Every seeded user carries a post, so the requirement
+        // filters nothing out.
+        Shape::Windowed => builder.with_array("posts", |sub| {
+            sub.from("posts")
+                .correlate("author_id", "users.id")
+                .require_result()
+        }),
+        Shape::Unwindowed => builder.with_array("posts", |sub| {
             sub.from("posts").correlate("author_id", "users.id")
         }),
     };
     let query = match shape {
-        // `order_by` + `limit` land ABOVE the include in the compiled plan
-        // (see `compile.rs`: array subqueries, then magic columns, then
-        // filter/sort/limit), so every outer row still gets its own cached
-        // subgraph instance while only one row is delivered. The live-instance
-        // assertion below is what keeps that true if the plan ever changes.
+        // `order_by` + `limit` land ABOVE a required include in the compiled
+        // plan, so every outer row still gets its own cached subgraph instance
+        // while only one row is delivered. The live-instance assertion below is
+        // what keeps that true if the plan ever changes.
         Shape::Windowed => builder.order_by("id").limit(1).build(),
         Shape::Unwindowed | Shape::UnwindowedWithoutInclude => builder.build(),
     };

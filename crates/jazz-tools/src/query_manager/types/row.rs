@@ -274,6 +274,67 @@ impl RowDelta {
             && self.moved.is_empty()
             && self.updated.is_empty()
     }
+
+    /// The delta of `self` followed by `next`: from the state before `self` to the
+    /// state after `next`.
+    pub fn compose(self, next: RowDelta) -> RowDelta {
+        if self.is_empty() {
+            return next;
+        }
+        if next.is_empty() {
+            return self;
+        }
+        // Per row: its state before `self` and after `next` (`None` = absent), in
+        // first-touched order.
+        let mut order: Vec<ObjectId> = Vec::new();
+        let mut states: HashMap<ObjectId, (Option<Row>, Option<Row>)> = HashMap::new();
+        let mut touch =
+            |id: ObjectId, before: Option<Row>, after: Option<Row>| match states.entry(id) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().1 = after;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    order.push(id);
+                    entry.insert((before, after));
+                }
+            };
+        for row in self.added {
+            touch(row.id, None, Some(row));
+        }
+        for row in self.removed {
+            touch(row.id, Some(row), None);
+        }
+        for (old, new) in self.updated {
+            touch(new.id, Some(old), Some(new));
+        }
+        for row in next.added {
+            touch(row.id, None, Some(row));
+        }
+        for row in next.removed {
+            touch(row.id, Some(row), None);
+        }
+        for (old, new) in next.updated {
+            touch(new.id, Some(old), Some(new));
+        }
+
+        let mut composed = RowDelta::new();
+        for id in &order {
+            match states.remove(id) {
+                Some((None, Some(after))) => composed.added.push(after),
+                Some((Some(before), None)) => composed.removed.push(before),
+                Some((Some(before), Some(after))) => composed.updated.push((before, after)),
+                _ => {}
+            }
+        }
+        let touched: std::collections::HashSet<ObjectId> = order.into_iter().collect();
+        let mut moved_seen = std::collections::HashSet::new();
+        for id in self.moved.into_iter().chain(next.moved) {
+            if !touched.contains(&id) && moved_seen.insert(id) {
+                composed.moved.push(id);
+            }
+        }
+        composed
+    }
 }
 
 #[derive(Debug, Clone)]

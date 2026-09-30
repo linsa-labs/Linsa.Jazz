@@ -33,7 +33,8 @@ use super::{
     key_codec::increment_bytes,
     key_codec::raw_table_entry_key,
     storage_core::{
-        history_row_storage_key, raw_table_delete_core, raw_table_get_core, raw_table_put_core,
+        history_row_storage_key, raw_table_delete_core, raw_table_family_keys_core,
+        raw_table_family_last_key_core, raw_table_get_core, raw_table_put_core,
         raw_table_scan_prefix_core, raw_table_scan_prefix_keys_core, raw_table_scan_range_core,
         raw_table_scan_range_keys_core, visible_row_storage_key,
     },
@@ -358,6 +359,46 @@ impl Storage for OpfsBTreeStorage {
         raw_table_scan_range_keys_core(table, start, end, |start_key, end_key| {
             self.tree_scan_range_keys(start_key, end_key)
         })
+    }
+
+    /// Reads the whole remaining range and cuts it: the tree has no bounded scan, so a
+    /// walk over a large family costs O(family) per page here.
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        raw_table_family_keys_core(name_prefix, after, limit, |start, end, limit| {
+            let mut keys = self.tree_scan_range_keys(start, end)?;
+            keys.truncate(limit);
+            Ok(keys)
+        })
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        raw_table_family_last_key_core(name_prefix, |start, end| {
+            Ok(self
+                .tree_scan_range_keys(start, end)?
+                .pop()
+                .into_iter()
+                .collect())
+        })
+    }
+
+    fn store_format_version(&self) -> Result<Option<i32>, StorageError> {
+        self.tree_read(super::STORE_MANIFEST_KEY)?
+            .map(|bytes| super::decode_store_manifest(&bytes))
+            .transpose()
+            .map(|manifest| manifest.map(|manifest| manifest.store_format_version))
+    }
+
+    fn set_store_format_version(&mut self, version: i32) -> Result<(), StorageError> {
+        let bytes = super::encode_store_manifest(&super::StoreManifest {
+            store_kind: super::OPFS_BTREE_STORE_KIND.to_string(),
+            store_format_version: version,
+        })?;
+        self.tree_insert(super::STORE_MANIFEST_KEY, &bytes)
     }
 
     fn append_history_region_row_bytes(

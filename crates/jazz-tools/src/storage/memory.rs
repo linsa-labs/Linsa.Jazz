@@ -679,6 +679,70 @@ impl Storage for MemoryStorage {
         })
     }
 
+    fn raw_table_scan_range_keys_limited(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<RawTableKeys, StorageError> {
+        use std::ops::Bound;
+        let Some(rows) = self.raw_tables.get(table) else {
+            return Ok(Vec::new());
+        };
+        if let (Some(start), Some(end)) = (start, end)
+            && start >= end
+        {
+            return Ok(Vec::new());
+        }
+        let lower = start.map_or(Bound::Unbounded, |start| Bound::Included(start.to_string()));
+        let upper = end.map_or(Bound::Unbounded, |end| Bound::Excluded(end.to_string()));
+        let range = rows.range::<String, _>((lower, upper));
+        Ok(if reverse {
+            range
+                .rev()
+                .take(limit)
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else {
+            range.take(limit).map(|(key, _)| key.clone()).collect()
+        })
+    }
+
+    /// The flat order of the family's keys, as a flat key-value backend walks it:
+    /// `{rest of the table name}:{key}` compared as strings, which is not the order of
+    /// (table name, key) — a table name that extends another sorts by its next byte
+    /// against `:`.
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut keys: Vec<String> = self
+            .raw_tables
+            .iter()
+            .filter_map(|(table, rows)| table.strip_prefix(name_prefix).map(|rest| (rest, rows)))
+            .flat_map(|(rest, rows)| rows.keys().map(move |key| format!("{rest}:{key}")))
+            .filter(|key| after.is_none_or(|after| key.as_str() > after))
+            .collect();
+        keys.sort_unstable();
+        keys.truncate(limit);
+        Ok(keys)
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .raw_tables
+            .iter()
+            .filter_map(|(table, rows)| {
+                let rest = table.strip_prefix(name_prefix)?;
+                rows.keys().next_back().map(|key| format!("{rest}:{key}"))
+            })
+            .max())
+    }
+
     fn append_history_region_rows(
         &mut self,
         table: &str,

@@ -16,10 +16,10 @@ use super::{
     HistoryRowBytes, IndexMutation, OwnedHistoryRowBytes, OwnedVisibleRowBytes, RawTableMutation,
     Storage, StorageError, VisibleRowBytes, key_codec,
     storage_core::{
-        append_history_region_row_bytes_core, raw_table_delete_core, raw_table_get_core,
-        raw_table_put_core, raw_table_scan_prefix_core, raw_table_scan_prefix_keys_core,
-        raw_table_scan_range_core, raw_table_scan_range_keys_core,
-        upsert_visible_region_row_bytes_core,
+        append_history_region_row_bytes_core, raw_table_delete_core, raw_table_family_keys_core,
+        raw_table_family_last_key_core, raw_table_get_core, raw_table_put_core,
+        raw_table_scan_prefix_core, raw_table_scan_prefix_keys_core, raw_table_scan_range_core,
+        raw_table_scan_range_keys_core, upsert_visible_region_row_bytes_core,
     },
 };
 use crate::object::ObjectId;
@@ -316,12 +316,89 @@ impl SqliteStorage {
         Ok(out)
     }
 
+    fn scan_range_keys_limited(
+        conn: &rusqlite::Connection,
+        start: &str,
+        end: &str,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let sql = if reverse {
+            "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key DESC LIMIT ?3"
+        } else {
+            "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key LIMIT ?3"
+        };
+        let mut stmt = conn.prepare_cached(sql).map_err(|e| {
+            StorageError::IoError(format!("sqlite prepare scan_range_keys_limited: {e}"))
+        })?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(
+                rusqlite::params![start.as_bytes(), end.as_bytes(), limit],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|e| StorageError::IoError(format!("sqlite scan_range_keys_limited: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let key_bytes = row.map_err(|e| {
+                StorageError::IoError(format!("sqlite scan_range_keys_limited row: {e}"))
+            })?;
+            let key = String::from_utf8(key_bytes)
+                .map_err(|e| StorageError::IoError(format!("sqlite key utf8: {e}")))?;
+            out.push(key);
+        }
+        Ok(out)
+    }
+
     fn set(conn: &rusqlite::Connection, key: &str, value: &[u8]) -> Result<(), StorageError> {
         conn.prepare_cached("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
             .map_err(|e| StorageError::IoError(format!("sqlite prepare set: {e}")))?
             .execute(rusqlite::params![key.as_bytes(), value])
             .map(|_| ())
             .map_err(|e| StorageError::IoError(format!("sqlite set: {e}")))
+    }
+
+    /// Writes index entries on the open connection, inside the caller's savepoint.
+    fn write_index_mutations(
+        conn: &rusqlite::Connection,
+        index_mutations: &[IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        for mutation in index_mutations {
+            match mutation {
+                IndexMutation::Insert {
+                    table,
+                    column,
+                    branch,
+                    value,
+                    row_id,
+                } => {
+                    let raw_table = key_codec::index_raw_table(table, column, branch);
+                    let key = key_codec::index_entry_key(table, column, branch, value, *row_id)?;
+                    raw_table_put_core(&raw_table, &key, &[0x01], |storage_key, bytes| {
+                        Self::set(conn, storage_key, bytes)
+                    })?;
+                }
+                IndexMutation::Remove {
+                    table,
+                    column,
+                    branch,
+                    value,
+                    row_id,
+                } => {
+                    let key =
+                        match key_codec::index_entry_key(table, column, branch, value, *row_id) {
+                            Ok(key) => key,
+                            Err(StorageError::IndexKeyTooLarge { .. }) => continue,
+                            Err(error) => return Err(error),
+                        };
+                    let raw_table = key_codec::index_raw_table(table, column, branch);
+                    raw_table_delete_core(&raw_table, &key, |storage_key| {
+                        Self::delete(conn, storage_key)
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn delete(conn: &rusqlite::Connection, key: &str) -> Result<(), StorageError> {
@@ -409,6 +486,27 @@ impl Storage for SqliteStorage {
                             }
                         }
                         Ok(())
+                    })
+                })
+            },
+        )
+    }
+
+    /// One savepoint for the whole batch, as `apply_encoded_row_mutation` writes a row's
+    /// entries. The trait's default writes entry by entry, and on SQLite every
+    /// `raw_table_put` opens its own savepoint, whose first touch of each b-tree page
+    /// copies that page to the statement journal.
+    fn apply_index_mutations(
+        &mut self,
+        mutations: &[IndexMutation<'_>],
+    ) -> Result<(), StorageError> {
+        crate::query_manager::settle_cost::timed(
+            &crate::query_manager::settle_cost::STORAGE_WRITE_MICROS,
+            || {
+                self.with_inner_mut(|inner| {
+                    inner.ensure_write_tx()?;
+                    Self::with_savepoint(&inner.conn, || {
+                        Self::write_index_mutations(&inner.conn, mutations)
                     })
                 })
             },
@@ -508,6 +606,62 @@ impl Storage for SqliteStorage {
             raw_table_scan_range_keys_core(table, start, end, |start_key, end_key| {
                 Self::scan_range_keys(&inner.conn, start_key, end_key)
             })
+        })
+    }
+
+    fn raw_table_scan_range_keys_limited(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<super::RawTableKeys, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_scan_range_keys_core(table, start, end, |start_key, end_key| {
+                Self::scan_range_keys_limited(&inner.conn, start_key, end_key, reverse, limit)
+            })
+        })
+    }
+
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_family_keys_core(name_prefix, after, limit, |start, end, limit| {
+                Self::scan_range_keys_limited(&inner.conn, start, end, false, limit)
+            })
+        })
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_family_last_key_core(name_prefix, |start, end| {
+                Self::scan_range_keys_limited(&inner.conn, start, end, true, 1)
+            })
+        })
+    }
+
+    fn store_format_version(&self) -> Result<Option<i32>, StorageError> {
+        self.with_inner(|inner| {
+            Self::get(&inner.conn, super::STORE_MANIFEST_KEY)?
+                .map(|bytes| super::decode_store_manifest(&bytes))
+                .transpose()
+                .map(|manifest| manifest.map(|manifest| manifest.store_format_version))
+        })
+    }
+
+    fn set_store_format_version(&mut self, version: i32) -> Result<(), StorageError> {
+        let bytes = super::encode_store_manifest(&super::StoreManifest {
+            store_kind: super::SQLITE_STORE_KIND.to_string(),
+            store_format_version: version,
+        })?;
+        self.with_inner_mut(|inner| {
+            inner.ensure_write_tx()?;
+            Self::set(&inner.conn, super::STORE_MANIFEST_KEY, &bytes)
         })
     }
 
@@ -750,45 +904,7 @@ impl Storage for SqliteStorage {
                     }
                 }
 
-                for mutation in index_mutations {
-                    match mutation {
-                        IndexMutation::Insert {
-                            table,
-                            column,
-                            branch,
-                            value,
-                            row_id,
-                        } => {
-                            let raw_table = key_codec::index_raw_table(table, column, branch);
-                            let key =
-                                key_codec::index_entry_key(table, column, branch, value, *row_id)?;
-                            raw_table_put_core(&raw_table, &key, &[0x01], |storage_key, bytes| {
-                                Self::set(&inner.conn, storage_key, bytes)
-                            })?;
-                        }
-                        IndexMutation::Remove {
-                            table,
-                            column,
-                            branch,
-                            value,
-                            row_id,
-                        } => {
-                            let key = match key_codec::index_entry_key(
-                                table, column, branch, value, *row_id,
-                            ) {
-                                Ok(key) => key,
-                                Err(StorageError::IndexKeyTooLarge { .. }) => continue,
-                                Err(error) => return Err(error),
-                            };
-                            let raw_table = key_codec::index_raw_table(table, column, branch);
-                            raw_table_delete_core(&raw_table, &key, |storage_key| {
-                                Self::delete(&inner.conn, storage_key)
-                            })?;
-                        }
-                    }
-                }
-
-                Ok(())
+                Self::write_index_mutations(&inner.conn, index_mutations)
             })
         })
     }
@@ -923,6 +1039,52 @@ mod tests {
         storage.close().unwrap();
         let reopened = SqliteStorage::open(&db_path).unwrap();
         reopened.close().unwrap();
+    }
+
+    /// A batch of index mutations goes through one savepoint, as a row's entries do in
+    /// `apply_encoded_row_mutation`: an entry that cannot be written takes the batch's
+    /// earlier entries back with it. Written entry by entry, each under its own savepoint,
+    /// the entries before the failure stayed, and filling a declared index over a
+    /// 100k-message table cost 5.5 s of CPU instead of 2.1.
+    #[test]
+    fn a_batch_of_index_mutations_applies_as_one_unit() {
+        use crate::object::ObjectId;
+        use crate::query_manager::types::Value;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(dir.path().join("test.sqlite")).unwrap();
+        let row_id = ObjectId::new();
+        let written = Value::Integer(1);
+        // A long value only overflows into a hashed segment; a key too large to write
+        // takes a column name longer than the key limit.
+        let unkeyable_column = "c".repeat(6 * 1024);
+        let mutations = [
+            IndexMutation::Insert {
+                table: "t",
+                column: "c",
+                branch: "main",
+                value: written.clone(),
+                row_id,
+            },
+            IndexMutation::Insert {
+                table: "t",
+                column: &unkeyable_column,
+                branch: "main",
+                value: Value::Integer(2),
+                row_id,
+            },
+        ];
+
+        assert!(matches!(
+            storage.apply_index_mutations(&mutations),
+            Err(StorageError::IndexKeyTooLarge { .. })
+        ));
+        assert!(
+            !storage
+                .index_contains("t", "c", "main", &written, row_id)
+                .unwrap(),
+            "the entry before the failed one outlived its batch"
+        );
     }
 
     #[test]

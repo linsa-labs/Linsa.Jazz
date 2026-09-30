@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use crate::object::ObjectId;
+use crate::query_manager::index_declarations::IndexDeclarations;
 use crate::query_manager::policy::{CmpOp, Operation, PolicyExpr, PolicyValue};
 use crate::query_manager::types::{
     ColumnDescriptor, ColumnMergeStrategy, ColumnName, ColumnType, RowDescriptor, Schema,
@@ -22,6 +23,15 @@ const LENS_VERSION: u8 = 2;
 const PERMISSIONS_VERSION: u8 = 1;
 const PERMISSIONS_BUNDLE_VERSION: u8 = 2;
 const PERMISSIONS_HEAD_VERSION: u8 = 2;
+/// Sections a permissions bundle may carry after its payload, each `tag, u32 length,
+/// bytes`. Decoders before them read the payload by its length and stop there, and
+/// a decoder skips a tag it does not know.
+///
+/// A section's own encoding is fixed for good: a version of it the decoder does not
+/// know fails the whole bundle (`IndexDeclarations::decode`), and with it the
+/// permissions head, on every engine that reads it. A new kind of index or a new
+/// encoding goes into a section of its own, under a new tag.
+const BUNDLE_SECTION_DECLARED_INDEXES: u8 = 1;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
@@ -1080,11 +1090,14 @@ pub fn decode_permissions(
     Ok(permissions)
 }
 
+/// A bundle with no declared indexes encodes as it did before the section existed,
+/// so its object id and bytes are the ones older engines produce.
 pub fn encode_permissions_bundle(
     schema_hash: SchemaHash,
     version: u64,
     parent_bundle_object_id: Option<ObjectId>,
     permissions: &HashMap<TableName, TablePolicies>,
+    declared_indexes: &IndexDeclarations,
 ) -> Vec<u8> {
     let encoded_permissions = encode_permissions(permissions);
     let mut buf = Vec::with_capacity(1 + 32 + 8 + 1 + 16 + 4 + encoded_permissions.len());
@@ -1100,6 +1113,12 @@ pub fn encode_permissions_bundle(
     }
     write_u32(&mut buf, encoded_permissions.len() as u32);
     buf.extend_from_slice(&encoded_permissions);
+    if !declared_indexes.is_empty() {
+        let section = declared_indexes.encode();
+        buf.push(BUNDLE_SECTION_DECLARED_INDEXES);
+        write_u32(&mut buf, section.len() as u32);
+        buf.extend_from_slice(&section);
+    }
     buf
 }
 
@@ -1108,6 +1127,7 @@ type DecodedPermissionsBundle = (
     u64,
     Option<ObjectId>,
     HashMap<TableName, TablePolicies>,
+    IndexDeclarations,
 );
 
 pub fn decode_permissions_bundle(
@@ -1143,7 +1163,13 @@ fn decode_permissions_bundle_v1(
     let payload_len = read_u32(data, &mut offset)? as usize;
     let payload = read_bytes(data, &mut offset, payload_len)?;
     let permissions = decode_permissions(payload)?;
-    Ok((schema_hash, 1, None, permissions))
+    Ok((
+        schema_hash,
+        1,
+        None,
+        permissions,
+        IndexDeclarations::empty(),
+    ))
 }
 
 fn decode_permissions_bundle_v2(
@@ -1171,7 +1197,26 @@ fn decode_permissions_bundle_v2(
     let payload_len = read_u32(data, &mut offset)? as usize;
     let payload = read_bytes(data, &mut offset, payload_len)?;
     let permissions = decode_permissions(payload)?;
-    Ok((schema_hash, version, parent_bundle_object_id, permissions))
+    let mut declared_indexes = IndexDeclarations::empty();
+    while offset < data.len() {
+        let tag = read_u8(data, &mut offset)?;
+        let len = read_u32(data, &mut offset)? as usize;
+        let section = read_bytes(data, &mut offset, len)?;
+        if tag == BUNDLE_SECTION_DECLARED_INDEXES {
+            declared_indexes = IndexDeclarations::decode(section).map_err(|err| {
+                CatalogueEncodingError::DecodeError {
+                    message: format!("invalid declared indexes in permissions bundle: {err}"),
+                }
+            })?;
+        }
+    }
+    Ok((
+        schema_hash,
+        version,
+        parent_bundle_object_id,
+        permissions,
+        declared_indexes,
+    ))
 }
 
 pub fn encode_permissions_head(
@@ -2564,15 +2609,85 @@ mod tests {
             TablePolicies::new().with_select(PolicyExpr::True),
         )]);
 
-        let encoded =
-            encode_permissions_bundle(schema_hash, version, parent_bundle_object_id, &permissions);
-        let (decoded_hash, decoded_version, decoded_parent_bundle_object_id, decoded_permissions) =
-            decode_permissions_bundle(&encoded).expect("bundle should decode");
+        let encoded = encode_permissions_bundle(
+            schema_hash,
+            version,
+            parent_bundle_object_id,
+            &permissions,
+            &IndexDeclarations::empty(),
+        );
+        let (
+            decoded_hash,
+            decoded_version,
+            decoded_parent_bundle_object_id,
+            decoded_permissions,
+            decoded_declared_indexes,
+        ) = decode_permissions_bundle(&encoded).expect("bundle should decode");
 
         assert_eq!(decoded_hash, schema_hash);
         assert_eq!(decoded_version, version);
         assert_eq!(decoded_parent_bundle_object_id, parent_bundle_object_id);
         assert_eq!(decoded_permissions, permissions);
+        assert!(decoded_declared_indexes.is_empty());
+    }
+
+    /// The declared indexes ride after the payload. Without them a bundle is byte for
+    /// byte what engines before the section wrote; with them, a decoder that reads the
+    /// payload by its length — as those engines do — still reads the same permissions.
+    #[test]
+    fn permissions_bundle_carries_declared_indexes_after_its_payload() {
+        let schema_hash = SchemaHash::compute(
+            &SchemaBuilder::new()
+                .table(TableSchema::builder("todos").column("title", ColumnType::Text))
+                .build(),
+        );
+        let permissions = HashMap::from([(
+            TableName::new("todos"),
+            TablePolicies::new().with_select(PolicyExpr::True),
+        )]);
+        let declared = IndexDeclarations::empty()
+            .with_composite("messages", "chatId", "createdAtMs")
+            .unwrap()
+            .with_trigram("messages", "chatId", "text")
+            .unwrap();
+
+        let plain = encode_permissions_bundle(
+            schema_hash,
+            3,
+            None,
+            &permissions,
+            &IndexDeclarations::empty(),
+        );
+        let payload = encode_permissions(&permissions);
+        assert_eq!(
+            plain.len(),
+            1 + 32 + 8 + 1 + 4 + payload.len(),
+            "no section without declared indexes"
+        );
+
+        let carried = encode_permissions_bundle(schema_hash, 3, None, &permissions, &declared);
+        assert_eq!(
+            &carried[..plain.len()],
+            &plain[..],
+            "the section only appends"
+        );
+        let (_, _, _, decoded_permissions, decoded_declared) =
+            decode_permissions_bundle(&carried).expect("bundle should decode");
+        assert_eq!(decoded_permissions, permissions);
+        assert_eq!(decoded_declared, declared);
+
+        // A section this engine does not know is skipped.
+        let mut future = carried.clone();
+        future.push(0xEE);
+        future.extend_from_slice(&3u32.to_le_bytes());
+        future.extend_from_slice(b"new");
+        let (_, _, _, _, decoded_declared) =
+            decode_permissions_bundle(&future).expect("unknown section is skipped");
+        assert_eq!(decoded_declared, declared);
+
+        let mut truncated = carried.clone();
+        truncated.pop();
+        assert!(decode_permissions_bundle(&truncated).is_err());
     }
 
     #[test]

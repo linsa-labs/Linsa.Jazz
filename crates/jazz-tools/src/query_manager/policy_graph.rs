@@ -327,6 +327,11 @@ impl PolicyGraph {
             } else {
                 row_policy_mode
             },
+            // A policy's relation reads no declared index: authorization answers must
+            // not depend on what a store has filled.
+            &std::sync::Arc::new(
+                crate::query_manager::index_declarations::IndexDeclarations::empty(),
+            ),
         )?;
         let output_descriptor = match graph
             .nodes

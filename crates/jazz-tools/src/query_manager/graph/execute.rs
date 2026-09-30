@@ -11,6 +11,9 @@ use crate::sync_manager::RowBatchKey;
 use super::super::graph_nodes::{NodeId, RowNode, SourceContext, SourceNode, TransformNode};
 use super::{GraphNode, QueryGraph};
 
+/// Settle passes one settle may add to grow ordered windows (each doubles the walk).
+pub(crate) const MAX_WINDOW_GROWTHS: usize = 24;
+
 impl QueryGraph {
     /// Mark a node as dirty using the bitmap.
     pub fn mark_dirty(&mut self, id: NodeId) {
@@ -480,6 +483,27 @@ impl QueryGraph {
         }
     }
 
+    /// Ordered tuples of a node, owned. An include built past a page's LimitOffset
+    /// keeps the page's order: its ordered output is its ordered input mapped through
+    /// its current tuples (tuple identity is the row ids, which the include keeps).
+    fn ordered_tuples_owned(&self, node_id: NodeId) -> Option<Vec<Tuple>> {
+        if self.deferred_arrays_tail.is_some()
+            && let Some(GraphNode::ArraySubquery(node)) = self.get_node(node_id)
+        {
+            let input = self.get_inputs(node_id).first().copied()?;
+            let ordered_input = self.ordered_tuples_owned(input)?;
+            let current = RowNode::current_tuples(node);
+            return Some(
+                ordered_input
+                    .iter()
+                    .filter_map(|tuple| current.get(tuple).cloned())
+                    .collect(),
+            );
+        }
+        self.ordered_tuples_from_node(node_id)
+            .map(<[Tuple]>::to_vec)
+    }
+
     fn ordered_tuples_from_node(&self, node_id: NodeId) -> Option<&[Tuple]> {
         match self.get_node(node_id) {
             Some(GraphNode::Sort(node)) => Some(node.sorted_tuples()),
@@ -524,6 +548,114 @@ impl QueryGraph {
     }
 
     fn settle_with_context<F>(
+        &mut self,
+        storage: &dyn Storage,
+        local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
+        mut settlement_eval_cache: Option<&mut SettlementEvalCache>,
+        mut row_loader: F,
+    ) -> RowDelta
+    where
+        F: FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    {
+        let mut delta = self.settle_pass(
+            storage,
+            local_overlay_rows,
+            settlement_eval_cache.as_deref_mut(),
+            &mut row_loader,
+        );
+        // A window that left the page short walks further, and the graph settles
+        // again; each growth doubles the walk, so this bound is never the limit in
+        // practice. One settle reports the composed change.
+        for _ in 0..MAX_WINDOW_GROWTHS {
+            if !self.grow_short_windows() {
+                break;
+            }
+            let next = self.settle_pass(
+                storage,
+                local_overlay_rows,
+                settlement_eval_cache.as_deref_mut(),
+                &mut row_loader,
+            );
+            delta = delta.compose(next);
+        }
+        delta
+    }
+
+    /// Grow every window whose frontier stops short of the page's last row (see
+    /// `IndexScanNode::window_needs_growth`) and dirty it for the next pass.
+    fn grow_short_windows(&mut self) -> bool {
+        let Some((sort, cap)) = self.window_page() else {
+            return false;
+        };
+        let edge = (sort.sorted_tuples().len() >= cap).then(|| cap - 1);
+        self.grow_windows_short_of(edge)
+    }
+
+    /// The Sort the windows feed and the page's prefix cap, when the graph has windows
+    /// and a page.
+    fn window_page(&self) -> Option<(&crate::query_manager::graph_nodes::sort::SortNode, usize)> {
+        if self.window_scans.is_empty() {
+            return None;
+        }
+        let (Some(sort_id), Some(page_id)) = (self.window_sort, self.pagination_node) else {
+            return None;
+        };
+        let Some(GraphNode::LimitOffset(page)) = self.get_node(page_id) else {
+            return None;
+        };
+        let cap = page.sync_prefix_cap().filter(|cap| *cap > 0)?;
+        let Some(GraphNode::Sort(sort)) = self.get_node(sort_id) else {
+            return None;
+        };
+        Some((sort, cap))
+    }
+
+    /// Grow every window whose frontier stops short of the Sort's row at `edge` — every
+    /// window not yet exhausted when `edge` is `None`, the page having run out of rows —
+    /// and dirty it for the next settle. Returns whether any window grew.
+    ///
+    /// The graph grows its windows against the page's own last row as it settles. A
+    /// server graph carries no policy filter, so the rows its scope may use are fewer
+    /// than the Sort holds: its scope walk (`filtered_sync_scope_tuples`) passes the
+    /// position of the last row the session may read, and grows from there.
+    pub(crate) fn grow_windows_short_of(&mut self, edge: Option<usize>) -> bool {
+        let Some((sort, _)) = self.window_page() else {
+            return false;
+        };
+        let edge = edge
+            .and_then(|position| sort.first_key_value_at(position))
+            .and_then(|value| crate::query_manager::composite_index::fixed_width_encoding(&value))
+            .map(|bytes| crate::query_manager::composite_index::hex(&bytes));
+        let short: Vec<NodeId> = self
+            .window_scans
+            .iter()
+            .copied()
+            .filter(|scan_id| {
+                matches!(
+                    self.get_node(*scan_id),
+                    Some(GraphNode::IndexScan(scan)) if scan.window_needs_growth(edge.as_deref())
+                )
+            })
+            .collect();
+        let mut grew = false;
+        for scan_id in short {
+            if let Some(GraphNode::IndexScan(scan)) = self.get_node_mut(scan_id)
+                && scan.grow_window()
+            {
+                grew = true;
+                self.mark_dirty(scan_id);
+                self.mark_downstream_dirty(scan_id);
+            }
+        }
+        if grew {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::WINDOW_GROWTHS,
+            );
+        }
+        grew
+    }
+
+    fn settle_pass<F>(
         &mut self,
         storage: &dyn Storage,
         local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
@@ -678,9 +810,7 @@ impl QueryGraph {
                     let input_delta = input_node
                         .and_then(|dep| tuple_deltas.get(&dep).cloned())
                         .unwrap_or_default();
-                    let ordered_input = input_node
-                        .and_then(|dep| self.ordered_tuples_from_node(dep))
-                        .map(<[Tuple]>::to_vec);
+                    let ordered_input = input_node.and_then(|dep| self.ordered_tuples_owned(dep));
 
                     if let Some(GraphNode::Project(project_node)) = self.get_node_mut(node_id) {
                         let delta = if let Some(ordered) = ordered_input {
@@ -780,9 +910,7 @@ impl QueryGraph {
                     let input_delta = input_node
                         .and_then(|dep| tuple_deltas.get(&dep).cloned())
                         .unwrap_or_default();
-                    let ordered_input = input_node
-                        .and_then(|dep| self.ordered_tuples_from_node(dep))
-                        .map(<[Tuple]>::to_vec);
+                    let ordered_input = input_node.and_then(|dep| self.ordered_tuples_owned(dep));
 
                     if let Some(GraphNode::MagicColumns(magic_node)) = self.get_node_mut(node_id) {
                         let delta = if let Some(ordered) = ordered_input {
@@ -949,9 +1077,7 @@ impl QueryGraph {
                 }
                 Some(GraphNode::Output(_)) => {
                     let input_node = self.get_inputs(node_id).first().copied();
-                    let ordered_input = input_node
-                        .and_then(|dep| self.ordered_tuples_from_node(dep))
-                        .map(<[Tuple]>::to_vec);
+                    let ordered_input = input_node.and_then(|dep| self.ordered_tuples_owned(dep));
 
                     if let Some(GraphNode::Output(output_node)) = self.get_node_mut(node_id) {
                         let delta = if let Some(ordered) = ordered_input {

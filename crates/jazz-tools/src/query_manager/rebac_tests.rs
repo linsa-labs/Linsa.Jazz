@@ -369,6 +369,7 @@ fn seed_folder_on_branch(
     );
     QueryManager::update_indices_for_insert_on_branch(
         storage,
+        &crate::query_manager::index_declarations::IndexDeclarations::empty(),
         "folders",
         branch,
         folder_id,

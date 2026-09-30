@@ -1,6 +1,6 @@
 use super::key_codec::{
-    history_row_raw_table_key, increment_string, raw_table_entry_key, raw_table_prefix,
-    raw_table_scan_prefix, strip_raw_table_key, visible_row_raw_table_key,
+    history_row_raw_table_key, increment_string, raw_table_entry_key, raw_table_family_prefix,
+    raw_table_prefix, raw_table_scan_prefix, strip_raw_table_key, visible_row_raw_table_key,
 };
 use super::{HistoryRowBytes, RawTableKeys, RawTableRows, StorageError, VisibleRowBytes};
 
@@ -97,6 +97,43 @@ pub(super) fn raw_table_scan_range_keys_core(
         .into_iter()
         .filter_map(|key| strip_raw_table_key(table, &key).map(str::to_string))
         .collect())
+}
+
+/// `Storage::raw_table_family_keys` over a backend's flat key space, given its bounded
+/// forward key scan `[start, end)`.
+pub(super) fn raw_table_family_keys_core(
+    name_prefix: &str,
+    after: Option<&str>,
+    limit: usize,
+    mut scan_range_keys_limited: impl FnMut(&str, &str, usize) -> Result<Vec<String>, StorageError>,
+) -> Result<Vec<String>, StorageError> {
+    let family = raw_table_family_prefix(name_prefix);
+    // `after` followed by a NUL byte is the least key greater than `after`.
+    let start = match after {
+        Some(after) => format!("{family}{after}\0"),
+        None => family.clone(),
+    };
+    let mut end = family.clone();
+    increment_string(&mut end);
+    Ok(scan_range_keys_limited(&start, &end, limit)?
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(family.as_str()).map(str::to_string))
+        .collect())
+}
+
+/// `Storage::raw_table_family_last_key` over a backend's flat key space, given its
+/// bounded reverse key scan `[start, end)`.
+pub(super) fn raw_table_family_last_key_core(
+    name_prefix: &str,
+    mut scan_range_keys_reverse: impl FnMut(&str, &str) -> Result<Vec<String>, StorageError>,
+) -> Result<Option<String>, StorageError> {
+    let family = raw_table_family_prefix(name_prefix);
+    let mut end = family.clone();
+    increment_string(&mut end);
+    Ok(scan_range_keys_reverse(&family, &end)?
+        .into_iter()
+        .next()
+        .and_then(|key| key.strip_prefix(family.as_str()).map(str::to_string)))
 }
 
 pub(super) fn history_row_storage_key(row: &HistoryRowBytes<'_>) -> String {

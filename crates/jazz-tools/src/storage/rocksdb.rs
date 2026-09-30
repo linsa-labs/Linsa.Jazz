@@ -17,10 +17,10 @@ use super::{
     HistoryRowBytes, IndexMutation, RawTableMutation, Storage, StorageError, VisibleRowBytes,
     key_codec,
     storage_core::{
-        append_history_region_row_bytes_core, raw_table_delete_core, raw_table_get_core,
-        raw_table_put_core, raw_table_scan_prefix_core, raw_table_scan_prefix_keys_core,
-        raw_table_scan_range_core, raw_table_scan_range_keys_core,
-        upsert_visible_region_row_bytes_core,
+        append_history_region_row_bytes_core, raw_table_delete_core, raw_table_family_keys_core,
+        raw_table_family_last_key_core, raw_table_get_core, raw_table_put_core,
+        raw_table_scan_prefix_core, raw_table_scan_prefix_keys_core, raw_table_scan_range_core,
+        raw_table_scan_range_keys_core, upsert_visible_region_row_bytes_core,
     },
 };
 use crate::object::ObjectId;
@@ -335,6 +335,40 @@ impl RocksDBStorage {
         Ok(out)
     }
 
+    fn scan_range_keys_limited_from_db(
+        db: &TransactionDB,
+        start: &str,
+        end: &str,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_lower_bound(start.as_bytes().to_vec());
+        read_opts.set_iterate_upper_bound(end.as_bytes().to_vec());
+        // A raw iterator for the same reason as `scan_prefix_keys_from_db`: keys only.
+        let mut out = Vec::new();
+        let mut iter = db.raw_iterator_opt(read_opts);
+        if reverse {
+            iter.seek_to_last();
+        } else {
+            iter.seek(start.as_bytes());
+        }
+        while iter.valid() && out.len() < limit {
+            let Some(key) = iter.key() else { break };
+            let key_str = String::from_utf8(key.to_vec())
+                .map_err(|e| StorageError::IoError(format!("rocksdb invalid key utf8: {e}")))?;
+            out.push(key_str);
+            if reverse {
+                iter.prev();
+            } else {
+                iter.next();
+            }
+        }
+        iter.status()
+            .map_err(|e| StorageError::IoError(format!("rocksdb iter: {e}")))?;
+        Ok(out)
+    }
+
     // ---- transaction helpers ----
 
     fn put_on_txn<'a>(
@@ -601,6 +635,63 @@ impl Storage for RocksDBStorage {
             raw_table_scan_range_keys_core(table, start, end, |start_key, end_key| {
                 Self::scan_range_keys_from_db(&inner.db, start_key, end_key)
             })
+        })
+    }
+
+    fn raw_table_scan_range_keys_limited(
+        &self,
+        table: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        reverse: bool,
+        limit: usize,
+    ) -> Result<super::RawTableKeys, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_scan_range_keys_core(table, start, end, |start_key, end_key| {
+                Self::scan_range_keys_limited_from_db(&inner.db, start_key, end_key, reverse, limit)
+            })
+        })
+    }
+
+    fn raw_table_family_keys(
+        &self,
+        name_prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_family_keys_core(name_prefix, after, limit, |start, end, limit| {
+                Self::scan_range_keys_limited_from_db(&inner.db, start, end, false, limit)
+            })
+        })
+    }
+
+    fn raw_table_family_last_key(&self, name_prefix: &str) -> Result<Option<String>, StorageError> {
+        self.with_inner(|inner| {
+            raw_table_family_last_key_core(name_prefix, |start, end| {
+                Self::scan_range_keys_limited_from_db(&inner.db, start, end, true, 1)
+            })
+        })
+    }
+
+    fn store_format_version(&self) -> Result<Option<i32>, StorageError> {
+        self.with_inner(|inner| {
+            Self::get_from_db(&inner.db, super::STORE_MANIFEST_KEY)?
+                .map(|bytes| super::decode_store_manifest(&bytes))
+                .transpose()
+                .map(|manifest| manifest.map(|manifest| manifest.store_format_version))
+        })
+    }
+
+    fn set_store_format_version(&mut self, version: i32) -> Result<(), StorageError> {
+        let bytes = super::encode_store_manifest(&super::StoreManifest {
+            store_kind: super::ROCKSDB_STORE_KIND.to_string(),
+            store_format_version: version,
+        })?;
+        self.with_inner(|inner| {
+            let txn = RefCell::new(inner.db.transaction());
+            Self::put_on_txn_cell(&txn, super::STORE_MANIFEST_KEY, &bytes)?;
+            Self::commit_txn(txn.into_inner())
         })
     }
 

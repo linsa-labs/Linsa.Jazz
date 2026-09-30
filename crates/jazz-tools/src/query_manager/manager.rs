@@ -21,8 +21,9 @@ use crate::sync_manager::{
 };
 
 use super::encoding::decode_row;
-use super::graph::{QueryCompileError, QueryGraph};
+use super::graph::{IncludePlacement, QueryCompileError, QueryGraph};
 use super::graph_nodes::output::QuerySubscriptionId;
+use super::index_declarations::{IndexDeclarations, MaintainedIndexes};
 use super::policy::{Operation, PolicyExpr};
 use super::policy_graph::PolicyGraph;
 use super::query::Query;
@@ -507,6 +508,10 @@ pub(super) struct ServerQuerySubscription {
     pub(super) propagation: QueryPropagation,
     /// Schema mismatch warnings already emitted for the latest settled state.
     pub(super) reported_schema_warnings: HashSet<SchemaWarningKey>,
+    /// The scope once took a page row past the rows whose includes were built, so the
+    /// graph builds its includes for every matching row from then on
+    /// (`IncludePlacement::MatchingRows`), recompiles included.
+    pub(super) includes_past_page: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -707,6 +712,12 @@ pub struct QueryManager {
     /// shared-borrow closures built during settle.
     pub(super) row_bytes_dedup: std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
 
+    /// Test hook: overrides the predicted `IncludePlacement` of server subscriptions, so
+    /// a test can reach the case the prediction misses — a root row the scope denies for
+    /// a reason no policy shows — without building one.
+    #[cfg(test)]
+    pub(super) include_placement_override: Option<IncludePlacement>,
+
     /// Currently queued SyncManager batch fates whose query effects have
     /// already been applied by this manager.
     ///
@@ -730,12 +741,50 @@ pub struct QueryManager {
     /// into the catalogue for this manager.
     pub(super) catalogued_storage_namespaces: HashSet<usize>,
 
+    /// The declared indexes the store maintains, which this manager's plans may read
+    /// once complete: the store's record (`declared_index`), read at open and again at
+    /// the top of every `process`.
+    pub(super) index_declarations: Arc<IndexDeclarations>,
+    /// The part of them this manager's writes file entries for
+    /// (`MaintainedIndexes::written`): not an index still clearing its prefix.
+    pub(super) written_index_declarations: Arc<IndexDeclarations>,
+    /// Declarations the app asked for (`propose_index_declarations`), applied to the
+    /// store by the next `process`.
+    pub(super) proposed_index_declarations: Option<IndexDeclarations>,
+    /// Whether declared-index state was written since the runtime last asked
+    /// (`take_declared_index_writes`), so the write gets flushed.
+    pub(super) declared_index_writes: bool,
+    /// Whether the store still owes declared-index work after the last step.
+    pub(super) declared_index_work_pending: bool,
+    /// How steps of that work are paced (`pace_declared_index_steps`): one per `process`
+    /// by default; a runtime grants them one batched tick at a time instead.
+    pub(super) declared_index_steps: DeclaredIndexSteps,
+    /// Released from the declared indexes (`release_declared_indexes`): gives them up at
+    /// open and ignores the app's declarations.
+    pub(super) declared_indexes_released: bool,
+    /// A step failed: the work waits for the declarations to change, or a restart,
+    /// instead of failing again every pass. Scans read the first column meanwhile.
+    pub(super) declared_index_work_failed: bool,
+    /// The open (`open_declared_indexes`) failed: each pass opens the store again, and
+    /// takes nothing from the record until one succeeds. Taken as it reads, the record
+    /// would hand a released engine the indexes the open had to give up.
+    pub(super) declared_indexes_unopened: bool,
+
     /// Application id for catalogue schema persistence, when available.
     pub(super) catalogue_app_id: Option<String>,
 
     /// Per-schema, per-table write metadata cached to avoid cloning policy
     /// trees and descriptors on every hot write.
     pub(super) write_table_cache: HashMap<(SchemaHash, TableName), Arc<WriteTableCacheEntry>>,
+}
+
+/// How declared-index steps are paced (`QueryManager::pace_declared_index_steps`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeclaredIndexSteps {
+    /// One step in every `process`.
+    EveryPass,
+    /// One step in the next `process` once granted.
+    Granted(bool),
 }
 
 impl QueryManager {
@@ -830,10 +879,21 @@ impl QueryManager {
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
             row_bytes_dedup: Default::default(),
+            #[cfg(test)]
+            include_placement_override: None,
             applied_pending_batch_fates: Vec::new(),
             known_schemas: Arc::new(HashMap::new()),
             pending_catalogue_schema_hashes: HashSet::new(),
             catalogued_storage_namespaces: HashSet::new(),
+            index_declarations: Arc::new(IndexDeclarations::empty()),
+            written_index_declarations: Arc::new(IndexDeclarations::empty()),
+            proposed_index_declarations: None,
+            declared_index_writes: false,
+            declared_index_work_pending: false,
+            declared_index_steps: DeclaredIndexSteps::EveryPass,
+            declared_indexes_released: super::declared_index::release_requested(),
+            declared_index_work_failed: false,
+            declared_indexes_unopened: false,
             catalogue_app_id: None,
             write_table_cache: HashMap::new(),
         }
@@ -988,19 +1048,172 @@ impl QueryManager {
         }
     }
 
+    /// Read the declared indexes from the store at open, after the repairs a start owes
+    /// it (`declared_index::open`), before any write or compile uses them. An open that
+    /// fails is retried by every later pass (`refresh_declared_indexes`); until one
+    /// succeeds, writes file no declared entries.
+    pub(crate) fn open_declared_indexes<H: Storage + ?Sized>(&mut self, storage: &mut H) {
+        match super::declared_index::open(storage, self.declared_indexes_released) {
+            Ok((record, wrote)) => {
+                self.declared_indexes_unopened = false;
+                self.adopt_declared_indexes(&record);
+                self.declared_index_work_pending = record.has_work();
+                self.declared_index_writes |= wrote;
+            }
+            Err(error) => {
+                self.declared_indexes_unopened = true;
+                // No work is known without the record, so no tick is asked for; the
+                // next pass opens it again.
+                self.declared_index_work_pending = false;
+                tracing::warn!(
+                    %error,
+                    "failed to open the declared indexes; scans read the first column meanwhile"
+                );
+            }
+        }
+    }
+
+    /// Release this engine from the declared indexes, for a rollback to an engine that
+    /// does not maintain them (see `declared_index`): the runtime built over the store
+    /// gives them up when it opens it, writing format 3 back, and the app's declarations
+    /// are ignored. Takes effect at open, or at the first later pass whose open succeeds
+    /// when that one fails, so a binding calls it before `RuntimeCore::new`.
+    pub fn release_declared_indexes(&mut self) {
+        self.declared_indexes_released = true;
+    }
+
+    /// Ask the store to maintain `declarations` — the app's, from its permissions head.
+    /// Applied by the next `process`, which recompiles the subscriptions if they change.
+    pub fn propose_index_declarations(&mut self, declarations: IndexDeclarations) {
+        self.proposed_index_declarations = Some(declarations);
+    }
+
+    /// The declared indexes this manager maintains.
+    pub fn index_declarations(&self) -> &Arc<IndexDeclarations> {
+        &self.index_declarations
+    }
+
+    /// Whether declared-index state was written since the last call.
+    pub(crate) fn take_declared_index_writes(&mut self) -> bool {
+        std::mem::take(&mut self.declared_index_writes)
+    }
+
+    /// Whether the store still owes declared-index work, which more passes advance.
+    pub(crate) fn has_declared_index_work(&self) -> bool {
+        self.declared_index_work_pending
+    }
+
+    /// Take declared-index steps only when granted (`grant_declared_index_step`), not in
+    /// every `process`. A runtime runs `process` several times per tick, and for every
+    /// write it applies: a step in each would hold the runtime for several pages at a
+    /// time and put a page in front of the write.
+    pub(crate) fn pace_declared_index_steps(&mut self) {
+        self.declared_index_steps = DeclaredIndexSteps::Granted(false);
+    }
+
+    /// Let the next `process` take one declared-index step.
+    pub(crate) fn grant_declared_index_step(&mut self) {
+        if let DeclaredIndexSteps::Granted(granted) = &mut self.declared_index_steps {
+            *granted = true;
+        }
+    }
+
+    /// Bring the declared indexes in line with the store: apply the app's proposal, re-read
+    /// the record — another runtime over the store may have changed it — and take one
+    /// step of the work it owes. A change of the declarations recompiles every
+    /// subscription, as a new live schema does. While the open has failed, the pass opens
+    /// the store again first, and does nothing else until that succeeds.
+    fn refresh_declared_indexes<H: Storage + ?Sized>(&mut self, storage: &mut H) {
+        // A grant is this pass's to use or lose, whatever the pass finds: kept, it would
+        // be spent by the next pass, a write's.
+        let step = match &mut self.declared_index_steps {
+            DeclaredIndexSteps::EveryPass => true,
+            DeclaredIndexSteps::Granted(granted) => std::mem::take(granted),
+        };
+        if self.declared_indexes_unopened {
+            self.open_declared_indexes(storage);
+            if self.declared_indexes_unopened {
+                return;
+            }
+        }
+        if let Some(proposal) = self.proposed_index_declarations.take() {
+            if self.declared_indexes_released {
+                tracing::warn!("ignored the app's declared indexes: this engine is released");
+            } else {
+                match super::declared_index::propose(storage, &proposal) {
+                    Ok(replaced) => self.declared_index_writes |= replaced,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to apply the declared indexes");
+                        self.proposed_index_declarations = Some(proposal);
+                    }
+                }
+            }
+        }
+        let record = match super::declared_index::load_record(storage) {
+            Ok(record) => record,
+            Err(error) => {
+                // No work is known without the record, so no tick is asked for; the
+                // next pass reads it again.
+                self.declared_index_work_pending = false;
+                tracing::warn!(%error, "failed to read the declared indexes");
+                return;
+            }
+        };
+        self.adopt_declared_indexes(&record);
+        self.declared_index_work_pending = record.has_work() && !self.declared_index_work_failed;
+        if self.declared_index_work_pending && step {
+            match super::declared_index::advance(storage) {
+                Ok(next) => {
+                    self.declared_index_work_pending = next.has_work();
+                    // A step's progress needs no barrier of its own: lost, it is redone
+                    // from the record it was committed with. The end of the work is
+                    // flushed, so a finished index does not wait for the next write.
+                    self.declared_index_writes |= !self.declared_index_work_pending;
+                    // A clear that ended hands its index to the writes.
+                    self.adopt_declared_indexes(&next);
+                }
+                Err(error) => {
+                    self.declared_index_work_failed = true;
+                    self.declared_index_work_pending = false;
+                    tracing::warn!(
+                        %error,
+                        "declared index work failed; scans read the first column meanwhile"
+                    );
+                }
+            }
+        }
+    }
+
+    fn adopt_declared_indexes(&mut self, record: &MaintainedIndexes) {
+        if record.declarations != *self.index_declarations {
+            self.index_declarations = Arc::new(record.declarations.clone());
+            self.declared_index_work_failed = false;
+            self.mark_subscriptions_for_recompile();
+        }
+        let written = record.written();
+        if written != *self.written_index_declarations {
+            self.written_index_declarations = Arc::new(written);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile_graph(
         query: &Query,
         schema: &Schema,
         session: Option<Session>,
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
+        include_placement: IncludePlacement,
+        declarations: &Arc<IndexDeclarations>,
     ) -> Result<QueryGraph, QueryCompileError> {
-        QueryGraph::try_compile_with_schema_context(
+        QueryGraph::try_compile_with_include_placement(
             query,
-            schema,
+            &Arc::new(schema.clone()),
             session,
-            schema_context,
+            &Arc::new(schema_context.clone()),
             row_policy_mode,
+            include_placement,
+            declarations,
         )
     }
 
@@ -1165,6 +1378,8 @@ impl QueryManager {
                     sub.session.clone(),
                     &current_schema_context,
                     compile_row_policy_mode,
+                    IncludePlacement::PageRows,
+                    &self.index_declarations,
                 ) {
                     Ok(new_graph) => {
                         let policy_context_tables =
@@ -1219,57 +1434,28 @@ impl QueryManager {
             .collect();
 
         for (client_id, query_id) in stale_server_subscription_keys {
-            let Some((query, session, propagation)) = self
+            let Some((query, session, propagation, includes_past_page)) = self
                 .server_subscriptions
                 .get(&(client_id, query_id))
-                .map(|sub| (sub.query.clone(), sub.session.clone(), sub.propagation))
-            else {
-                continue;
-            };
-
-            let Some((schema_for_compile, subscription_context)) =
-                self.build_server_subscription_context(&query)
-            else {
-                let reason = "schema context unavailable for query recompile".to_string();
-                tracing::error!(
-                    %client_id,
-                    query_id = query_id.0,
-                    error = %reason,
-                    "server subscription stale recompile failed; dropping subscription"
-                );
-                failed_server.push((
-                    client_id,
-                    query_id,
-                    "query_recompile_failed".to_string(),
-                    reason,
-                    propagation,
-                ));
-                continue;
-            };
-
-            let query_for_compile = Self::query_for_server_compile(&query, &subscription_context);
-            let compile_schema: Schema = schema_for_compile
-                .iter()
-                .map(|(table_name, table_schema)| {
-                    let mut structural = table_schema.clone();
-                    structural.policies = TablePolicies::default();
-                    (*table_name, structural)
+                .map(|sub| {
+                    (
+                        sub.query.clone(),
+                        sub.session.clone(),
+                        sub.propagation,
+                        sub.includes_past_page,
+                    )
                 })
-                .collect();
+            else {
+                continue;
+            };
 
-            // Recompile the graph
-            match Self::compile_graph(
-                &query_for_compile,
-                &compile_schema,
+            match self.compile_server_subscription_graph(
+                client_id,
+                &query,
                 session,
-                &subscription_context,
-                RowPolicyMode::PermissiveLocal,
+                includes_past_page,
             ) {
-                Ok(new_graph) => {
-                    let branches = Self::resolved_server_query_branches(
-                        &query_for_compile,
-                        &subscription_context,
-                    );
+                Ok((new_graph, subscription_context, branches)) => {
                     if let Some(sub) = self.server_subscriptions.get_mut(&(client_id, query_id)) {
                         sub.schema_context = subscription_context;
                         sub.branches = branches;
@@ -1277,8 +1463,7 @@ impl QueryManager {
                         sub.needs_recompile = false;
                     }
                 }
-                Err(err) => {
-                    let reason = err.to_string();
+                Err(reason) => {
                     tracing::error!(
                         %client_id,
                         query_id = query_id.0,
@@ -1325,6 +1510,58 @@ impl QueryManager {
                 ),
             );
         }
+    }
+
+    /// Compiles a server subscription's graph against the current schemas, the way a
+    /// recompile does: the structural schema with permissive rows, since the
+    /// authorization schema judges the scope.
+    pub(super) fn compile_server_subscription_graph(
+        &mut self,
+        client_id: ClientId,
+        query: &Query,
+        session: Option<Session>,
+        includes_past_page: bool,
+    ) -> Result<(QueryGraph, SchemaContext, Vec<String>), String> {
+        let Some((schema_for_compile, subscription_context)) =
+            self.build_server_subscription_context(query)
+        else {
+            return Err("schema context unavailable for query recompile".to_string());
+        };
+
+        let query_for_compile = Self::query_for_server_compile(query, &subscription_context);
+        let compile_schema: Schema = schema_for_compile
+            .iter()
+            .map(|(table_name, table_schema)| {
+                let mut structural = table_schema.clone();
+                structural.policies = TablePolicies::default();
+                (*table_name, structural)
+            })
+            .collect();
+        let include_placement = if includes_past_page {
+            IncludePlacement::MatchingRows
+        } else {
+            let bypasses_authorization =
+                self.client_bypasses_authorization_filtering(client_id, session.as_ref());
+            self.include_placement_for_server_scope(
+                &query_for_compile,
+                &subscription_context,
+                session.as_ref(),
+                bypasses_authorization,
+            )
+        };
+        let graph = Self::compile_graph(
+            &query_for_compile,
+            &compile_schema,
+            session,
+            &subscription_context,
+            RowPolicyMode::PermissiveLocal,
+            include_placement,
+            &self.index_declarations,
+        )
+        .map_err(|err| err.to_string())?;
+        let branches =
+            Self::resolved_server_query_branches(&query_for_compile, &subscription_context);
+        Ok((graph, subscription_context, branches))
     }
 
     /// Get the schema context.
@@ -1691,6 +1928,8 @@ impl QueryManager {
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
         }
+        // Before anything in this pass writes a row or compiles a plan.
+        self.refresh_declared_indexes(storage);
 
         // 1. Process SyncManager inbox (receives client writes)
         self.sync_manager.process_inbox(storage);
@@ -2293,6 +2532,7 @@ impl QueryManager {
                 let old_data = old_row.map(|row| row.data.as_ref());
                 let _ = Self::update_indices_for_hard_delete_on_branch(
                     storage,
+                    &self.written_index_declarations,
                     &branch_table,
                     branch,
                     update.object_id,
@@ -2315,6 +2555,7 @@ impl QueryManager {
                 if let Some(old_row) = old_row {
                     let _ = Self::update_indices_for_soft_delete_on_branch(
                         storage,
+                        &self.written_index_declarations,
                         &branch_table,
                         branch,
                         update.object_id,
@@ -2363,6 +2604,7 @@ impl QueryManager {
             if apply_index_mutations
                 && let Err(error) = Self::update_indices_for_restore_on_branch(
                     storage,
+                    &self.written_index_declarations,
                     &branch_table,
                     branch,
                     update.object_id,
@@ -2392,6 +2634,7 @@ impl QueryManager {
             if apply_index_mutations
                 && let Err(error) = Self::update_indices_for_insert_on_branch(
                     storage,
+                    &self.written_index_declarations,
                     &branch_table,
                     branch,
                     update.object_id,
@@ -2413,6 +2656,7 @@ impl QueryManager {
             && apply_index_mutations
             && let Err(error) = Self::update_indices_for_update_on_branch(
                 storage,
+                &self.written_index_declarations,
                 super::indices::BranchIndexTarget {
                     table: &branch_table,
                     branch,

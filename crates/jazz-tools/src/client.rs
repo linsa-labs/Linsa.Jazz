@@ -733,6 +733,7 @@ mod tests {
                         TablePolicies::new().with_select(PolicyExpr::True),
                     )]),
                     None,
+                    None,
                 )
                 .expect("seed permissions bundle");
         }

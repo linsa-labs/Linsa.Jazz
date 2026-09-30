@@ -2363,6 +2363,7 @@ mod cross_generation_backref_read;
 mod cross_generation_differential;
 mod cross_generation_local_write;
 mod cross_generation_policy;
+mod declared_index_pacing;
 mod delivery_confirmation;
 mod delivery_convergence_differential;
 mod fk_remove_error;

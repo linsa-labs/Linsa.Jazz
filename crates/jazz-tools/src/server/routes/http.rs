@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::jazz_transport::ErrorResponse;
 use crate::middleware::auth::validate_admin_secret;
+use crate::query_manager::index_declarations::{IndexDeclarations, IndexDeclarationsWire};
 use crate::query_manager::types::{
     ColumnType, Schema, SchemaHash, TableName, TablePolicies, Value,
 };
@@ -116,6 +117,10 @@ pub(super) struct PublishSchemaRequest {
 pub(super) struct PublishPermissionsRequest {
     schema_hash: String,
     permissions: std::collections::HashMap<String, TablePolicies>,
+    /// Absent: the current head's declared indexes carry forward. Present, empty
+    /// included: they replace them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    declared_indexes: Option<IndexDeclarationsWire>,
     expected_parent_bundle_object_id: Option<String>,
 }
 
@@ -146,6 +151,8 @@ pub(super) struct PermissionsHeadResponse {
 pub(super) struct StoredPermissionsResponse {
     head: Option<PermissionsHeadView>,
     permissions: Option<std::collections::HashMap<String, TablePolicies>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared_indexes: Option<IndexDeclarationsWire>,
 }
 
 #[derive(Debug, Serialize)]
@@ -670,10 +677,12 @@ pub(super) async fn permissions_handler(
                 Some(current) => StoredPermissionsResponse {
                     head: Some(permissions_head_view(current.head)),
                     permissions: Some(permissions_map_view(current.permissions)),
+                    declared_indexes: Some(current.declared_indexes.to_wire()),
                 },
                 None => StoredPermissionsResponse {
                     head: None,
                     permissions: None,
+                    declared_indexes: None,
                 },
             }),
         )
@@ -779,6 +788,24 @@ pub(super) async fn publish_permissions_handler(
         }
     }
 
+    let declared_indexes = match request
+        .declared_indexes
+        .as_ref()
+        .map(IndexDeclarations::from_wire)
+        .transpose()
+    {
+        Ok(declared_indexes) => declared_indexes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::bad_request(format!(
+                    "invalid index declarations: {error}"
+                ))),
+            )
+                .into_response();
+        }
+    };
+
     let permissions = request
         .permissions
         .into_iter()
@@ -788,6 +815,7 @@ pub(super) async fn publish_permissions_handler(
     match state.runtime.publish_permissions_bundle(
         schema_hash,
         permissions,
+        declared_indexes,
         expected_parent_bundle_object_id,
     ) {
         Ok(_) => match state.runtime.with_schema_manager(|schema_manager| {
@@ -811,6 +839,15 @@ pub(super) async fn publish_permissions_handler(
         {
             (
                 StatusCode::CONFLICT,
+                Json(ErrorResponse::bad_request(message)),
+            )
+                .into_response()
+        }
+        Err(crate::runtime_tokio::RuntimeError::WriteError(message))
+            if message.starts_with("invalid index declarations") =>
+        {
+            (
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::bad_request(message)),
             )
                 .into_response()

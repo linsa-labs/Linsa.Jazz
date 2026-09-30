@@ -151,6 +151,8 @@ impl QueryManager {
             session.clone(),
             &self.schema_context,
             compile_row_policy_mode,
+            crate::query_manager::graph::IncludePlacement::PageRows,
+            &self.index_declarations,
         )
         .map_err(|err| QueryError::QueryCompilationError(err.to_string()))?;
         let policy_context_tables = Self::policy_context_tables_for_graph(&graph);

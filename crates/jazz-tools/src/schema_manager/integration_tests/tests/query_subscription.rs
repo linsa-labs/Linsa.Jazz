@@ -84,7 +84,13 @@ fn query_graph_compile_with_schema_context() {
     let query = QueryBuilder::new("users").build();
 
     // Compile with schema context
-    let graph = QueryGraph::compile_with_schema_context(&query, &v2, None, &ctx);
+    let graph = QueryGraph::compile_with_schema_context(
+        &query,
+        &v2,
+        None,
+        &ctx,
+        &std::sync::Arc::new(crate::query_manager::index_declarations::IndexDeclarations::empty()),
+    );
     let graph = graph.expect("Query graph compilation should succeed with schema context");
 
     // Should have index scan nodes for both branches
