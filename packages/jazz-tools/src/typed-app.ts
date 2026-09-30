@@ -8,6 +8,7 @@ import type {
   ColumnTransform,
 } from "./dsl.js";
 import { schemaToWasm } from "./codegen/schema-reader.js";
+import type { DeclaredIndexes, TableDeclaredIndexes } from "./declared-indexes.js";
 import type { WasmSchema } from "./drivers/types.js";
 import {
   PERMISSION_INTROSPECTION_COLUMNS,
@@ -29,6 +30,7 @@ export class DefinedTable<TColumns extends TableDefinition = TableDefinition> {
   constructor(
     public readonly columns: TColumns,
     public readonly indexedColumns?: readonly Extract<keyof TColumns, string>[],
+    public readonly declaredIndexes: TableDeclaredIndexes = {},
   ) {}
 
   indexOnly<
@@ -44,7 +46,55 @@ export class DefinedTable<TColumns extends TableDefinition = TableDefinition> {
       }
     }
 
-    return new DefinedTable(this.columns, normalizedColumns);
+    return new DefinedTable(this.columns, normalizedColumns, this.declaredIndexes);
+  }
+
+  /**
+   * Declare an ordered index over `(first, second)`: a query filtered on `first`,
+   * ordered by `second` and limited then reads its page, not every row of that
+   * `first` value. `first` must keep its own index (see {@link indexOnly}); both
+   * columns need a fixed-width type (uuid/ref, int, timestamp, boolean).
+   *
+   * Not part of the schema hash: it is published with the permissions, and every
+   * store builds it for the rows it already holds.
+   */
+  compositeIndex(
+    first: Extract<keyof TColumns, string>,
+    second: Extract<keyof TColumns, string>,
+  ): DefinedTable<TColumns> {
+    this.assertDeclaredColumns("compositeIndex", [first, second]);
+    return new DefinedTable(this.columns, this.indexedColumns, {
+      ...this.declaredIndexes,
+      composite: [...(this.declaredIndexes.composite ?? []), [first, second]],
+    });
+  }
+
+  /**
+   * Declare a trigram index over `text` within `scope`: `contains` on `text`,
+   * filtered on `scope`, then reads its candidates instead of every row of that
+   * `scope` value. Matching is case-insensitive. `scope` must keep its own index
+   * and have a fixed-width type; `text` must be a string column.
+   *
+   * Not part of the schema hash: it is published with the permissions, and every
+   * store builds it for the rows it already holds.
+   */
+  trigramIndex(
+    scope: Extract<keyof TColumns, string>,
+    text: Extract<keyof TColumns, string>,
+  ): DefinedTable<TColumns> {
+    this.assertDeclaredColumns("trigramIndex", [scope, text]);
+    return new DefinedTable(this.columns, this.indexedColumns, {
+      ...this.declaredIndexes,
+      trigram: [...(this.declaredIndexes.trigram ?? []), [scope, text]],
+    });
+  }
+
+  private assertDeclaredColumns(method: string, columns: readonly string[]): void {
+    for (const column of columns) {
+      if (!(column in this.columns)) {
+        throw new Error(`table.${method}(...) references unknown column "${column}".`);
+      }
+    }
   }
 }
 
@@ -1166,6 +1216,8 @@ export type App<TSchema extends SchemaLike> = Simplify<
       relations: readonly RelationSeedQuery<TTable>[],
     ): TypedTableQueryBuilder<any, any, any, any>;
     wasmSchema: WasmSchema;
+    /** The indexes the tables declare, published with the permissions. */
+    declaredIndexes: DeclaredIndexes;
   }
 >;
 
@@ -1178,6 +1230,7 @@ type SchemaSlice<
 
 export interface SliceableApp<TSchema extends SchemaLike> {
   readonly wasmSchema: WasmSchema;
+  readonly declaredIndexes: DeclaredIndexes;
   slice<const TTables extends readonly [TableName<TSchema>, ...TableName<TSchema>[]]>(
     ...tables: TTables
   ): App<SchemaSlice<TSchema, TTables>>;
@@ -1266,6 +1319,38 @@ function columnTransformsForTable(
   return Object.keys(transforms).length > 0 ? transforms : undefined;
 }
 
+function tableDeclaredIndexes(
+  definition: TableDefinition | DefinedTable<TableDefinition>,
+): TableDeclaredIndexes {
+  if (definition instanceof DefinedTable) {
+    return definition.declaredIndexes;
+  }
+  // A table defined against another copy of this module (bundled schema files).
+  const maybeDefinedTable = definition as {
+    __jazzTableDefinition?: unknown;
+    declaredIndexes?: TableDeclaredIndexes;
+  };
+  if (maybeDefinedTable.__jazzTableDefinition === true && maybeDefinedTable.declaredIndexes) {
+    return maybeDefinedTable.declaredIndexes;
+  }
+  return {};
+}
+
+/** The indexes a schema definition's tables declare, by table. */
+export function declaredIndexesOf(definition: SchemaDefinition): DeclaredIndexes {
+  const declared: DeclaredIndexes = {};
+  for (const [tableName, tableDefinition] of Object.entries(definition)) {
+    const { composite = [], trigram = [] } = tableDeclaredIndexes(tableDefinition);
+    if (composite.length > 0 || trigram.length > 0) {
+      declared[tableName] = {
+        ...(composite.length > 0 ? { composite: composite.map(([a, b]) => [a, b]) } : {}),
+        ...(trigram.length > 0 ? { trigram: trigram.map(([a, b]) => [a, b]) } : {}),
+      };
+    }
+  }
+  return declared;
+}
+
 function definitionToSchema<TSchema extends SchemaDefinition>(definition: TSchema): SchemaAst {
   return {
     tables: Object.entries(definition).map(([tableName, tableDefinition]) => {
@@ -1341,6 +1426,7 @@ export function defineSliceableApp(
 
   return {
     wasmSchema,
+    declaredIndexes: declaredIndexesOf(normalizedDefinition),
     slice(...tableNames: string[]) {
       if (tableNames.length === 0) {
         throw new Error("slice(...) requires at least one table name.");
@@ -1401,6 +1487,7 @@ function createAppForTables(
       return builder;
     },
     wasmSchema,
+    declaredIndexes: definition ? declaredIndexesOf(definition) : {},
   } as App<Schema<SchemaDefinition>>;
 }
 

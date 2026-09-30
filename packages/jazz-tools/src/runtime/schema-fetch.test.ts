@@ -358,6 +358,8 @@ describe("schema-fetch", () => {
           },
         },
       },
+      // A server that predates declared indexes does not send them.
+      declaredIndexes: null,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]![0]).toBe(
@@ -477,5 +479,32 @@ describe("schema-fetch", () => {
     ).rejects.toThrow(
       'Server subscriptions fetch failed: 401 Unauthorized - {"error":"bad secret"}',
     );
+  });
+
+  it("publishes declared indexes only when given, so an omitted set carries forward", async () => {
+    const bodies: unknown[] = [];
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return { ok: true, status: 201, statusText: "Created", json: async () => ({ head: null }) };
+    });
+    (globalThis as { fetch: typeof fetch }).fetch = fetchMock as unknown as typeof fetch;
+    const base = {
+      appId: "app-123",
+      adminSecret: "admin-secret",
+      schemaHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      permissions: {},
+    };
+    const declaredIndexes = { messages: { composite: [["chatId", "createdAtMs"]] } } as const;
+
+    await publishStoredPermissions("http://localhost:1625/", base);
+    await publishStoredPermissions("http://localhost:1625/", {
+      ...base,
+      declaredIndexes: { messages: { composite: [["chatId", "createdAtMs"]] } },
+    });
+    await publishStoredPermissions("http://localhost:1625/", { ...base, declaredIndexes: {} });
+
+    expect(bodies[0]).not.toHaveProperty("declaredIndexes");
+    expect(bodies[1]).toMatchObject({ declaredIndexes });
+    expect(bodies[2]).toMatchObject({ declaredIndexes: {} });
   });
 });

@@ -37,6 +37,8 @@ export interface WorkerBridgeOptions {
   leadershipId?: number;
   logLevel?: "error" | "warn" | "info" | "debug" | "trace";
   telemetryCollectorUrl?: string;
+  /** See `DbConfig.releaseDeclaredIndexes`. */
+  releaseDeclaredIndexes?: boolean;
 }
 
 export interface PeerSyncBatch {

@@ -138,6 +138,7 @@ describe("react-native Db", () => {
       adminSecret: "admin-secret",
       tier: "edge",
       dataPath: "/tmp/rn-data",
+      releaseDeclaredIndexes: true,
     };
 
     createJazzRnRuntimeMock.mockReturnValue(runtime as never);
@@ -154,6 +155,7 @@ describe("react-native Db", () => {
       userBranch: config.userBranch,
       tier: config.tier,
       dataPath: config.dataPath,
+      releaseDeclaredIndexes: true,
     });
     expect(connectWithRuntimeSpy).toHaveBeenCalledWith(
       runtime,

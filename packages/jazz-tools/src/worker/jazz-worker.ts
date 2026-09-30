@@ -50,6 +50,7 @@ interface InitMessage {
   workerLockName?: string;
   logLevel?: "error" | "warn" | "info" | "debug" | "trace";
   telemetryCollectorUrl?: string;
+  releaseDeclaredIndexes?: boolean;
 }
 
 declare const self: {

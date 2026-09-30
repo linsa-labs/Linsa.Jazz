@@ -351,6 +351,7 @@ export async function pushPermissions(
     adminSecret: options.adminSecret,
     schemaHash: options.schemaHash,
     permissions: compiled.permissions,
+    declaredIndexes: compiled.declaredIndexes,
   });
   emit(options, {
     type: "permissions-published",
@@ -1204,6 +1205,7 @@ export async function deploy(options: DeployOptions): Promise<DeployResult> {
     adminSecret: options.adminSecret,
     schema: compiled.wasmSchema,
     permissions: compiled.permissions,
+    declaredIndexes: compiled.declaredIndexes,
     migration: resolvedMigration.migration,
     noVerify: options.noVerify,
   });

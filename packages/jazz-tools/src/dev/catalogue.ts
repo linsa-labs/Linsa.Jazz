@@ -7,6 +7,7 @@ import type { DefinedMigration } from "../migrations.js";
 import { schemaDefinitionToAst } from "../migrations.js";
 import { toValue } from "../runtime/value-converter.js";
 import type { Lens, SqlType } from "../schema.js";
+import type { DeclaredIndexes } from "../declared-indexes.js";
 import type { CompiledPermissionsMap } from "../schema-permissions.js";
 import { collectMissingExplicitPolicyDiagnostics } from "../schema-permissions.js";
 import { schemaToWasm } from "../codegen/schema-reader.js";
@@ -62,6 +63,11 @@ export type DeploySchemaResult =
 export interface PushPermissionsOptions extends CatalogueServerOptions {
   schemaHash: string;
   permissions: CompiledPermissionsMap;
+  /**
+   * The app's declared indexes (`app.declaredIndexes`). Omitted: the published ones
+   * carry forward. Given, `{}` included: they replace them.
+   */
+  declaredIndexes?: DeclaredIndexes;
 }
 
 export interface PushPermissionsResult {
@@ -112,6 +118,12 @@ export interface DeployOptions extends CatalogueServerOptions {
    * the current server schema and the new schema.
    */
   noVerify?: boolean;
+  /**
+   * The app's declared indexes (`app.declaredIndexes`), published with
+   * {@link permissions}. Omitted: the published ones carry forward. Given, `{}`
+   * included: they replace them.
+   */
+  declaredIndexes?: DeclaredIndexes;
 }
 
 export interface DeployResult {
@@ -378,6 +390,7 @@ export async function pushPermissions(
     adminSecret: options.adminSecret,
     schemaHash: options.schemaHash,
     permissions: options.permissions,
+    declaredIndexes: options.declaredIndexes,
     expectedParentBundleObjectId: previousHead?.bundleObjectId ?? null,
   });
 
@@ -557,6 +570,7 @@ export async function deploy(options: DeployOptions): Promise<DeployResult> {
     adminSecret: options.adminSecret,
     schemaHash: schema.hash,
     permissions: options.permissions,
+    declaredIndexes: options.declaredIndexes,
     expectedParentBundleObjectId: previousHead?.bundleObjectId ?? null,
   });
 

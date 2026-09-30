@@ -10,6 +10,8 @@ export interface CreateJazzRnRuntimeOptions {
   userBranch?: string;
   tier?: DurabilityTier;
   dataPath?: string;
+  /** See `DbConfig.releaseDeclaredIndexes`. */
+  releaseDeclaredIndexes?: boolean;
 }
 
 export function createJazzRnRuntime(options: CreateJazzRnRuntimeOptions): JazzRnRuntimeAdapter {
@@ -21,6 +23,7 @@ export function createJazzRnRuntime(options: CreateJazzRnRuntimeOptions): JazzRn
     options.userBranch ?? "main",
     options.tier,
     options.dataPath,
+    options.releaseDeclaredIndexes ?? false,
   );
 
   return new JazzRnRuntimeAdapter(runtime as unknown as JazzRnRuntimeBinding, options.schema);

@@ -115,6 +115,13 @@ export interface DbConfig {
   devMode?: boolean;
   /** Local-first auth via a local seed. Mutually exclusive with jwtToken. */
   secret?: string;
+  /**
+   * Release this runtime's store from the app's declared indexes, for a rollback to an
+   * engine that does not maintain them: the store gives them up when it opens, going back
+   * to the format such an engine opens, and the app's declarations are ignored while this
+   * is set. Queries stay exact, only slower. Applies to persistent storage. Default false.
+   */
+  releaseDeclaredIndexes?: boolean;
 }
 
 function resolveStorageDriver(driver?: StorageDriver): StorageDriver {

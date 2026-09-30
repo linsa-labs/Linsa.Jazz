@@ -6,6 +6,9 @@ import { loadCompiledSchema } from "./schema-loader.js";
 const WITH_DEFAULTS_DIR = fileURLToPath(
   new URL("./testing/fixtures/with-defaults", import.meta.url),
 );
+const DECLARED_INDEXES_DIR = fileURLToPath(
+  new URL("./testing/fixtures/declared-indexes", import.meta.url),
+);
 
 describe("loadCompiledSchema", () => {
   it("keeps typed-app schema and wasm schema losslessly aligned", async () => {
@@ -42,5 +45,17 @@ describe("loadCompiledSchema", () => {
         }),
       }),
     );
+  });
+
+  it("returns what the schema's tables declare, for the permissions publish", async () => {
+    const loaded = await loadCompiledSchema(DECLARED_INDEXES_DIR);
+
+    expect(loaded.declaredIndexes).toEqual({
+      messages: {
+        composite: [["chatId", "createdAtMs"]],
+        trigram: [["chatId", "text"]],
+      },
+    });
+    expect((await loadCompiledSchema(WITH_DEFAULTS_DIR)).declaredIndexes).toEqual({});
   });
 });

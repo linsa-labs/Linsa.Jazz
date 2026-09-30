@@ -53,6 +53,13 @@ export type BackendContextConfig = Omit<AppContext, "schema" | "driver" | "clien
   jwtPublicKey?: BackendJwtPublicKey;
   /** Whether local-first bearer JWTs are accepted in `forRequest()`. Defaults to `true`. */
   allowLocalFirstAuth?: boolean;
+  /**
+   * Release this runtime's store from the app's declared indexes, for a rollback to an
+   * engine that does not maintain them: the store gives them up when it opens, going back
+   * to the format such an engine opens, and the app's declarations are ignored while this
+   * is set. Queries stay exact, only slower. Applies to persistent storage. Default false.
+   */
+  releaseDeclaredIndexes?: boolean;
 } & BackendContextSchemaConfig;
 
 type ResolvedBackendContextConfig = BackendContextConfig & {
@@ -123,6 +130,7 @@ export class JazzContext {
         this.config.userBranch ?? "main",
         this.config.driver.dataPath,
         nodeTier,
+        this.config.releaseDeclaredIndexes ?? false,
       );
     } else {
       this.runtime = NapiRuntime.inMemory(

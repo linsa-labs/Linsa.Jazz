@@ -4,6 +4,7 @@ import type {
   Value as WasmValue,
   WasmSchema,
 } from "../drivers/types.js";
+import type { DeclaredIndexes } from "../declared-indexes.js";
 import type { CompiledPermissionsMap } from "../schema-permissions.js";
 import { normalizePermissionsForWasm } from "../schema-permissions.js";
 import { appScopedUrl } from "./url.js";
@@ -225,6 +226,8 @@ export async function fetchPermissionsHead(
 export interface StoredPermissionsResponse {
   head: StoredPermissionsHead | null;
   permissions: Record<string, TablePolicies> | null;
+  /** `null` from a server that predates declared indexes, or before any publish. */
+  declaredIndexes: DeclaredIndexes | null;
 }
 
 export interface FetchStoredPermissionsOptions {
@@ -252,10 +255,12 @@ export async function fetchStoredPermissions(
   const body = (await response.json()) as {
     head?: StoredPermissionsHead | null;
     permissions?: Record<string, TablePolicies> | null;
+    declaredIndexes?: DeclaredIndexes | null;
   };
   return {
     head: body.head ?? null,
     permissions: body.permissions ?? null,
+    declaredIndexes: body.declaredIndexes ?? null,
   };
 }
 
@@ -264,6 +269,11 @@ export interface PublishStoredPermissionsOptions {
   adminSecret: string;
   schemaHash: string;
   permissions: CompiledPermissionsMap;
+  /**
+   * Omitted: the server carries the published head's declared indexes forward.
+   * Given, `{}` included: they replace them.
+   */
+  declaredIndexes?: DeclaredIndexes;
   expectedParentBundleObjectId?: string | null;
 }
 
@@ -280,6 +290,9 @@ export async function publishStoredPermissions(
     body: JSON.stringify({
       schemaHash: options.schemaHash,
       permissions: normalizePermissionsForWasm(options.permissions),
+      ...(options.declaredIndexes !== undefined
+        ? { declaredIndexes: options.declaredIndexes }
+        : {}),
       expectedParentBundleObjectId: options.expectedParentBundleObjectId ?? null,
     }),
   });

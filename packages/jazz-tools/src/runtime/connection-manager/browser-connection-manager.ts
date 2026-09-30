@@ -827,6 +827,7 @@ export class BrowserConnectionManager extends ConnectionManager {
       leadershipId: this.tabRole === "leader" ? this.currentLeadershipId : undefined,
       logLevel: this.host.config.logLevel,
       telemetryCollectorUrl: this.telemetryCollectorUrl(),
+      releaseDeclaredIndexes: this.host.config.releaseDeclaredIndexes,
     };
   }
 

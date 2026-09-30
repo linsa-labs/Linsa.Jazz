@@ -34,6 +34,7 @@ export class ReactNativeRuntimeModule extends DbRuntimeModule<ReactNativeRuntime
       userBranch: config.userBranch,
       tier,
       dataPath: config.dataPath,
+      releaseDeclaredIndexes: config.releaseDeclaredIndexes,
     });
 
     return JazzClient.connectWithRuntime(

@@ -13,7 +13,9 @@ import type {
   Value,
   WasmSchema,
 } from "./drivers/types.js";
+import type { DeclaredIndexes } from "./declared-indexes.js";
 import { schemaDefinitionToAst } from "./migrations.js";
+import { declaredIndexesOf, type SchemaDefinition } from "./typed-app.js";
 import type { CompiledPermissionsMap } from "./schema-permissions.js";
 import { validatePermissionsAgainstSchema } from "./schema-permissions.js";
 
@@ -26,6 +28,8 @@ export interface LoadedSchemaProject {
   permissions?: CompiledPermissionsMap;
   schema: Schema;
   wasmSchema: WasmSchema;
+  /** What the schema's tables declare (`table.compositeIndex(...)`), `{}` if nothing. */
+  declaredIndexes: DeclaredIndexes;
 }
 
 async function bundleToTempFile(filePath: string): Promise<string> {
@@ -164,7 +168,9 @@ function wasmSchemaToAst(wasmSchema: WasmSchema): Schema {
   };
 }
 
-function isTypedAppLike(value: Record<string, unknown>): value is { wasmSchema: WasmSchema } {
+function isTypedAppLike(
+  value: Record<string, unknown>,
+): value is { wasmSchema: WasmSchema; declaredIndexes?: unknown } {
   if (!("wasmSchema" in value)) {
     return false;
   }
@@ -173,7 +179,12 @@ function isTypedAppLike(value: Record<string, unknown>): value is { wasmSchema: 
   return typeof schema === "object" && schema !== null && !Array.isArray(schema);
 }
 
-function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null {
+interface LoadedSchemaModule {
+  schema: Schema;
+  declaredIndexes: DeclaredIndexes;
+}
+
+function schemaFromLoadedModule(loaded: Record<string, unknown>): LoadedSchemaModule | null {
   const candidates = [loaded.schema, loaded.schemaDef, loaded.default, loaded.app].filter(
     (candidate): candidate is Record<string, unknown> =>
       typeof candidate === "object" && candidate !== null,
@@ -181,11 +192,21 @@ function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null 
 
   for (const candidate of candidates) {
     if (isTypedAppLike(candidate)) {
-      return wasmSchemaToAst(candidate.wasmSchema);
+      const declaredIndexes = candidate.declaredIndexes;
+      return {
+        schema: wasmSchemaToAst(candidate.wasmSchema),
+        declaredIndexes:
+          typeof declaredIndexes === "object" && declaredIndexes !== null
+            ? (declaredIndexes as DeclaredIndexes)
+            : {},
+      };
     }
 
     try {
-      return schemaDefinitionToAst(candidate as any);
+      return {
+        schema: schemaDefinitionToAst(candidate as any),
+        declaredIndexes: declaredIndexesOf(candidate as SchemaDefinition),
+      };
     } catch {
       // Try the next supported export shape.
     }
@@ -193,13 +214,13 @@ function schemaFromLoadedModule(loaded: Record<string, unknown>): Schema | null 
 
   const collected = getCollectedSchema();
   if (collected.tables.length > 0) {
-    return collected;
+    return { schema: collected, declaredIndexes: {} };
   }
 
   return null;
 }
 
-async function loadSchemaAst(filePath: string): Promise<Schema> {
+async function loadSchemaModule(filePath: string): Promise<LoadedSchemaModule> {
   const loaded = await loadTsModule(filePath);
   const directSchema = schemaFromLoadedModule(loaded);
   if (directSchema) {
@@ -343,7 +364,7 @@ export async function loadCompiledSchema(schemaDir: string): Promise<LoadedSchem
     );
   }
 
-  let schema = await loadSchemaAst(resolved.schemaFile);
+  const { schema, declaredIndexes } = await loadSchemaModule(resolved.schemaFile);
   const tablesWithInlinePolicies = findInlinePolicyTables(schema);
   if (tablesWithInlinePolicies.length > 0) {
     throw new Error(
@@ -382,5 +403,6 @@ export async function loadCompiledSchema(schemaDir: string): Promise<LoadedSchem
     permissions,
     schema,
     wasmSchema: schemaToWasm(schema),
+    declaredIndexes,
   };
 }

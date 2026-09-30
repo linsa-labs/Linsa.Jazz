@@ -106,6 +106,7 @@ export type {
 
 // Typed schema app
 export { schemaToWasm } from "./codegen/schema-reader.js";
+export type { DeclaredIndexes, TableDeclaredIndexes } from "./declared-indexes.js";
 export {
   defineSchema,
   defineApp,

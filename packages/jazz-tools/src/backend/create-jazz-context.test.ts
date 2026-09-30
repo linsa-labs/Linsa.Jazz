@@ -9,7 +9,10 @@ const mocks = vi.hoisted(() => {
   const resolveRequestSession = vi.fn();
   const runtimeCtor = vi.fn();
   const inMemoryRuntimeCtor = vi.fn();
-  const runtimeInstances: Array<{ flush: ReturnType<typeof vi.fn> }> = [];
+  const runtimeInstances: Array<{
+    flush: ReturnType<typeof vi.fn>;
+    releaseDeclaredIndexes: boolean | undefined;
+  }> = [];
   const createdDbs: Array<{
     kind: string;
     client: unknown;
@@ -47,6 +50,7 @@ const mocks = vi.hoisted(() => {
 
   class MockNapiRuntime {
     readonly flush = vi.fn();
+    readonly releaseDeclaredIndexes: boolean | undefined;
 
     constructor(
       schemaJson: string,
@@ -55,8 +59,10 @@ const mocks = vi.hoisted(() => {
       userBranch: string,
       dataPath: string,
       tier?: string,
+      releaseDeclaredIndexes?: boolean,
     ) {
       runtimeCtor(schemaJson, appId, env, userBranch, dataPath, tier);
+      this.releaseDeclaredIndexes = releaseDeclaredIndexes;
       runtimeInstances.push(this);
     }
 
@@ -228,6 +234,27 @@ describe("backend/create-jazz-context", () => {
       "/tmp/jazz.db",
       "edge",
     );
+  });
+
+  it("BC-U01c: releases the store's declared indexes only when asked", () => {
+    const released = createJazzContext({
+      appId: "server-app",
+      app: { wasmSchema: SCHEMA_A },
+      permissions: {},
+      driver: { type: "persistent", dataPath: "/tmp/jazz.db" },
+      releaseDeclaredIndexes: true,
+    });
+    released.db();
+    expect(mocks.runtimeInstances[0]?.releaseDeclaredIndexes).toBe(true);
+
+    const kept = createJazzContext({
+      appId: "server-app",
+      app: { wasmSchema: SCHEMA_A },
+      permissions: {},
+      driver: { type: "persistent", dataPath: "/tmp/jazz.db" },
+    });
+    kept.db();
+    expect(mocks.runtimeInstances[1]?.releaseDeclaredIndexes).toBe(false);
   });
 
   it("BC-U01b: rejects configuring both jwksUrl and jwtPublicKey", () => {
