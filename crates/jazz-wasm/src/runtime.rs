@@ -1314,8 +1314,10 @@ impl WasmRuntime {
     /// Create a persistent WasmRuntime backed by OPFS.
     ///
     /// Opens a single OPFS file namespace and restores state from the latest
-    /// durable checkpoint.
+    /// durable checkpoint. `release_declared_indexes` releases the store from the app's
+    /// declared indexes, for a rollback (`QueryManager::release_declared_indexes`).
     #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_persistent(
         schema_json: &str,
         app_id: &str,
@@ -1324,6 +1326,7 @@ impl WasmRuntime {
         db_name: &str,
         tier: Option<String>,
         use_binary_encoding: bool,
+        release_declared_indexes: bool,
     ) -> Result<WasmRuntime, JsValue> {
         #[cfg(feature = "console_error_panic_hook")]
         console_error_panic_hook::set_once();
@@ -1368,6 +1371,11 @@ impl WasmRuntime {
                 ?error,
                 "failed to rehydrate schema manager from catalogue storage"
             );
+        }
+        if release_declared_indexes {
+            schema_manager
+                .query_manager_mut()
+                .release_declared_indexes();
         }
 
         Ok(assemble_wasm_runtime(

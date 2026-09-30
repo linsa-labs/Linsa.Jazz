@@ -1182,6 +1182,7 @@ struct BridgeInitOptions {
     leadership_id: Option<u32>,
     log_level: Option<String>,
     telemetry_collector_url: Option<String>,
+    release_declared_indexes: Option<bool>,
 }
 
 fn build_init_message(opts: &BridgeInitOptions, original: &JsValue) -> Result<JsValue, JsError> {
@@ -1239,6 +1240,13 @@ fn build_init_message(opts: &BridgeInitOptions, original: &JsValue) -> Result<Js
             &msg,
             &"telemetryCollectorUrl".into(),
             &JsValue::from_str(url),
+        );
+    }
+    if let Some(release) = opts.release_declared_indexes {
+        let _ = Reflect::set(
+            &msg,
+            &"releaseDeclaredIndexes".into(),
+            &JsValue::from_bool(release),
         );
     }
     let runtime_sources =

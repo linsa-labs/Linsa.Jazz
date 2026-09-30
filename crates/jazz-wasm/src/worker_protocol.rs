@@ -59,6 +59,9 @@ pub struct InitPayloadFields {
     pub leadership_id: Option<u32>,
     pub log_level: Option<String>,
     pub telemetry_collector_url: Option<String>,
+    /// Release the worker's store from the app's declared indexes, for a rollback
+    /// (`QueryManager::release_declared_indexes`).
+    pub release_declared_indexes: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

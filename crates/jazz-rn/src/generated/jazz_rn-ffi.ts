@@ -42,6 +42,7 @@ interface NativeModuleInterface {
     userBranch: Uint8Array,
     tier: Uint8Array,
     dataPath: Uint8Array,
+    releaseDeclaredIndexes: Uint8Array,
     uniffi_out_err: UniffiRustCallStatus
   ): bigint;
   ubrn_uniffi_jazz_rn_fn_method_rnruntime_batched_tick(

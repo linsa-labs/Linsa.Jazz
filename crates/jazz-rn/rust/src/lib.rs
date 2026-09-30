@@ -673,7 +673,10 @@ pub struct RnRuntime {
 
 #[uniffi::export]
 impl RnRuntime {
-    #[uniffi::constructor]
+    /// `release_declared_indexes` releases the store from the app's declared indexes,
+    /// for a rollback to an engine that does not maintain them (see
+    /// `QueryManager::release_declared_indexes`).
+    #[uniffi::constructor(default(release_declared_indexes = None))]
     pub fn new(
         schema_json: String,
         app_id: String,
@@ -681,6 +684,7 @@ impl RnRuntime {
         user_branch: String,
         tier: Option<String>,
         data_path: Option<String>,
+        release_declared_indexes: Option<bool>,
     ) -> Result<Arc<Self>, JazzRnError> {
         with_panic_boundary("new", || {
             // Put the engine-log subscriber in place with everything filtered
@@ -736,6 +740,12 @@ impl RnRuntime {
                 eprintln!(
                     "jazz-rn: failed to rehydrate schema manager from catalogue storage for app {app_id_obj}: {error}"
                 );
+            }
+
+            if release_declared_indexes == Some(true) {
+                schema_manager
+                    .query_manager_mut()
+                    .release_declared_indexes();
             }
 
             let scheduler = RnScheduler::default();

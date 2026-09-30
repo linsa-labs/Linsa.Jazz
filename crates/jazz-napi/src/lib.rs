@@ -558,6 +558,7 @@ fn build_napi_runtime(
     user_branch: String,
     storage: Box<dyn Storage + Send>,
     tier: Option<String>,
+    release_declared_indexes: Option<bool>,
 ) -> napi::Result<NapiRuntime> {
     // Parse schema
     let runtime_schema = parse_runtime_schema_input(&schema_json)
@@ -631,6 +632,14 @@ fn build_napi_runtime(
         );
     }
 
+    // A rollback to an engine without declared indexes starts here: the runtime gives
+    // them up when it opens the store.
+    if release_declared_indexes == Some(true) {
+        schema_manager
+            .query_manager_mut()
+            .release_declared_indexes();
+    }
+
     // Create components
     let scheduler = NapiScheduler::new();
 
@@ -677,6 +686,7 @@ impl NapiRuntime {
         user_branch: String,
         data_path: String,
         tier: Option<String>,
+        release_declared_indexes: Option<bool>,
     ) -> napi::Result<Self> {
         let storage = open_sqlite_storage(&data_path)?;
 
@@ -687,6 +697,7 @@ impl NapiRuntime {
             user_branch,
             Box::new(storage),
             tier,
+            release_declared_indexes,
         )
     }
 
@@ -706,6 +717,7 @@ impl NapiRuntime {
             user_branch,
             Box::new(MemoryStorage::new()),
             tier,
+            None,
         )
     }
 

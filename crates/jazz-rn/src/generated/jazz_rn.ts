@@ -948,13 +948,19 @@ export class RnRuntime
   readonly [uniffiTypeNameSymbol] = 'RnRuntime';
   readonly [destructorGuardSymbol]: UniffiGcObject;
   readonly [pointerLiteralSymbol]: UniffiHandle;
+  /**
+   * `release_declared_indexes` releases the store from the app's declared indexes,
+   * for a rollback to an engine that does not maintain them (see
+   * `QueryManager::release_declared_indexes`).
+   */
   constructor(
     schemaJson: string,
     appId: string,
     jazzEnv: string,
     userBranch: string,
     tier: string | undefined,
-    dataPath: string | undefined
+    dataPath: string | undefined,
+    releaseDeclaredIndexes: boolean | undefined = undefined
   ) /*throws*/ {
     super();
     const pointer = uniffiCaller.rustCallWithError(
@@ -969,6 +975,7 @@ export class RnRuntime
           FfiConverterString.lower(userBranch),
           FfiConverterOptionalString.lower(tier),
           FfiConverterOptionalString.lower(dataPath),
+          FfiConverterOptionalBool.lower(releaseDeclaredIndexes),
           callStatus
         );
       },
@@ -1694,6 +1701,9 @@ const FfiConverterTypeRnRuntime = new FfiConverterObject(
   uniffiTypeRnRuntimeObjectFactory
 );
 
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBool = new FfiConverterOptional(FfiConverterBool);
+
 // FfiConverter for BatchedTickCallback | undefined
 const FfiConverterOptionalTypeBatchedTickCallback = new FfiConverterOptional(
   FfiConverterTypeBatchedTickCallback
@@ -1963,7 +1973,7 @@ function uniffiEnsureInitialized() {
   }
   if (
     nativeModule().ubrn_uniffi_jazz_rn_checksum_constructor_rnruntime_new() !==
-    5640
+    59440
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       'uniffi_jazz_rn_checksum_constructor_rnruntime_new'

@@ -241,6 +241,7 @@ async fn run_init(init: InitPayload) -> Result<(), String> {
         &f.db_name,
         Some("local".to_string()),
         false,
+        f.release_declared_indexes.unwrap_or(false),
     )
     .await
     {
