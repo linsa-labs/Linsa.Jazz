@@ -118,3 +118,37 @@ fn direct_query_manager_process_has_no_stale_subscription_work_without_subscript
     qm.process(&mut storage);
     assert!(!qm.has_stale_subscriptions());
 }
+
+/// A storage that loses a write transaction moves to a new cache namespace, and a commit
+/// that keeps failing moves it on every flush. The manager remembers one namespace at a
+/// time — meeting a new one forgets the rest — so nothing grows with them.
+#[test]
+fn a_manager_remembers_cataloguing_its_schemas_in_one_storage_at_a_time() {
+    let mut schema = Schema::new();
+    schema.insert(
+        TableName::new("users"),
+        TableSchema::new(RowDescriptor::new(vec![
+            ColumnDescriptor::new("name", ColumnType::Text),
+            ColumnDescriptor::new("id", ColumnType::Uuid),
+        ])),
+    );
+    let schema_hash = crate::query_manager::types::SchemaHash::compute(&schema);
+
+    let mut qm = QueryManager::new(SyncManager::new());
+    qm.set_current_schema(schema, "dev", "main");
+
+    for _ in 0..8 {
+        // Every storage has a namespace of its own.
+        let mut storage = MemoryStorage::new();
+        qm.ensure_known_schemas_catalogued(&mut storage)
+            .expect("schema bootstrap should succeed");
+        assert_eq!(qm.catalogued_storage_namespaces.len(), 1);
+        assert!(
+            storage
+                .load_catalogue_entry(schema_hash.to_object_id())
+                .expect("catalogue lookup should succeed")
+                .is_some(),
+            "a storage the manager had not seen was left without the schema"
+        );
+    }
+}

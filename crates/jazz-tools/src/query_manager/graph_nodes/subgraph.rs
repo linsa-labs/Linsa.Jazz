@@ -200,6 +200,23 @@ impl SubgraphTemplate {
         })
     }
 
+    /// Whether an instance's rows are decided by `inner_column = <binding>`
+    /// alone at the scan: no join or recursion to bring rows in from elsewhere,
+    /// no soft-deleted rows, no offset, and no second condition on the
+    /// correlation column for the planner to fold into the scan.
+    pub(crate) fn reads_only_its_correlation(&self) -> bool {
+        self.base_query.joins.is_empty()
+            && self.base_query.recursive.is_none()
+            && !self.base_query.include_deleted
+            && self.base_query.offset == 0
+            && self.base_query.disjuncts.iter().all(|disjunct| {
+                disjunct
+                    .conditions
+                    .iter()
+                    .all(|condition| condition.column() != self.inner_column)
+            })
+    }
+
     /// Get the inner table name.
     pub fn table(&self) -> &str {
         &self.base_query.table.0

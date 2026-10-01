@@ -29,6 +29,12 @@ pub use rocksdb::RocksDBStorage;
 mod sqlite;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use sqlite::SqliteStorage;
+#[cfg(all(
+    feature = "sqlite",
+    not(target_arch = "wasm32"),
+    any(test, feature = "test")
+))]
+pub use sqlite::{SqliteReadPathMode, force_sqlite_read_path};
 pub mod graft;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -587,10 +593,13 @@ fn cached_raw_table_header_with_storage<H: Storage + ?Sized>(
     storage: &H,
     raw_table: &str,
 ) -> Option<RawTableHeader> {
+    // The namespace first, every time: reading it can purge these caches (a storage that
+    // lost a write transaction abandons its namespace), which a held lock would deadlock.
+    let key = (storage.storage_cache_namespace(), raw_table.to_string());
     raw_table_header_cache()
         .lock()
         .expect("raw table header cache poisoned")
-        .get(&(storage.storage_cache_namespace(), raw_table.to_string()))
+        .get(&key)
         .cloned()
 }
 
@@ -599,13 +608,11 @@ fn cache_raw_table_header_with_storage<H: Storage + ?Sized>(
     raw_table: &str,
     header: RawTableHeader,
 ) {
+    let key = (storage.storage_cache_namespace(), raw_table.to_string());
     raw_table_header_cache()
         .lock()
         .expect("raw table header cache poisoned")
-        .insert(
-            (storage.storage_cache_namespace(), raw_table.to_string()),
-            header,
-        );
+        .insert(key, header);
 }
 
 fn validated_raw_table_cache() -> &'static Mutex<HashSet<(usize, String)>> {
@@ -614,24 +621,27 @@ fn validated_raw_table_cache() -> &'static Mutex<HashSet<(usize, String)>> {
 }
 
 fn raw_table_validated_with_storage<H: Storage + ?Sized>(storage: &H, raw_table: &str) -> bool {
+    let key = (storage.storage_cache_namespace(), raw_table.to_string());
     validated_raw_table_cache()
         .lock()
         .expect("validated raw table cache poisoned")
-        .contains(&(storage.storage_cache_namespace(), raw_table.to_string()))
+        .contains(&key)
 }
 
 fn cache_validated_raw_table_with_storage<H: Storage + ?Sized>(storage: &H, raw_table: &str) {
+    let key = (storage.storage_cache_namespace(), raw_table.to_string());
     validated_raw_table_cache()
         .lock()
         .expect("validated raw table cache poisoned")
-        .insert((storage.storage_cache_namespace(), raw_table.to_string()));
+        .insert(key);
 }
 
 fn invalidate_validated_raw_table_with_storage<H: Storage + ?Sized>(storage: &H, raw_table: &str) {
+    let key = (storage.storage_cache_namespace(), raw_table.to_string());
     validated_raw_table_cache()
         .lock()
         .expect("validated raw table cache poisoned")
-        .remove(&(storage.storage_cache_namespace(), raw_table.to_string()));
+        .remove(&key);
 }
 
 fn cached_row_descriptor(raw_table: &str) -> Option<Arc<RowDescriptor>> {
@@ -665,7 +675,80 @@ fn table_catalogue_descriptor_cache() -> &'static Mutex<TableCatalogueDescriptor
 }
 
 pub(crate) fn invalidate_catalogue_lookup_caches_with_storage<H: Storage + ?Sized>(storage: &H) {
-    let namespace = storage.storage_cache_namespace();
+    forget_catalogue_lookup_caches(storage.storage_cache_namespace());
+}
+
+/// How many storage namespaces a schema manager remembers having persisted its schema
+/// to. A storage that loses a write transaction moves to a new namespace and is never
+/// asked about the old one again, so the set is emptied at this size rather than grown:
+/// forgetting one costs a catalogue read.
+pub(crate) const MAX_REMEMBERED_STORAGE_NAMESPACES: usize = 64;
+
+/// Drops everything cached under a namespace its storage has left for good.
+///
+/// Called with no cache lock held and takes each in turn; callers that key by the
+/// namespace read it BEFORE taking a cache lock for the same reason.
+#[cfg_attr(
+    not(all(feature = "sqlite", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+pub(crate) fn forget_storage_cache_namespace(namespace: usize) {
+    raw_table_header_cache()
+        .lock()
+        .expect("raw table header cache poisoned")
+        .retain(|(cached_namespace, _), _| *cached_namespace != namespace);
+    validated_raw_table_cache()
+        .lock()
+        .expect("validated raw table cache poisoned")
+        .retain(|(cached_namespace, _)| *cached_namespace != namespace);
+    forget_catalogue_lookup_caches(namespace);
+}
+
+/// Entries each of the caches above the storages holds under `namespace`: raw-table
+/// headers, validated raw tables, catalogue user descriptors, branch schema hashes,
+/// table catalogue descriptors. One lock at a time.
+#[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) fn storage_cache_entries_in_namespace(namespace: usize) -> [usize; 5] {
+    let headers = raw_table_header_cache()
+        .lock()
+        .expect("raw table header cache poisoned")
+        .keys()
+        .filter(|(cached_namespace, _)| *cached_namespace == namespace)
+        .count();
+    let validated = validated_raw_table_cache()
+        .lock()
+        .expect("validated raw table cache poisoned")
+        .iter()
+        .filter(|(cached_namespace, _)| *cached_namespace == namespace)
+        .count();
+    let user_descriptors = catalogue_user_descriptor_cache()
+        .lock()
+        .expect("catalogue user descriptor cache poisoned")
+        .keys()
+        .filter(|(cached_namespace, _, _)| *cached_namespace == namespace)
+        .count();
+    let branch_hashes = branch_schema_hash_cache()
+        .lock()
+        .expect("branch schema hash cache poisoned")
+        .keys()
+        .filter(|(cached_namespace, _)| *cached_namespace == namespace)
+        .count();
+    let table_descriptors = table_catalogue_descriptor_cache()
+        .lock()
+        .expect("table catalogue descriptor cache poisoned")
+        .keys()
+        .filter(|(cached_namespace, _)| *cached_namespace == namespace)
+        .count();
+    [
+        headers,
+        validated,
+        user_descriptors,
+        branch_hashes,
+        table_descriptors,
+    ]
+}
+
+fn forget_catalogue_lookup_caches(namespace: usize) {
     catalogue_user_descriptor_cache()
         .lock()
         .expect("catalogue user descriptor cache poisoned")
@@ -685,14 +768,15 @@ fn cached_catalogue_user_descriptor_with_storage<H: Storage + ?Sized>(
     table_name: &str,
     schema_hash: SchemaHash,
 ) -> Option<Arc<RowDescriptor>> {
+    let key = (
+        storage.storage_cache_namespace(),
+        table_name.to_string(),
+        schema_hash,
+    );
     catalogue_user_descriptor_cache()
         .lock()
         .expect("catalogue user descriptor cache poisoned")
-        .get(&(
-            storage.storage_cache_namespace(),
-            table_name.to_string(),
-            schema_hash,
-        ))
+        .get(&key)
         .cloned()
 }
 
@@ -702,17 +786,15 @@ fn cache_catalogue_user_descriptor_with_storage<H: Storage + ?Sized>(
     schema_hash: SchemaHash,
     descriptor: Arc<RowDescriptor>,
 ) {
+    let key = (
+        storage.storage_cache_namespace(),
+        table_name.to_string(),
+        schema_hash,
+    );
     catalogue_user_descriptor_cache()
         .lock()
         .expect("catalogue user descriptor cache poisoned")
-        .insert(
-            (
-                storage.storage_cache_namespace(),
-                table_name.to_string(),
-                schema_hash,
-            ),
-            descriptor,
-        );
+        .insert(key, descriptor);
 }
 
 fn metadata_raw_key(id: ObjectId) -> String {
@@ -758,11 +840,18 @@ fn decode_row_locator(bytes: &[u8]) -> Result<RowLocator, StorageError> {
 }
 
 fn exact_row_table_locator_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("row_raw_table", ColumnType::Text),
-        ColumnDescriptor::new("table_name", ColumnType::Text),
-        ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("row_raw_table", ColumnType::Text),
+                ColumnDescriptor::new("table_name", ColumnType::Text),
+                ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
+            ])
+        })
+        .clone()
 }
 
 fn encode_exact_row_table_locator(locator: &ExactRowTableLocator) -> Result<Vec<u8>, StorageError> {
@@ -864,18 +953,39 @@ fn decode_local_batch_record_key(key: &str) -> Result<BatchId, StorageError> {
 }
 
 fn branch_ord_by_name_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![ColumnDescriptor::new(
-        "branch_ord",
-        ColumnType::Integer,
-    )])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![ColumnDescriptor::new(
+                "branch_ord",
+                ColumnType::Integer,
+            )])
+        })
+        .clone()
 }
 
 fn branch_name_by_ord_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![ColumnDescriptor::new("branch_name", ColumnType::Text)])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![ColumnDescriptor::new("branch_name", ColumnType::Text)])
+        })
+        .clone()
 }
 
 fn branch_ord_meta_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![ColumnDescriptor::new("next_ord", ColumnType::Integer)])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![ColumnDescriptor::new("next_ord", ColumnType::Integer)])
+        })
+        .clone()
 }
 
 fn branch_ord_by_name_key(branch_name: BranchName) -> String {
@@ -1122,13 +1232,20 @@ fn decode_raw_table_header(bytes: &[u8]) -> Result<RawTableHeader, StorageError>
 }
 
 fn raw_table_header_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("storage_kind", ColumnType::Text),
-        ColumnDescriptor::new("storage_format_version", ColumnType::Integer),
-        ColumnDescriptor::new("logical_table_name", ColumnType::Text).nullable(),
-        ColumnDescriptor::new("schema_hash", ColumnType::Bytea).nullable(),
-        ColumnDescriptor::new("row_descriptor_bytes", ColumnType::Bytea).nullable(),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("storage_kind", ColumnType::Text),
+                ColumnDescriptor::new("storage_format_version", ColumnType::Integer),
+                ColumnDescriptor::new("logical_table_name", ColumnType::Text).nullable(),
+                ColumnDescriptor::new("schema_hash", ColumnType::Bytea).nullable(),
+                ColumnDescriptor::new("row_descriptor_bytes", ColumnType::Bytea).nullable(),
+            ])
+        })
+        .clone()
 }
 
 fn supported_storage_format_version(storage_kind: &str) -> Result<i32, StorageError> {
@@ -2450,6 +2567,9 @@ fn row_raw_table_ids_for_table<H: Storage + ?Sized>(
     table: &str,
 ) -> Result<Vec<RowRawTableId>, StorageError> {
     let prefix = row_raw_table_header_prefix(kind, table);
+    if let Some(ids) = storage.memoized_row_raw_table_ids(&prefix) {
+        return Ok(ids);
+    }
     let mut ids = Vec::new();
     for (raw_table_name, bytes) in storage.raw_table_scan_prefix(RAW_TABLE_HEADER_TABLE, &prefix)? {
         let row_raw_table_id = RowRawTableId::parse_raw_table_name(&raw_table_name)?;
@@ -2460,6 +2580,7 @@ fn row_raw_table_ids_for_table<H: Storage + ?Sized>(
         ids.push(row_raw_table_id);
     }
     ids.sort_by_key(|row_raw_table_id| row_raw_table_id.raw_table_name().to_string());
+    storage.memoize_row_raw_table_ids(&prefix, &ids);
     Ok(ids)
 }
 
@@ -2612,77 +2733,98 @@ fn common_case_exact_visible_row_table_locator<H: Storage + ?Sized>(
 }
 
 fn sealed_batch_submission_storage_descriptor_with_branch_ords() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-        ColumnDescriptor::new("mode", ColumnType::Text),
-        ColumnDescriptor::new("target_branch_ord", ColumnType::Integer),
-        ColumnDescriptor::new("batch_digest", ColumnType::Bytea),
-        ColumnDescriptor::new(
-            "members",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("row_digest", ColumnType::Bytea),
-                    ])),
-                }),
-            },
-        ),
-        ColumnDescriptor::new(
-            "captured_frontier",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("branch_ord", ColumnType::Integer),
-                        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-                    ])),
-                }),
-            },
-        ),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                ColumnDescriptor::new("mode", ColumnType::Text),
+                ColumnDescriptor::new("target_branch_ord", ColumnType::Integer),
+                ColumnDescriptor::new("batch_digest", ColumnType::Bytea),
+                ColumnDescriptor::new(
+                    "members",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("row_digest", ColumnType::Bytea),
+                            ])),
+                        }),
+                    },
+                ),
+                ColumnDescriptor::new(
+                    "captured_frontier",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("branch_ord", ColumnType::Integer),
+                                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                            ])),
+                        }),
+                    },
+                ),
+            ])
+        })
+        .clone()
 }
 
 fn local_batch_record_storage_descriptor_with_branch_ords() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-        ColumnDescriptor::new("mode", ColumnType::Text),
-        ColumnDescriptor::new("sealed", ColumnType::Boolean),
-        ColumnDescriptor::new(
-            "members",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("table_name", ColumnType::Text),
-                        ColumnDescriptor::new("branch_ord", ColumnType::Integer),
-                        ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
-                        ColumnDescriptor::new("row_digest", ColumnType::Bytea),
-                    ])),
-                }),
-            },
-        ),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                ColumnDescriptor::new("mode", ColumnType::Text),
+                ColumnDescriptor::new("sealed", ColumnType::Boolean),
+                ColumnDescriptor::new(
+                    "members",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("table_name", ColumnType::Text),
+                                ColumnDescriptor::new("branch_ord", ColumnType::Integer),
+                                ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
+                                ColumnDescriptor::new("row_digest", ColumnType::Bytea),
+                            ])),
+                        }),
+                    },
+                ),
+            ])
+        })
+        .clone()
 }
 
 fn local_batch_row_index_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-        ColumnDescriptor::new(
-            "members",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("table_name", ColumnType::Text),
-                        ColumnDescriptor::new("branch_name", ColumnType::Text),
-                        ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
-                        ColumnDescriptor::new("row_digest", ColumnType::Bytea),
-                    ])),
-                }),
-            },
-        ),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                ColumnDescriptor::new(
+                    "members",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("table_name", ColumnType::Text),
+                                ColumnDescriptor::new("branch_name", ColumnType::Text),
+                                ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
+                                ColumnDescriptor::new("row_digest", ColumnType::Bytea),
+                            ])),
+                        }),
+                    },
+                ),
+            ])
+        })
+        .clone()
 }
 
 fn encode_batch_mode(mode: crate::batch_fate::BatchMode) -> &'static str {
@@ -3364,7 +3506,29 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
     // every visible read; correctness first, and the alternative — leaving a
     // pointer nothing keeps current in front of one that is — is what this
     // defect is.
-    if let Some(locator) = storage.load_visible_row_table_locator(branch, row_id)? {
+    //
+    // `raw_table_key_known_absent` (here and below): a backend that can prove a
+    // `(raw table, branch)` pair does not hold this key lets the probe be skipped — it
+    // could only miss. On a store with several schema generations that is most of the
+    // ladder: a read fans out over every branch, a row has a head on one of them, and
+    // this table holds a handful of stamps against thousands of rows.
+    //
+    // In the last-resort loop the skip sits BEFORE the family is resolved, because
+    // resolving costs a header read of its own. So a family whose header cannot be
+    // resolved, and which provably lacks the key, is passed over without the error
+    // the unskipped walk would have returned for it. Deliberate: the row is not there
+    // either way, and a reader of some other row is not the place to report it.
+    let branch_prefix = key_codec::visible_row_raw_table_prefix(branch);
+    let exact_locator = if storage.raw_table_key_known_absent(
+        VISIBLE_ROW_TABLE_LOCATOR_TABLE,
+        &branch_prefix,
+        &key,
+    ) {
+        None
+    } else {
+        storage.load_visible_row_table_locator(branch, row_id)?
+    };
+    if let Some(locator) = exact_locator {
         let resolved = resolved_row_table_from_locator(storage, &locator)?
             .expect("locator-resolved row table must exist");
         let row_raw_table = locator.row_raw_table.to_string();
@@ -3388,9 +3552,16 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
 
     // The common case: no exact locator was ever needed for this row, so the
     // family derived from `__row_locator` is the only one it has ever lived in.
+    let mut common_case_raw_table = None;
     if let Some(locator) = common_case_exact_visible_row_table_locator(storage, row_id)? {
         let row_raw_table = locator.row_raw_table.to_string();
-        if let Some(bytes) = storage.raw_table_get(&row_raw_table, &key)? {
+        let bytes = if storage.raw_table_key_known_absent(&row_raw_table, &branch_prefix, &key) {
+            None
+        } else {
+            storage.raw_table_get(&row_raw_table, &key)?
+        };
+        common_case_raw_table = Some(row_raw_table.clone());
+        if let Some(bytes) = bytes {
             let resolved = resolved_row_table_from_locator(storage, &locator)?
                 .expect("common-case locator-resolved visible row table must exist");
             return Ok(Some(OwnedVisibleRowBytes {
@@ -3420,6 +3591,17 @@ pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
     // empty over a delivered, confirmed row — welcome, chats, kick). Bounded
     // by the handful of schema generations a store ever holds.
     for row_raw_table_id in row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)? {
+        // The common-case step above already read this exact key from this table.
+        if common_case_raw_table.as_deref() == Some(row_raw_table_id.raw_table_name()) {
+            continue;
+        }
+        if storage.raw_table_key_known_absent(
+            row_raw_table_id.raw_table_name(),
+            &branch_prefix,
+            &key,
+        ) {
+            continue;
+        }
         let Some(resolved) = resolved_row_table_from_id(storage, row_raw_table_id.clone())? else {
             continue;
         };

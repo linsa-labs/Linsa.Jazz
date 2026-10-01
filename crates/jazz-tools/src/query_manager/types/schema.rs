@@ -317,11 +317,30 @@ impl ColumnDescriptor {
 ///
 /// Descriptors are treated as immutable once built. To change columns, build a
 /// new list and hand it to `new` (see `MagicColumnsNode`); there is no in-place
-/// mutation path, which is also what keeps `content_hash_cache` honest.
+/// mutation path, which is also what keeps `memo` honest.
+///
+/// What is derived from the columns — the content hash and the compiled row
+/// layout — is memoized in one cell shared by every clone, for the same reason
+/// the columns are: a descriptor is handed out as a clone far more often than
+/// it is used in place (`TupleDescriptor::combined_descriptor` returns one per
+/// call), and a memo owned by the clone is computed on the clone and dropped
+/// with it. A per-clone hash cell, with the layout looked up by that hash,
+/// hashed the same nested descriptor tree once per decoded row.
 #[derive(Debug)]
 pub struct RowDescriptor {
+    /// Read-only after construction. The memo beside it is OF these columns and is
+    /// shared with every clone: assigning another column list here would leave this
+    /// descriptor, and none of its clones, hashing and laying out rows by the old one.
+    /// A different column list is a different descriptor — build it with
+    /// [`RowDescriptor::new`].
     pub columns: Arc<[ColumnDescriptor]>,
-    content_hash_cache: OnceLock<[u8; 32]>,
+    memo: Arc<DescriptorMemo>,
+}
+
+#[derive(Debug, Default)]
+struct DescriptorMemo {
+    content_hash: OnceLock<[u8; 32]>,
+    row_layout: OnceLock<Arc<crate::row_format::CompiledRowLayout>>,
 }
 
 impl Serialize for RowDescriptor {
@@ -347,11 +366,11 @@ impl<'de> Deserialize<'de> for RowDescriptor {
 
 impl Clone for RowDescriptor {
     fn clone(&self) -> Self {
-        // Share the columns and the memoized hash: both describe the same
-        // immutable column list.
+        // Share the columns and what is memoized from them: both describe
+        // the same immutable column list.
         Self {
             columns: Arc::clone(&self.columns),
-            content_hash_cache: self.content_hash_cache.clone(),
+            memo: Arc::clone(&self.memo),
         }
     }
 }
@@ -374,8 +393,24 @@ impl RowDescriptor {
     pub fn new(columns: impl Into<Arc<[ColumnDescriptor]>>) -> Self {
         Self {
             columns: columns.into(),
-            content_hash_cache: OnceLock::new(),
+            memo: Arc::default(),
         }
+    }
+
+    /// Whether `other` is a clone of this descriptor (or the other way round), so that
+    /// what one of them memoizes the other finds.
+    #[cfg(test)]
+    pub(crate) fn shares_memo_with(&self, other: &RowDescriptor) -> bool {
+        Arc::ptr_eq(&self.memo, &other.memo)
+    }
+
+    /// Whether the content hash and the row layout are already computed.
+    #[cfg(test)]
+    pub(crate) fn memoized(&self) -> (bool, bool) {
+        (
+            self.memo.content_hash.get().is_some(),
+            self.memo.row_layout.get().is_some(),
+        )
     }
 
     /// Find column index by name.
@@ -422,11 +457,23 @@ impl RowDescriptor {
 
     /// Compute a content hash of this descriptor, preserving declared column order.
     pub fn content_hash(&self) -> [u8; 32] {
-        *self.content_hash_cache.get_or_init(|| {
+        *self.memo.content_hash.get_or_init(|| {
+            crate::query_manager::settle_cost::bump(
+                &crate::query_manager::settle_cost::DESCRIPTOR_HASHES,
+            );
             let mut hasher = blake3::Hasher::new();
             super::branch::hash_row_descriptor(&mut hasher, self);
             *hasher.finalize().as_bytes()
         })
+    }
+
+    /// The compiled layout of rows of this descriptor, built by `compile` the
+    /// first time any clone asks.
+    pub(crate) fn row_layout(
+        &self,
+        compile: impl FnOnce(&RowDescriptor) -> crate::row_format::CompiledRowLayout,
+    ) -> Arc<crate::row_format::CompiledRowLayout> {
+        Arc::clone(self.memo.row_layout.get_or_init(|| Arc::new(compile(self))))
     }
 }
 

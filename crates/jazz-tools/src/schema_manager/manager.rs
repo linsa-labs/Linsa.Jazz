@@ -926,6 +926,11 @@ impl SchemaManager {
 
         let changed =
             self.persist_catalogue_object_if_changed(storage, object_id, metadata, content);
+        if self.persisted_current_schema_in_storage.len()
+            >= crate::storage::MAX_REMEMBERED_STORAGE_NAMESPACES
+        {
+            self.persisted_current_schema_in_storage.clear();
+        }
         self.persisted_current_schema_in_storage.insert(storage_key);
         changed
     }
@@ -2545,6 +2550,32 @@ mod tests {
         // V2 has 3 columns (id, name, email)
         let v2_desc = manager.get_table_descriptor("users", &v2_hash).unwrap();
         assert_eq!(v2_desc.columns.len(), 3);
+    }
+
+    /// A storage that loses a write transaction moves to a new cache namespace, and a
+    /// commit that keeps failing moves it on every flush. What the manager remembers
+    /// about namespaces nobody will ask about again must not grow with them.
+    #[test]
+    fn the_storages_a_manager_remembers_persisting_its_schema_to_are_bounded() {
+        let mut manager = SchemaManager::new(
+            SyncManager::new(),
+            make_schema_v1(),
+            test_app_id(),
+            "dev",
+            "main",
+        )
+        .unwrap();
+        let bound = crate::storage::MAX_REMEMBERED_STORAGE_NAMESPACES;
+        for _ in 0..4 * bound {
+            // Every storage has a namespace of its own.
+            let mut storage = crate::storage::MemoryStorage::new();
+            assert!(manager.ensure_current_schema_persisted(&mut storage));
+            assert!(
+                !manager.ensure_current_schema_persisted(&mut storage),
+                "the manager forgot a storage it has just persisted its schema to"
+            );
+            assert!(manager.persisted_current_schema_in_storage.len() <= bound);
+        }
     }
 
     #[test]

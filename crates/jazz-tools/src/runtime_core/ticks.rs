@@ -719,6 +719,8 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     pub fn immediate_tick(&mut self) -> TickOutput {
         let _span = trace_span!("immediate_tick", tier = self.tier_label).entered();
 
+        // Everything up to the end of the second `process` reads storage row by row.
+        self.storage.begin_read_scope();
         let recovered_sealed_batches = self
             .schema_manager
             .query_manager_mut()
@@ -735,6 +737,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         //    compile on first pass (schema wasn't available yet, e.g. catalogue
         //    was just processed and made the schema available).
         self.schema_manager.process(&mut self.storage);
+        self.storage.end_read_scope();
         if self
             .schema_manager
             .query_manager_mut()

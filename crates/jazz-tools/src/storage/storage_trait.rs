@@ -47,18 +47,47 @@ pub trait Storage {
     }
 
     fn load_row_locator(&self, id: ObjectId) -> Result<Option<RowLocator>, StorageError> {
-        self.raw_table_get(ROW_LOCATOR_TABLE, &metadata_raw_key(id))?
-            .map(|bytes| {
-                ensure_system_raw_table_header_validated_once(
-                    self,
-                    ROW_LOCATOR_TABLE,
-                    STORAGE_KIND_ROW_LOCATOR,
-                    ROW_LOCATOR_STORAGE_FORMAT_V1,
-                )?;
-                decode_row_locator(&bytes)
-            })
-            .transpose()
+        load_row_locator_default(self, id)
     }
+
+    /// Whether the backend KNOWS that no entry of `table` has a key starting with
+    /// `prefix`. `false` means "not known", never "non-empty": callers use a `true` to
+    /// skip a read that is then guaranteed to miss, and must do the read otherwise.
+    ///
+    /// A store that has lived through several schema generations answers one visible
+    /// read by probing every branch times every generation family, and almost all of
+    /// those probes land in a `(family, branch)` pair that holds no rows at all. A
+    /// backend that can keep this answer exact under its own writes turns each of them
+    /// into a lookup; the default knows nothing and changes nothing.
+    fn raw_table_prefix_known_empty(&self, _table: &str, _prefix: &str) -> bool {
+        false
+    }
+
+    /// Opens a scope in which the caller makes many reads back to back. A backend that
+    /// pays a fixed price around every statement may pay it once for the scope instead.
+    /// When writes become durable does not change. What reads see may: a backend is free
+    /// to answer the whole scope from one snapshot, so a commit made through another
+    /// connection during the scope is seen after it.
+    fn begin_read_scope(&self) {}
+
+    /// Closes the scope opened by the matching `begin_read_scope`.
+    fn end_read_scope(&self) {}
+
+    /// Whether the backend KNOWS that `table` holds no entry under `key`, from what it
+    /// knows about the keys starting with `prefix` (which `key` must start with).
+    /// `false` means "not known", never "present".
+    fn raw_table_key_known_absent(&self, _table: &str, _prefix: &str, _key: &str) -> bool {
+        false
+    }
+
+    /// The backend's memo of `row_raw_table_ids_for_table` for one header prefix, if it
+    /// keeps one. Exactness is the backend's: it must drop the memo on any write to the
+    /// raw-table header table.
+    fn memoized_row_raw_table_ids(&self, _header_prefix: &str) -> Option<Vec<RowRawTableId>> {
+        None
+    }
+
+    fn memoize_row_raw_table_ids(&self, _header_prefix: &str, _ids: &[RowRawTableId]) {}
 
     fn put_row_locator(
         &mut self,
@@ -1908,6 +1937,9 @@ pub trait Storage {
         value: &Value,
     ) -> Vec<ObjectId> {
         let raw_table = key_codec::index_raw_table(table, column, branch);
+        if self.raw_table_prefix_known_empty(&raw_table, "") {
+            return Vec::new();
+        }
         if is_double_zero(value) {
             let mut result = HashSet::new();
             for zero in &[Value::Double(0.0), Value::Double(-0.0)] {
@@ -1935,6 +1967,36 @@ pub trait Storage {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether the index holds no entry for `value` — what `index_lookup(..).is_empty()`
+    /// answers, read off one entry instead of all of them. `false` when the index cannot
+    /// be read: a caller skips work on a `true`, and must not skip it on a guess.
+    fn index_lookup_is_empty(
+        &self,
+        table: &str,
+        column: &str,
+        branch: &str,
+        value: &Value,
+    ) -> bool {
+        if is_double_zero(value) {
+            return self.index_lookup(table, column, branch, value).is_empty();
+        }
+        let raw_table = key_codec::index_raw_table(table, column, branch);
+        if self.raw_table_prefix_known_empty(&raw_table, "") {
+            return true;
+        }
+        // A value too large to key has no entries: `index_lookup` returns none for it.
+        let Ok(prefix) = key_codec::index_value_prefix(table, column, branch, value) else {
+            return true;
+        };
+        let mut end = prefix.clone();
+        key_codec::increment_string(&mut end);
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_READ_OPS,
+        );
+        self.raw_table_scan_range_keys_limited(&raw_table, Some(&prefix), Some(&end), false, 1)
+            .is_ok_and(|keys| keys.is_empty())
     }
 
     fn index_range(
@@ -2038,6 +2100,30 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
 
     fn load_row_locator(&self, id: ObjectId) -> Result<Option<RowLocator>, StorageError> {
         (**self).load_row_locator(id)
+    }
+
+    fn raw_table_prefix_known_empty(&self, table: &str, prefix: &str) -> bool {
+        (**self).raw_table_prefix_known_empty(table, prefix)
+    }
+
+    fn raw_table_key_known_absent(&self, table: &str, prefix: &str, key: &str) -> bool {
+        (**self).raw_table_key_known_absent(table, prefix, key)
+    }
+
+    fn begin_read_scope(&self) {
+        (**self).begin_read_scope()
+    }
+
+    fn end_read_scope(&self) {
+        (**self).end_read_scope()
+    }
+
+    fn memoized_row_raw_table_ids(&self, header_prefix: &str) -> Option<Vec<RowRawTableId>> {
+        (**self).memoized_row_raw_table_ids(header_prefix)
+    }
+
+    fn memoize_row_raw_table_ids(&self, header_prefix: &str, ids: &[RowRawTableId]) {
+        (**self).memoize_row_raw_table_ids(header_prefix, ids)
     }
 
     fn put_row_locator(
@@ -2668,6 +2754,16 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         (**self).index_lookup(table, column, branch, value)
     }
 
+    fn index_lookup_is_empty(
+        &self,
+        table: &str,
+        column: &str,
+        branch: &str,
+        value: &Value,
+    ) -> bool {
+        (**self).index_lookup_is_empty(table, column, branch, value)
+    }
+
     fn index_range(
         &self,
         table: &str,
@@ -2694,6 +2790,26 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
     fn close(&self) -> Result<(), StorageError> {
         (**self).close()
     }
+}
+
+/// The default body of [`Storage::load_row_locator`], split out so a backend that memoizes
+/// locators can fall through to it on a miss.
+pub(super) fn load_row_locator_default<H: Storage + ?Sized>(
+    storage: &H,
+    id: ObjectId,
+) -> Result<Option<RowLocator>, StorageError> {
+    storage
+        .raw_table_get(ROW_LOCATOR_TABLE, &metadata_raw_key(id))?
+        .map(|bytes| {
+            ensure_system_raw_table_header_validated_once(
+                storage,
+                ROW_LOCATOR_TABLE,
+                STORAGE_KIND_ROW_LOCATOR,
+                ROW_LOCATOR_STORAGE_FORMAT_V1,
+            )?;
+            decode_row_locator(&bytes)
+        })
+        .transpose()
 }
 
 /// The default body of [`Storage::put_visible_row_table_locator`], split out so

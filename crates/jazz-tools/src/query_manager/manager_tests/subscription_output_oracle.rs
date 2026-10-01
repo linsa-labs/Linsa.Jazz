@@ -179,17 +179,26 @@ enum EnginePath {
     /// O(instances) — and therefore the right reference for proving that
     /// routing changes cost and nothing else.
     PreciseUnrouted,
+    /// The default path with empty bindings OFF (`JAZZ_INCLUDE_EMPTY_PROBE=0`):
+    /// every include binding gets a compiled instance, as before v24. The
+    /// reference for proving that answering an empty binding from the index
+    /// changes cost and nothing else.
+    PreciseNoEmptyProbe,
     /// Row-precise include dirtiness with correlation routing on (the default
     /// runtime path since v14).
     PreciseDirty,
 }
 
-/// Both kill switches, held for one engine call. Acquired in a fixed order
-/// (precise, then routing) so two engines on different paths cannot deadlock
-/// against each other inside one dual-run.
+/// The kill switches, held for one engine call. Acquired in a fixed order
+/// (precise, then routing, then empty bindings) so two engines on different
+/// paths cannot deadlock against each other inside one dual-run.
 struct EngagedPath {
     _precise: crate::query_manager::precise_dirty::PreciseDirtyMode,
     _routing: crate::query_manager::graph_nodes::include_routing::IncludeRoutingMode,
+    _empty_probe: crate::query_manager::graph_nodes::include_routing::IncludeEmptyProbeMode,
+    /// Every binding the default path answers from the index is also compiled and
+    /// settled, and must yield nothing — on every seed, storage and op profile here.
+    _empty_binding_parity: crate::query_manager::graph_nodes::include_routing::EmptyBindingParity,
 }
 
 impl EnginePath {
@@ -200,8 +209,17 @@ impl EnginePath {
                 EnginePath::Legacy
             )),
             _routing: crate::query_manager::graph_nodes::include_routing::force_include_routing(
-                matches!(self, EnginePath::PreciseDirty),
+                matches!(
+                    self,
+                    EnginePath::PreciseDirty | EnginePath::PreciseNoEmptyProbe
+                ),
             ),
+            _empty_probe:
+                crate::query_manager::graph_nodes::include_routing::force_include_empty_probe(
+                    !matches!(self, EnginePath::PreciseNoEmptyProbe),
+                ),
+            _empty_binding_parity:
+                crate::query_manager::graph_nodes::include_routing::check_empty_bindings_against_instances(),
         }
     }
 }
@@ -1106,6 +1124,7 @@ struct Engine<H: Storage> {
     mirrors: Vec<Mirror>,
     name: &'static str,
     path: EnginePath,
+    settle_passes: usize,
 }
 
 impl<H: Storage> Engine<H> {
@@ -1129,6 +1148,7 @@ impl<H: Storage> Engine<H> {
             mirrors: Vec::new(),
             name,
             path,
+            settle_passes: 0,
         }
     }
 
@@ -1229,7 +1249,17 @@ impl<H: Storage> Engine<H> {
     /// grouping is the ONLY normalization applied (see module docs).
     fn process_and_take(&mut self, context: &str) -> HashMap<u64, QueryUpdate> {
         let _path = self.path.engage();
+        // Settle the way a runtime tick does: inside a read scope. Every other pass
+        // flushes first, so on SQLite the settle reads in the scope's own transaction
+        // one time and in the write transaction its writes left open the next — the
+        // two places the read memo answers from.
+        self.settle_passes += 1;
+        if self.settle_passes.is_multiple_of(2) {
+            self.storage.flush().expect("the oracle storage flushes");
+        }
+        self.storage.begin_read_scope();
         self.qm.process(&mut self.storage);
+        self.storage.end_read_scope();
         let mut grouped: HashMap<u64, QueryUpdate> = HashMap::new();
         for update in self.qm.take_updates() {
             let key = update.subscription_id.0;
@@ -1657,6 +1687,75 @@ fn subscription_output_differential_routed_vs_unrouted_on_full_ops() {
             (EnginePath::PreciseUnrouted, EnginePath::PreciseDirty),
         );
     }
+}
+
+/// The v24 guard: answering an empty include binding from the index must change
+/// COST, not output.
+///
+/// One engine compiles an instance for every binding (the v23 path,
+/// `JAZZ_INCLUDE_EMPTY_PROBE=0`), the other holds an `EmptyBinding` wherever the
+/// correlation index proves the instance would scan nothing. On the FULL op
+/// matrix the two output streams must be byte-identical, and the model layer
+/// checks both against the reference tree.
+///
+/// What this guards is a binding that stays "empty" after a row arrived for it:
+/// like under-routing it raises no error and no log, only an include array that
+/// never fills. The instance side cannot make that mistake by construction.
+///
+/// The run also has to be about empty bindings at all: an include the probe
+/// judges ineligible would make both sides run instances and pass vacuously.
+#[test]
+fn subscription_output_differential_empty_bindings_vs_instances_on_full_ops() {
+    use crate::query_manager::graph_nodes::include_routing::empty_bindings_bound_on_this_thread;
+
+    let bound_before = empty_bindings_bound_on_this_thread();
+    for seed in SEEDS {
+        run_oracle(
+            seed,
+            &memory_storage_factory,
+            Fault::None,
+            OpProfile::FullIncludingFilterFlips,
+            (EnginePath::PreciseNoEmptyProbe, EnginePath::PreciseDirty),
+        );
+    }
+    let bound = empty_bindings_bound_on_this_thread() - bound_before;
+    assert!(
+        bound > 100,
+        "the oracle bound only {bound} empty bindings: its includes are not what the probe answers"
+    );
+}
+
+/// The same guard on the backend the application runs: the probe reads the
+/// correlation index through `Storage::index_lookup`, and SQLite answers it
+/// from its own key scans and read memo rather than from `MemoryStorage`'s maps.
+#[test]
+fn subscription_output_differential_empty_bindings_vs_instances_on_sqlite() {
+    use crate::query_manager::graph_nodes::include_routing::empty_bindings_bound_on_this_thread;
+    use crate::storage::SqliteStorage;
+    use crate::test_support::persist_test_schema;
+
+    let factory = |schema: &Schema| {
+        let mut storage = SqliteStorage::open(":memory:").expect("in-memory sqlite storage");
+        persist_test_schema(&mut storage, schema);
+        storage
+    };
+    let bound_before = empty_bindings_bound_on_this_thread();
+    for seed in &SEEDS[..3] {
+        run_oracle(
+            *seed,
+            &factory,
+            Fault::None,
+            OpProfile::FullIncludingFilterFlips,
+            (EnginePath::PreciseNoEmptyProbe, EnginePath::PreciseDirty),
+        );
+    }
+    // Both engines are the same engine wherever the probe does not fire — a probe that
+    // SQLite never answers would pass this differential and prove nothing.
+    let bound = empty_bindings_bound_on_this_thread() - bound_before;
+    assert!(
+        bound > 50,
+        "the oracle bound only {bound} empty bindings on sqlite: the probe is not answering there"
+    );
 }
 
 /// Minimal pin of the fixed FINDING (module docs): a child row's `is_deleted`

@@ -20,6 +20,15 @@
 //! routed (the default) and broadcast (`JAZZ_INCLUDE_ROUTING=0`), so a failure
 //! says immediately whether the bug is in routing or older than it.
 //!
+//! Since v24 a binding whose instance would scan nothing is answered from the
+//! correlation index and holds no instance at all (`EmptyBinding`). Three of
+//! the four seeded parents are childless, so most slots in this fixture are
+//! exactly that — and "a row arrived for an empty binding and nobody probed it
+//! again" is the same silent failure as a mark routed nowhere. Every case
+//! therefore also runs with empty bindings ON and OFF
+//! (`JAZZ_INCLUDE_EMPTY_PROBE=0`), and the classes that only exist for an empty
+//! binding have their own section at the end.
+//!
 //! This complements, and does not duplicate, `subscription_output_oracle`:
 //! that proves routed and unrouted output streams are byte-identical over
 //! randomized op sequences; this pins each named mutation class to a
@@ -29,7 +38,9 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::query_manager::graph_nodes::include_routing::force_include_routing;
+use crate::query_manager::graph_nodes::include_routing::{
+    empty_bindings_bound_on_this_thread, force_include_empty_probe, force_include_routing,
+};
 use crate::query_manager::manager::QueryUpdate;
 use crate::query_manager::precise_dirty::force_precise_dirty;
 
@@ -328,33 +339,64 @@ fn included_row(value: &Value) -> (ObjectId, &Vec<Value>) {
     }
 }
 
-/// Run one case under one routing mode.
+/// Whether a binding with nothing to scan holds an instance or an
+/// `EmptyBinding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Empty {
+    /// Answered from the correlation index — the default runtime path.
+    Bindings,
+    /// A compiled instance per binding — the v23 path, kept reachable by
+    /// `JAZZ_INCLUDE_EMPTY_PROBE=0`.
+    Instances,
+}
+
+/// Run one case under one routing mode and one way of holding empty bindings.
 ///
-/// The mutation runs inside the mode guard, so both the write-time buffering
+/// The mutation runs inside the mode guards, so both the write-time buffering
 /// and the settle-time routing decision belong to the mode under test.
 fn run_case(
     depth: Depth,
     mode: Mode,
+    empty: Empty,
     case: impl Fn(&mut Harness, &[ObjectId], &[ObjectId]) -> Tree,
 ) {
     let _precise = force_precise_dirty(true);
     let _routing = force_include_routing(matches!(mode, Mode::Routed));
+    let _empty = force_include_empty_probe(matches!(empty, Empty::Bindings));
 
+    let bound_before = empty_bindings_bound_on_this_thread();
     let (mut harness, children, grandchildren) = Harness::seed(depth);
+    let bound_at_seed = empty_bindings_bound_on_this_thread() - bound_before;
+    match empty {
+        // The include learns its probe from the first instance it compiles, which
+        // may itself be a childless parent's: at least all but one of them.
+        Empty::Bindings => assert!(
+            bound_at_seed >= (PARENT_COUNT - 2) as u64,
+            "{depth:?}/{mode:?}: the fixture's childless parents hold instances \
+             ({bound_at_seed} empty bindings), so this run says nothing about empty bindings"
+        ),
+        Empty::Instances => assert_eq!(
+            bound_at_seed, 0,
+            "{depth:?}/{mode:?}: the kill switch still made empty bindings"
+        ),
+    }
     let expected = case(&mut harness, &children, &grandchildren);
     assert_eq!(
         harness.tree(),
         expected,
-        "{depth:?}/{mode:?}: the mutation did not reach the subscriber within one settle — \
-         a mark that routes nowhere is silent, so this assertion is the only signal"
+        "{depth:?}/{mode:?}/{empty:?}: the mutation did not reach the subscriber within one \
+         settle — a mark that routes nowhere is silent, so this assertion is the only signal"
     );
 }
 
-/// Run one case at both depths and in both routing modes.
+/// Run one case at both depths, in both routing modes, with and without empty
+/// bindings.
 fn matrix(case: impl Fn(&mut Harness, &[ObjectId], &[ObjectId]) -> Tree + Copy) {
     for depth in [Depth::Leaf, Depth::Nested] {
         for mode in [Mode::Routed, Mode::Broadcast] {
-            run_case(depth, mode, case);
+            for empty in [Empty::Bindings, Empty::Instances] {
+                run_case(depth, mode, empty, case);
+            }
         }
     }
 }
@@ -362,7 +404,9 @@ fn matrix(case: impl Fn(&mut Harness, &[ObjectId], &[ObjectId]) -> Tree + Copy) 
 /// Depth-2 classes only exist in the nested shape.
 fn nested_matrix(case: impl Fn(&mut Harness, &[ObjectId], &[ObjectId]) -> Tree + Copy) {
     for mode in [Mode::Routed, Mode::Broadcast] {
-        run_case(Depth::Nested, mode, case);
+        for empty in [Empty::Bindings, Empty::Instances] {
+            run_case(Depth::Nested, mode, empty, case);
+        }
     }
 }
 
@@ -769,6 +813,185 @@ fn a_grandchild_can_move_to_a_child_of_another_parent() {
 // ============================================================================
 // Helpers that read a value out of the mirror rather than out of the engine.
 // ============================================================================
+
+// ============================================================================
+// Classes that only exist for an empty binding.
+// ============================================================================
+
+fn insert_child(harness: &mut Harness, title: &str, hidden: bool, parent: ObjectId) -> ObjectId {
+    harness
+        .qm
+        .insert(
+            &mut harness.storage,
+            CHILD_TABLE,
+            &[
+                Value::Text(title.into()),
+                Value::Boolean(hidden),
+                Value::Uuid(parent),
+            ],
+        )
+        .expect("insert child")
+        .row_id
+}
+
+/// The FIRST row of a binding, hidden by the include's filter: the correlation
+/// index is no longer empty, so the slot needs an instance — whose filter then
+/// keeps the array empty. Flipping the row is a content update of a row that
+/// instance holds, and has to show it.
+#[test]
+fn a_filtered_out_first_child_enters_once_it_is_flipped() {
+    matrix(|harness, children, grandchildren| {
+        let target = harness.parents[2];
+        let hidden = insert_child(harness, "child-7", true, target);
+        harness.settle_once();
+        assert_eq!(
+            harness.tree(),
+            expect(
+                harness,
+                &[(0, seeded_children(harness.depth, children, grandchildren))]
+            ),
+            "a filtered-out child must not show in its parent's include"
+        );
+
+        harness
+            .qm
+            .update(
+                &mut harness.storage,
+                hidden,
+                &[
+                    Value::Text("child-7".into()),
+                    Value::Boolean(false),
+                    Value::Uuid(target),
+                ],
+            )
+            .expect("flip child");
+        harness.settle_once();
+        expect(
+            harness,
+            &[
+                (0, seeded_children(harness.depth, children, grandchildren)),
+                (2, vec![(hidden, Vec::new())]),
+            ],
+        )
+    });
+}
+
+/// A child hops across childless parents: each hop fills a binding that was
+/// proven empty and leaves behind an instance with nothing in it.
+#[test]
+fn a_child_hops_across_childless_parents() {
+    matrix(|harness, children, grandchildren| {
+        let child = insert_child(harness, "child-7", false, harness.parents[1]);
+        harness.settle_once();
+        for slot in [2usize, 3, 1] {
+            harness
+                .qm
+                .update(
+                    &mut harness.storage,
+                    child,
+                    &[
+                        Value::Text("child-7".into()),
+                        Value::Boolean(false),
+                        Value::Uuid(harness.parents[slot]),
+                    ],
+                )
+                .expect("re-parent child");
+            harness.settle_once();
+            assert_eq!(
+                harness.tree(),
+                expect(
+                    harness,
+                    &[
+                        (0, seeded_children(harness.depth, children, grandchildren)),
+                        (slot, vec![(child, Vec::new())]),
+                    ]
+                ),
+                "the child must be under parent slot {slot} and nowhere else"
+            );
+        }
+        expect(
+            harness,
+            &[
+                (0, seeded_children(harness.depth, children, grandchildren)),
+                (1, vec![(child, Vec::new())]),
+            ],
+        )
+    });
+}
+
+/// A parent loses every child and gets a new one: the slot goes from a filled
+/// instance to an empty one and back, with deletes in between.
+#[test]
+fn an_emptied_parent_can_be_filled_again() {
+    matrix(|harness, children, _grandchildren| {
+        for child in children {
+            harness
+                .qm
+                .delete(&mut harness.storage, *child)
+                .expect("delete child");
+        }
+        harness.settle_once();
+        assert_eq!(
+            harness.tree(),
+            expect(harness, &[]),
+            "every include must be empty once the only children are deleted"
+        );
+
+        let reborn = insert_child(harness, "child-8", false, harness.parents[0]);
+        let other = insert_child(harness, "child-9", false, harness.parents[3]);
+        harness.settle_once();
+        expect(
+            harness,
+            &[
+                (0, vec![(reborn, Vec::new())]),
+                (3, vec![(other, Vec::new())]),
+            ],
+        )
+    });
+}
+
+/// Depth 2: a child that arrives with no grandchildren is an empty binding of
+/// the NESTED include, inside its parent's instance. Its first grandchild has
+/// to fill it — the mark travels through the outer instance to a slot that
+/// holds no graph.
+#[test]
+fn a_first_grandchild_reaches_a_childless_child() {
+    nested_matrix(|harness, children, grandchildren| {
+        let lone_child = insert_child(harness, "child-5", false, harness.parents[0]);
+        let far_child = insert_child(harness, "child-6", false, harness.parents[2]);
+        harness.settle_once();
+
+        let mut new_grandchildren = Vec::new();
+        for child in [lone_child, far_child] {
+            new_grandchildren.push(
+                harness
+                    .qm
+                    .insert(
+                        &mut harness.storage,
+                        GRANDCHILD_TABLE,
+                        &[Value::Text("grandchild-9".into()), Value::Uuid(child)],
+                    )
+                    .expect("insert grandchild")
+                    .row_id,
+            );
+        }
+        harness.settle_once();
+        expect(
+            harness,
+            &[
+                (
+                    0,
+                    vec![
+                        (children[0], vec![grandchildren[0]]),
+                        (children[1], vec![grandchildren[1]]),
+                        (lone_child, vec![new_grandchildren[0]]),
+                    ],
+                ),
+                (2, vec![(far_child, vec![new_grandchildren[1]])]),
+            ],
+        )
+    });
+}
 
 fn child_title(harness: &Harness, child_id: ObjectId) -> String {
     let descriptor = harness.descriptor.as_ref().expect("mirror descriptor");

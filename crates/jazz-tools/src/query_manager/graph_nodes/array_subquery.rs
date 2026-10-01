@@ -8,13 +8,14 @@
 use ahash::{AHashMap, AHashSet};
 
 use crate::object::ObjectId;
-use crate::query_manager::encoding::{decode_row, encode_row};
+use crate::query_manager::encoding::decode_row;
 use crate::query_manager::precise_dirty::precise_dirty_enabled;
 use crate::query_manager::query::ArraySubqueryRequirement;
 use std::sync::Arc;
 
 use super::include_routing::{
-    CacheKey, Channel, DirtRouting, IncludeDirt, PendingInnerDirt, Route,
+    CacheKey, Channel, DirtRouting, EmptyBinding, EmptyProbe, IncludeDirt, PendingInnerDirt, Route,
+    empty_probe_enabled,
 };
 
 use crate::query_manager::types::{
@@ -58,6 +59,11 @@ use super::subgraph::{SubgraphInstance, SubgraphTemplate};
 /// old recompile-per-row behaviour for the overflow rather than growing without bound.
 const MAX_CACHED_SUBGRAPHS: usize = 2048;
 
+/// Ceiling on bindings held as [`EmptyBinding`]s by one node, for the same reason
+/// instances have one: an include over many outer rows must not pin a slot per row for
+/// the life of the subscription, and forgetting an outer row walks the slots.
+pub(crate) const MAX_EMPTY_BINDINGS: usize = MAX_CACHED_SUBGRAPHS;
+
 /// Ceiling on ids held in [`PendingInnerDirt`] before it is flushed eagerly.
 ///
 /// Sized like `MAX_PENDING_CHANGED_ROWS` in `index_scan.rs`, and for the same
@@ -87,8 +93,10 @@ pub enum Correlate {
 
 #[derive(Debug)]
 pub struct ArraySubqueryNode {
-    /// Descriptor for outer tuples.
-    outer_descriptor: TupleDescriptor,
+    /// The outer tuple as one row descriptor, built once: a tuple of several elements
+    /// builds a new descriptor on every `combined_descriptor()` call, and a new
+    /// descriptor compiles its layout again — once per outer row, if asked per row.
+    outer_row_descriptor: RowDescriptor,
     /// Output descriptor (outer columns + array column).
     output_descriptor: RowDescriptor,
     /// Output tuple descriptor.
@@ -187,10 +195,10 @@ impl ArraySubqueryNode {
         // Array column type: Array<Row> with the subgraph's output columns.
         // The row id is carried in Value::Row { id: Some(...), .. } rather than
         // prepended as a column.
-        let row_columns = subgraph_template.output_descriptor().columns.clone();
         let element_type = ColumnType::Array {
             element: Box::new(ColumnType::Row {
-                columns: Box::new(RowDescriptor::new(row_columns)),
+                // A clone, not a rebuild: it shares the template's memoized layout.
+                columns: Box::new(subgraph_template.output_descriptor().clone()),
             }),
         };
 
@@ -225,7 +233,7 @@ impl ArraySubqueryNode {
         );
 
         Self {
-            outer_descriptor,
+            outer_row_descriptor,
             output_descriptor,
             output_tuple_descriptor,
             subgraph_template,
@@ -242,6 +250,8 @@ impl ArraySubqueryNode {
                 pending: PendingInnerDirt::default(),
                 routing,
                 scratch: Vec::new(),
+                probe: EmptyProbe::Unknown,
+                empty: AHashMap::new(),
             }),
         }
     }
@@ -255,6 +265,7 @@ impl ArraySubqueryNode {
         let victims: Vec<CacheKey> = self
             .subgraph_cache
             .keys()
+            .chain(self.dirt.empty.keys())
             .filter(|(id, _)| *id == outer_id)
             .copied()
             .collect();
@@ -294,11 +305,186 @@ impl ArraySubqueryNode {
                 .routing
                 .unbind(*key, &cached.correlation_value, &cached.held_rows);
         }
+        // The slot's other possible occupant: a binding proven empty holds no
+        // rows, only its place in the correlation index.
+        if let Some(binding) = self.dirt.empty.remove(key) {
+            self.dirt
+                .routing
+                .unbind(*key, &binding.correlation_value, &[]);
+        }
+    }
+
+    /// Answer a binding from the index alone when its instance would scan
+    /// nothing (see [`EmptyProbe`]). True means the slot now holds an
+    /// [`EmptyBinding`] and the include's answer is the empty array.
+    fn bind_if_provably_empty(
+        &mut self,
+        cache_key: CacheKey,
+        correlation_value: &Value,
+        io: &dyn Storage,
+    ) -> bool {
+        if !empty_probe_enabled() {
+            return false;
+        }
+        let EmptyProbe::Lookups(lookups) = &self.dirt.probe else {
+            return false;
+        };
+        // The lookups were read off an instance bound to a UUID; another value
+        // type may normalize to a different scan.
+        if !matches!(correlation_value, Value::Uuid(_)) {
+            return false;
+        }
+        let scans_nothing = lookups.iter().all(|(table, column, branch)| {
+            io.index_lookup_is_empty(table.as_str(), column.as_str(), branch, correlation_value)
+        });
+        if !scans_nothing {
+            return false;
+        }
+        crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::EMPTY_BINDINGS);
+        #[cfg(test)]
+        super::include_routing::note_empty_binding_bound();
+        // Retire whatever occupied the slot, as a fresh instance would.
+        self.drop_cached_subgraph(&cache_key);
+        // Past the ceiling the answer stands but is not kept. A slot with no
+        // occupant is never clean, so the binding is probed again whenever the
+        // include re-evaluates — a lookup, where an instance evicted at the
+        // same ceiling costs a compile.
+        if self.dirt.empty.len() < MAX_EMPTY_BINDINGS {
+            self.dirt.empty.insert(
+                cache_key,
+                EmptyBinding {
+                    correlation_value: correlation_value.clone(),
+                    dirty: false,
+                },
+            );
+            self.dirt.routing.bind(cache_key, correlation_value);
+        }
+        true
+    }
+
+    /// The one way an instance of this include is settled: against storage and the row
+    /// loader, and nothing else. The empty-binding probe answers for exactly this read,
+    /// and its parity harness settles through here as well — an instance given another
+    /// source here is given it there, and the harness then says what the probe misses.
+    fn settle_instance(
+        instance: &mut SubgraphInstance,
+        io: &dyn Storage,
+        row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    ) {
+        let _row_delta = instance
+            .graph
+            .settle(io, &mut |id, hint| row_loader(id, hint));
+    }
+
+    /// Parity harness for empty bindings (see
+    /// `include_routing::empty_probe_parity_enabled`): compile the instance the probe
+    /// spared, settle it against the same storage, and require it to yield nothing.
+    #[cfg(any(test, feature = "test", debug_assertions))]
+    fn assert_binding_is_empty(
+        &self,
+        correlation_value: &Value,
+        io: &dyn Storage,
+        row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    ) {
+        let Some(mut instance) = self
+            .subgraph_template
+            .instantiate(correlation_value.clone(), &self.schema)
+        else {
+            return;
+        };
+        Self::settle_instance(&mut instance, io, row_loader);
+        let yielded = instance.graph.current_output_tuples().len();
+        assert_eq!(
+            yielded,
+            0,
+            "the correlation index calls the include binding {correlation_value:?} on `{}` \
+             empty, and its instance yields {yielded} row(s)",
+            self.subgraph_template.table(),
+        );
+    }
+
+    /// Read the index lookups an instance makes off a freshly compiled one.
+    ///
+    /// Eligible only when every source of the instance is a plain
+    /// `column = <binding>` index lookup: then "all lookups empty" is exactly
+    /// "the instance scans nothing". Anything else — a join, a window or a
+    /// search, the soft-deleted index, a scan the planner narrowed with a
+    /// second condition — keeps instances for every binding.
+    fn learn_empty_probe(
+        &mut self,
+        graph: &crate::query_manager::graph::QueryGraph,
+        bound: &Value,
+    ) {
+        use crate::query_manager::graph::GraphNode;
+
+        if !matches!(self.dirt.probe, EmptyProbe::Unknown) {
+            return;
+        }
+        let mut lookups = Vec::new();
+        let mut eligible =
+            matches!(bound, Value::Uuid(_)) && self.subgraph_template.reads_only_its_correlation();
+        for compact in &graph.nodes {
+            if !eligible {
+                break;
+            }
+            match &compact.node {
+                // The scan has to be BY the correlation, not merely carry the
+                // bound value: with no index on the correlation column the
+                // planner scans by one of the include's own filters, and a
+                // filter literal can equal the first binding.
+                GraphNode::IndexScan(scan) => match scan.plain_eq_value() {
+                    Some(value)
+                        if value == bound
+                            && self.dirt.routing.scans_the_correlate(
+                                &self.schema,
+                                &scan.table,
+                                scan.column.as_str(),
+                            ) =>
+                    {
+                        lookups.push((scan.table, scan.column, scan.branch.clone()));
+                    }
+                    _ => eligible = false,
+                },
+                GraphNode::Union(_)
+                | GraphNode::Materialize(_)
+                | GraphNode::MagicColumns(_)
+                | GraphNode::Project(_)
+                | GraphNode::Filter(_)
+                | GraphNode::PolicyFilter(_)
+                | GraphNode::Sort(_)
+                | GraphNode::LimitOffset(_)
+                | GraphNode::ArraySubquery(_)
+                | GraphNode::Output(_) => {}
+                GraphNode::Alias(_)
+                | GraphNode::Join(_)
+                | GraphNode::SelectElement(_)
+                | GraphNode::RecursiveRelation(_)
+                | GraphNode::ExistsOutput(_) => eligible = false,
+            }
+        }
+        self.dirt.probe = if eligible && !lookups.is_empty() {
+            EmptyProbe::Lookups(lookups)
+        } else {
+            EmptyProbe::Ineligible
+        };
+    }
+
+    /// Mark every empty binding for a re-probe when `tables` carries a mark
+    /// that can fill one.
+    fn dirty_empty_bindings_for<'a>(&mut self, mut tables: impl Iterator<Item = &'a TableName>) {
+        if self.dirt.empty.is_empty() {
+            return;
+        }
+        if tables.any(|table| self.dirt.routing.can_fill_empty_binding(table)) {
+            for binding in self.dirt.empty.values_mut() {
+                binding.dirty = true;
+            }
+        }
     }
 
     /// Called after any payload change, to keep the buffer bounded.
     fn note_pending_changed(&mut self) {
-        if self.subgraph_cache.is_empty() {
+        if self.subgraph_cache.is_empty() && self.dirt.empty.is_empty() {
             // Nothing to route it to. An instance compiled later starts
             // all-dirty, so it cannot miss the change, and an idle include
             // costs nothing to keep marked.
@@ -323,7 +509,8 @@ impl ArraySubqueryNode {
         for cached in self.subgraph_cache.values_mut() {
             self.dirt.pending.apply_to(&mut cached.instance.graph);
         }
-        self.dirt.pending.clear();
+        let pending = std::mem::take(&mut self.dirt.pending);
+        self.dirty_empty_bindings_for(pending.tables());
     }
 
     /// Table-level sibling of [`Self::note_inner_rows_changed`] for dirt with
@@ -470,7 +657,7 @@ impl ArraySubqueryNode {
         // The kill switch lands here too, so `JAZZ_INCLUDE_ROUTING=0` takes
         // the v13-3 path exactly, without paying for resolutions it discards.
         if !self.dirt.pending.full_tables.is_empty()
-            || self.subgraph_cache.len() <= MIN_ROUTABLE_INSTANCES
+            || self.subgraph_cache.len() + self.dirt.empty.len() <= MIN_ROUTABLE_INSTANCES
             || !super::include_routing::routing_enabled()
         {
             self.broadcast_pending_inner_dirt();
@@ -494,12 +681,17 @@ impl ArraySubqueryNode {
         for (key, marks) in routed {
             if let Some(cached) = self.subgraph_cache.get_mut(&key) {
                 marks.apply_to(&mut cached.instance.graph);
+            } else if let Some(binding) = self.dirt.empty.get_mut(&key) {
+                // Routed by correlation: a row carrying this binding's value
+                // changed. Probe again at the next evaluation.
+                binding.dirty = true;
             }
         }
         if !broadcast.is_empty() {
             for cached in self.subgraph_cache.values_mut() {
                 broadcast.apply_to(&mut cached.instance.graph);
             }
+            self.dirty_empty_bindings_for(broadcast.tables());
         }
     }
 
@@ -800,9 +992,7 @@ impl ArraySubqueryNode {
             Correlate::Col(col_idx) => {
                 let element = tuple.get(0)?;
                 let content = element.content()?;
-                let outer_row_desc = self.outer_descriptor.combined_descriptor();
-                let values = decode_row(&outer_row_desc, content).ok()?;
-                values.get(col_idx).cloned()
+                crate::row_format::decode_column(&self.outer_row_descriptor, content, col_idx).ok()
             }
         }
     }
@@ -895,11 +1085,23 @@ impl ArraySubqueryNode {
             Some(cached) if &cached.correlation_value == correlation_value
         );
         if !reusable {
+            if self.bind_if_provably_empty(cache_key, correlation_value, io) {
+                #[cfg(any(test, feature = "test", debug_assertions))]
+                if super::include_routing::empty_probe_parity_enabled() {
+                    self.assert_binding_is_empty(correlation_value, io, row_loader);
+                }
+                return (
+                    Value::Array(vec![]),
+                    TupleProvenance::default(),
+                    TupleBatchProvenance::default(),
+                );
+            }
             match self
                 .subgraph_template
                 .instantiate(correlation_value.clone(), &self.schema)
             {
                 Some(fresh) => {
+                    self.learn_empty_probe(&fresh.graph, correlation_value);
                     // Retire whatever occupied the slot first, so its binding
                     // and held rows leave the routing indices with it.
                     self.drop_cached_subgraph(&cache_key);
@@ -968,9 +1170,7 @@ impl ArraySubqueryNode {
             // pre-condition, include-plan-sharing design §9).
             instance.graph.mark_all_dirty();
         }
-        let _row_delta = instance
-            .graph
-            .settle(io, &mut |id, hint| row_loader(id, hint));
+        Self::settle_instance(instance, io, row_loader);
         let mut provenance = TupleProvenance::default();
         let mut batch_provenance = TupleBatchProvenance::default();
         let array_elements: Vec<Value> = instance
@@ -1048,15 +1248,46 @@ impl ArraySubqueryNode {
         let batch_id = element.batch_id()?;
         let row_provenance = element.row_provenance()?.clone();
 
-        // Decode outer values
-        let outer_row_desc = self.outer_descriptor.combined_descriptor();
-        let mut values = decode_row(&outer_row_desc, outer_content).ok()?;
-
-        // Append array column
-        values.push(array_result.clone());
-
-        // Encode output
-        let output_content = encode_row(&self.output_descriptor, &values).ok()?;
+        // The output row is the outer row plus the array column at the end, so
+        // the outer bytes are carried over as they are.
+        let array_column = self.output_descriptor.columns.last()?;
+        let output_content = crate::row_format::encode_row_with_appended_variable_column(
+            &crate::row_format::compiled_row_layout(&self.outer_row_descriptor),
+            outer_content,
+            array_column,
+            array_result,
+        )
+        .ok()?;
+        // Parity harness: every output row is re-derived the long way. Byte parity is
+        // what holds for an outer row in the encoder's own spelling; a decodable row in
+        // any other spelling must still decode to the same values.
+        #[cfg(debug_assertions)]
+        {
+            // The checker's own codec work is not the engine's: keep it out of the counts.
+            let _uncounted = crate::query_manager::settle_cost::UncountedRowCodecs::hold();
+            if let Ok(mut values) = decode_row(&self.outer_row_descriptor, outer_content) {
+                let canonical = crate::row_format::encode_row(&self.outer_row_descriptor, &values)
+                    .ok()
+                    .as_deref()
+                    == Some(outer_content);
+                values.push(array_result.clone());
+                if canonical {
+                    debug_assert_eq!(
+                        crate::row_format::encode_row(&self.output_descriptor, &values)
+                            .ok()
+                            .as_deref(),
+                        Some(output_content.as_slice()),
+                        "appended array column diverged from a full re-encode"
+                    );
+                } else {
+                    debug_assert_eq!(
+                        decode_row(&self.output_descriptor, &output_content).ok(),
+                        Some(values),
+                        "appended array column changed what the row decodes to"
+                    );
+                }
+            }
+        }
 
         let mut provenance = outer_tuple.provenance().clone();
         for scoped_object in inner_provenance.iter().copied() {
@@ -1110,11 +1341,23 @@ impl ArraySubqueryNode {
             "instance cleanliness read before the buffered marks were routed"
         );
         let element_clean = |index: usize, element: &Value| {
-            matches!(
-                self.subgraph_cache.get(&(outer_id, index)),
-                Some(cached) if &cached.correlation_value == element
-                    && !cached.instance.graph.has_dirty_nodes()
-            )
+            // A NULL correlation matches nothing, whatever the inner tables
+            // hold: it has no slot and nothing to re-check.
+            if element.is_null() {
+                return true;
+            }
+            let key = (outer_id, index);
+            match self.subgraph_cache.get(&key) {
+                Some(cached) => {
+                    &cached.correlation_value == element && !cached.instance.graph.has_dirty_nodes()
+                }
+                // A slot proven empty is clean until a mark that can fill it
+                // arrives.
+                None => matches!(
+                    self.dirt.empty.get(&key),
+                    Some(binding) if &binding.correlation_value == element && !binding.dirty
+                ),
+            }
         };
         match correlation_value {
             Value::Array(elements) => elements
@@ -1337,6 +1580,7 @@ impl RowNode for ArraySubqueryNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_manager::encoding::encode_row;
     use crate::query_manager::graph_nodes::subgraph::SubgraphBuilder;
     use crate::query_manager::types::TableName;
 
@@ -1530,6 +1774,85 @@ mod tests {
             },
         );
         node.dirt.routing.bind(key, &correlation_value);
+    }
+
+    /// Empty bindings have a ceiling, as instances do: past it a binding proven empty
+    /// is still answered, and not kept.
+    #[test]
+    fn empty_bindings_are_not_kept_past_their_ceiling() {
+        use crate::query_manager::types::ColumnName;
+        use crate::storage::MemoryStorage;
+
+        let _probe =
+            crate::query_manager::graph_nodes::include_routing::force_include_empty_probe(true);
+        let mut node = cache_test_node();
+        node.dirt.probe = EmptyProbe::Lookups(vec![(
+            TableName::new("posts"),
+            ColumnName::new("author_id"),
+            "main".to_string(),
+        )]);
+        let storage = MemoryStorage::new();
+
+        for _ in 0..MAX_EMPTY_BINDINGS + 10 {
+            assert!(node.bind_if_provably_empty(
+                (ObjectId::new(), 0),
+                &Value::Uuid(ObjectId::new()),
+                &storage
+            ));
+        }
+        assert_eq!(node.dirt.empty.len(), MAX_EMPTY_BINDINGS);
+
+        // Forgetting an outer row frees its slot for another binding.
+        let (forgotten, _) = *node.dirt.empty.keys().next().unwrap();
+        node.forget_cached_subgraphs(forgotten);
+        assert_eq!(node.dirt.empty.len(), MAX_EMPTY_BINDINGS - 1);
+        let kept = (ObjectId::new(), 0);
+        assert!(node.bind_if_provably_empty(kept, &Value::Uuid(ObjectId::new()), &storage));
+        assert!(node.dirt.empty.contains_key(&kept));
+    }
+
+    /// A node can hold empty bindings and no instance at all — a page none of whose rows
+    /// has an attachment, once the row that carried the learning instance has left it.
+    /// A change buffered then still has bindings to reach: dropping it as "nothing to
+    /// route to" would leave them answering "empty" for good.
+    #[test]
+    fn a_change_is_kept_for_a_node_that_holds_only_empty_bindings() {
+        use crate::query_manager::types::ColumnName;
+        use crate::storage::MemoryStorage;
+
+        // Same order as every other gate that holds both: precise first.
+        let _precise = crate::query_manager::precise_dirty::force_precise_dirty(true);
+        let _probe =
+            crate::query_manager::graph_nodes::include_routing::force_include_empty_probe(true);
+        let changed: AHashSet<ObjectId> = [ObjectId::new()].into_iter().collect();
+
+        let mut idle = cache_test_node();
+        idle.note_inner_rows_changed("posts", &changed);
+        assert_eq!(
+            idle.dirt.pending.buffered_ids(),
+            0,
+            "a node with nothing bound keeps a change it has nowhere to route"
+        );
+
+        let mut node = cache_test_node();
+        node.dirt.probe = EmptyProbe::Lookups(vec![(
+            TableName::new("posts"),
+            ColumnName::new("author_id"),
+            "main".to_string(),
+        )]);
+        let storage = MemoryStorage::new();
+        assert!(node.bind_if_provably_empty(
+            (ObjectId::new(), 0),
+            &Value::Uuid(ObjectId::new()),
+            &storage
+        ));
+        assert!(node.subgraph_cache.is_empty());
+        node.note_inner_rows_changed("posts", &changed);
+        assert_eq!(
+            node.dirt.pending.buffered_ids(),
+            1,
+            "a change was dropped while empty bindings were waiting for it"
+        );
     }
 
     #[test]

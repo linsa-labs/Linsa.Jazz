@@ -426,6 +426,17 @@ impl IndexScanNode {
         values.get(column_index).cloned()
     }
 
+    /// The value of a plain `column = value` lookup, or `None` for any other
+    /// scan: a range, a full or empty scan, an ordered window, a search.
+    pub(crate) fn plain_eq_value(&self) -> Option<&Value> {
+        match &self.condition {
+            ScanCondition::Eq(value) if self.window.is_none() && self.trigram.is_none() => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     /// Row ids this scan currently considers members.
     ///
     /// This is PRE-filter membership: everything the correlate predicate

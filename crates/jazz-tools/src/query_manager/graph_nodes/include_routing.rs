@@ -286,6 +286,9 @@ pub(super) struct DirtRouting {
     links: AHashMap<TableName, TableLink>,
     /// False disables routing for this node entirely (see [`Self::new`]).
     routable: bool,
+    /// The include's own inner table: the only table whose rows can turn an
+    /// empty binding into a non-empty one (see [`EmptyBinding`]).
+    inner_table: TableName,
 }
 
 impl DirtRouting {
@@ -338,7 +341,18 @@ impl DirtRouting {
             by_correlation: AHashMap::new(),
             links,
             routable: offset == 0,
+            inner_table,
         }
+    }
+
+    /// Whether a mark for `table` can make an empty binding non-empty.
+    ///
+    /// Only a row of the include's own inner table can: an empty binding has no
+    /// inner rows, so nothing nested under them exists to change. A table this
+    /// node has no link for is answered "yes" — an unrecognised name must cost
+    /// a re-probe, never a missed row.
+    pub(super) fn can_fill_empty_binding(&self, table: &TableName) -> bool {
+        *table == self.inner_table || !self.links.contains_key(table)
     }
 
     /// Which cache entries a mark for `(table, id)` must reach.
@@ -367,22 +381,58 @@ impl DirtRouting {
             // Not a table this node reads. Nothing can hold its rows.
             return Route::Instances(keys);
         };
-        let extra = match (link, correlate) {
+        let mut add = |extra: Option<&CacheKeys>| {
+            for key in extra.into_iter().flatten() {
+                if !keys.contains(key) {
+                    keys.push(*key);
+                }
+            }
+        };
+        match (link, correlate) {
             (TableLink::Unroutable, _) => return Route::Broadcast,
             // The row is gone from this subscription's view: it can only leave
             // instances, never enter one.
-            (_, None) => return Route::Instances(keys),
-            (TableLink::Direct(_), Some(value)) => self.by_correlation.get(&CorrKey(value.clone())),
-            (TableLink::NestedByParentId(_), Some(Value::Uuid(parent))) => self.held_by.get(parent),
+            (_, None) => {}
+            // A UUID[] foreign key: the row names several bindings at once, and
+            // each element is a binding's correlation value in its own right.
+            // Looked up whole, the array matches no binding and the row reaches
+            // nobody.
+            (TableLink::Direct(_), Some(Value::Array(elements))) => {
+                for element in elements {
+                    add(self.by_correlation.get(&CorrKey(element.clone())));
+                }
+            }
+            (TableLink::Direct(_), Some(value)) => {
+                add(self.by_correlation.get(&CorrKey(value.clone())));
+            }
+            (TableLink::NestedByParentId(_), Some(Value::Uuid(parent))) => {
+                add(self.held_by.get(parent));
+            }
             // A nested correlate that is not a row id cannot name a parent row.
             (TableLink::NestedByParentId(_), Some(_)) => return Route::Broadcast,
-        };
-        for key in extra.into_iter().flatten() {
-            if !keys.contains(key) {
-                keys.push(*key);
-            }
         }
         Route::Instances(keys)
+    }
+
+    /// Whether a scan of `table` by `column` is a scan by this include's
+    /// correlation: the same table, and the same place on its rows that
+    /// routing reads the correlate from. A planner free to scan by another
+    /// column — the correlation column carries no index, a filter's does —
+    /// produces a scan that says nothing about which bindings are empty.
+    pub(super) fn scans_the_correlate(
+        &self,
+        schema: &Schema,
+        table: &TableName,
+        column: &str,
+    ) -> bool {
+        let Some(TableLink::Direct(source)) = self.links.get(&self.inner_table) else {
+            return false;
+        };
+        *table == self.inner_table
+            && schema
+                .get(table)
+                .and_then(|table_schema| correlate_source(&table_schema.columns, column))
+                == Some(*source)
     }
 
     /// Where the correlate value of a row of `table` sits, or `None` when this
@@ -629,6 +679,210 @@ impl PendingInnerDirt {
         self.updated.clear();
         self.deleted.clear();
     }
+
+    /// Every table the payload carries a mark for, on any channel.
+    pub(super) fn tables(&self) -> impl Iterator<Item = &TableName> + '_ {
+        self.full_tables
+            .iter()
+            .chain(self.rows.keys())
+            .chain(self.updated.keys())
+            .chain(self.deleted.keys())
+    }
+}
+
+// ============================================================================
+// Empty bindings
+// ============================================================================
+
+/// How an include answers "this parent has no rows" without an instance.
+///
+/// WHY: an instance is a compiled query graph, and an include compiles one per
+/// outer row. Most of them hold nothing — a message has no attachments, no
+/// calls, no task refs — yet each paid a plan compile, a settle, a re-settle on
+/// every broadcast mark, and a graph drop. On a 50-row page of the app's thread
+/// query that was ~340 of ~375 instances.
+///
+/// A plain include instance reads exactly `inner_column = <binding>` from the
+/// column's index on each branch, and filters from there. If those lookups
+/// return nothing, no later node can produce a row, so the answer is the empty
+/// array and no graph is needed. The lookups are taken from a compiled
+/// instance rather than re-derived, so they are the reads the instance itself
+/// would make. Each has to be a scan BY the correlation
+/// ([`DirtRouting::scans_the_correlate`]): a planner that scans by another
+/// column, or a branch whose schema names the correlation column differently,
+/// leaves the include ineligible.
+#[derive(Debug, Default)]
+pub(super) enum EmptyProbe {
+    /// No instance compiled yet: the inner plan's reads are not known.
+    #[default]
+    Unknown,
+    /// The inner plan reads something other than plain `inner_column = value`
+    /// index lookups (a join, a window, soft-deleted rows, a second condition
+    /// on the correlation column). Every binding gets an instance.
+    Ineligible,
+    /// The lookups one instance makes: `(table, index column, branch)`.
+    Lookups(Vec<(TableName, crate::query_manager::types::ColumnName, String)>),
+}
+
+/// A cache slot proven empty by [`EmptyProbe`] instead of holding an instance.
+///
+/// It keeps the instance's place in `DirtRouting::by_correlation`, so a row
+/// written with this correlation value routes here exactly as it would to an
+/// empty instance, and `dirty` is that instance's "has dirty nodes": the slot
+/// is probed again at the next evaluation.
+#[derive(Debug)]
+pub(super) struct EmptyBinding {
+    pub(super) correlation_value: Value,
+    pub(super) dirty: bool,
+}
+
+/// Kill switch for empty bindings.
+///
+/// Default ON. `JAZZ_INCLUDE_EMPTY_PROBE=0` (or `false`) compiles an instance
+/// for every binding, as before — the mode the output oracle compares against.
+pub fn empty_probe_enabled() -> bool {
+    #[cfg(any(test, feature = "test"))]
+    if let Some(forced) = empty_probe_override::forced() {
+        return forced;
+    }
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("JAZZ_INCLUDE_EMPTY_PROBE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+#[cfg(any(test, feature = "test"))]
+mod empty_probe_override {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+    const UNSET: u8 = 0;
+    const FORCED_ON: u8 = 1;
+    const FORCED_OFF: u8 = 2;
+
+    static STATE: AtomicU8 = AtomicU8::new(UNSET);
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Holds empty bindings in a forced mode for the guard's lifetime.
+    pub struct IncludeEmptyProbeMode {
+        _serialised: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for IncludeEmptyProbeMode {
+        fn drop(&mut self) {
+            STATE.store(UNSET, Ordering::SeqCst);
+        }
+    }
+
+    /// Force empty bindings on or off for the returned guard's lifetime.
+    pub fn force_include_empty_probe(enabled: bool) -> IncludeEmptyProbeMode {
+        let guard = lock().lock().unwrap_or_else(PoisonError::into_inner);
+        STATE.store(
+            if enabled { FORCED_ON } else { FORCED_OFF },
+            Ordering::SeqCst,
+        );
+        IncludeEmptyProbeMode { _serialised: guard }
+    }
+
+    pub(super) fn forced() -> Option<bool> {
+        match STATE.load(Ordering::SeqCst) {
+            FORCED_ON => Some(true),
+            FORCED_OFF => Some(false),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+pub use empty_probe_override::{IncludeEmptyProbeMode, force_include_empty_probe};
+
+/// Whether every empty binding is checked against the instance it stands in for.
+///
+/// "The correlation index holds nothing for this value, so the instance would yield
+/// nothing" rests on what an instance reads: plain index lookups by the correlation,
+/// with nothing laid over them. Nothing in the types says so, and a later change that
+/// gives instances another source would break includes without a failing test — an
+/// array that stays empty raises no error. With the check on, each binding answered
+/// from the index is also compiled and settled, and must come back empty.
+///
+/// Off by default, in every build: it compiles the very instance the probe exists to
+/// spare, so every count the probe moves reads as if the probe were off. Tests that
+/// compare outputs turn it on for their thread
+/// ([`check_empty_bindings_against_instances`]); `JAZZ_INCLUDE_EMPTY_PROBE_PARITY=1`
+/// turns it on for a whole debug run.
+#[cfg(any(test, feature = "test", debug_assertions))]
+pub(super) fn empty_probe_parity_enabled() -> bool {
+    #[cfg(any(test, feature = "test"))]
+    if empty_probe_parity::on_this_thread() {
+        return true;
+    }
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("JAZZ_INCLUDE_EMPTY_PROBE_PARITY").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+#[cfg(any(test, feature = "test"))]
+mod empty_probe_parity {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Keeps the empty-binding check on for this thread until dropped. Not `Send`: the
+    /// depth it holds is this thread's.
+    pub struct EmptyBindingParity(std::marker::PhantomData<*const ()>);
+
+    impl Drop for EmptyBindingParity {
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+
+    /// Check every empty binding made on this thread against a compiled instance, for
+    /// the returned guard's lifetime.
+    pub fn check_empty_bindings_against_instances() -> EmptyBindingParity {
+        DEPTH.with(|depth| depth.set(depth.get() + 1));
+        EmptyBindingParity(std::marker::PhantomData)
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        DEPTH.with(|depth| depth.get() > 0)
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+pub use empty_probe_parity::{EmptyBindingParity, check_empty_bindings_against_instances};
+
+#[cfg(test)]
+thread_local! {
+    static EMPTY_BINDINGS_BOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Empty bindings made on this thread so far. A gate reads the difference to
+/// prove a run exercised them; unlike the `settle_cost` counter it is not
+/// blended with whatever other tests are running in the process.
+#[cfg(test)]
+pub(crate) fn empty_bindings_bound_on_this_thread() -> u64 {
+    EMPTY_BINDINGS_BOUND.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn note_empty_binding_bound() {
+    EMPTY_BINDINGS_BOUND.with(|bound| bound.set(bound.get() + 1));
 }
 
 /// The whole per-node include-dirt state, boxed as one unit by
@@ -650,6 +904,11 @@ pub(super) struct IncludeDirt {
     /// the "the index must not become the next O(N)" trap. The retired set is
     /// rotated back in here, so after warm-up the rebuild allocates nothing.
     pub(super) scratch: Vec<ObjectId>,
+    /// How this include proves a binding empty (see [`EmptyProbe`]).
+    pub(super) probe: EmptyProbe,
+    /// Cache slots proven empty. A key is here or in the node's
+    /// `subgraph_cache`, never both.
+    pub(super) empty: AHashMap<CacheKey, EmptyBinding>,
 }
 
 #[cfg(test)]

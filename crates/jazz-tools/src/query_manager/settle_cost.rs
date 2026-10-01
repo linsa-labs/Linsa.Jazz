@@ -76,6 +76,30 @@ pub static SUBQUERY_INSTANCE_EVALS: AtomicU64 = AtomicU64::new(0);
 /// compile a fresh one. This is the (b) of the split.
 pub static SUBQUERY_INSTANTIATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Include bindings answered from the correlation index alone, without an
+/// instance — `ArraySubqueryNode::bind_if_provably_empty` proving a binding
+/// empty. Each one is an instantiation, a plan compile and an instance settle
+/// that did not happen.
+pub static EMPTY_BINDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// Descriptor content hashes computed and row layouts compiled. Both are functions of a
+/// descriptor's columns alone and are kept on the descriptor, shared by its clones, so
+/// each is paid once per descriptor BUILT — never per row, and never per clone.
+/// Descriptors are built by plan compiles, and an include that carries includes of its
+/// own builds its nested descriptors once per instance compiled: a pass's counts scale
+/// with the plans it compiled. Counts that scale with its ROWS beyond that have a
+/// descriptor rebuilt per row somewhere.
+pub static DESCRIPTOR_HASHES: AtomicU64 = AtomicU64::new(0);
+pub static ROW_LAYOUT_COMPILES: AtomicU64 = AtomicU64::new(0);
+
+/// Whole rows encoded from values and decoded into values (`row_format::encode_row`,
+/// `decode_row`). Reading one column, comparing in place and carrying a row's bytes
+/// into a wider row do not count. A pass that decodes and re-encodes each row it only
+/// forwards — an include appending its array to the outer row, say — shows here as
+/// counts that scale with the rows held rather than with the rows that changed.
+pub static ROW_ENCODES: AtomicU64 = AtomicU64::new(0);
+pub static ROW_DECODES: AtomicU64 = AtomicU64::new(0);
+
 /// Query plans compiled —
 /// `QueryGraph::compile_execution_plan_with_schema_context_shared` calls. A
 /// superset of [`SUBQUERY_INSTANTIATIONS`]: every instantiation compiles one
@@ -203,6 +227,9 @@ pub static STORAGE_READ_OPS: AtomicU64 = AtomicU64::new(0);
 /// without this axis a settle that spends 37 of its 41 ms inside reads cannot
 /// say whether it read thirty small rows or one enormous one.
 pub static STORAGE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Transactions opened to hold a scope of reads (`Storage::begin_read_scope`). A tick that
+/// reads outside one pays the store's per-statement lock traffic on every read.
+pub static STORAGE_READ_SCOPES: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_WRITE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -246,6 +273,54 @@ pub(crate) fn set_gauge(gauge: &AtomicU64, value: u64) {
 pub(crate) fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Count one whole-row encode or decode ([`ROW_ENCODES`], [`ROW_DECODES`]).
+///
+/// Debug builds re-derive some results the long way to check the short one (the
+/// include's appended array column, for one). That work is the checker's, not the
+/// engine's, and counting it would hide exactly the saving being checked — so a
+/// checker holds an [`UncountedRowCodecs`] while it runs.
+#[inline]
+pub(crate) fn bump_row_codec(counter: &AtomicU64) {
+    #[cfg(debug_assertions)]
+    if uncounted_row_codecs::held() {
+        return;
+    }
+    bump(counter);
+}
+
+#[cfg(debug_assertions)]
+mod uncounted_row_codecs {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// While held, row codecs run on this thread are not counted. Not `Send`: the count
+    /// it holds is this thread's.
+    pub(crate) struct UncountedRowCodecs(std::marker::PhantomData<*const ()>);
+
+    impl UncountedRowCodecs {
+        pub(crate) fn hold() -> Self {
+            DEPTH.with(|depth| depth.set(depth.get() + 1));
+            Self(std::marker::PhantomData)
+        }
+    }
+
+    impl Drop for UncountedRowCodecs {
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+
+    pub(super) fn held() -> bool {
+        DEPTH.with(|depth| depth.get() > 0)
+    }
+}
+
+#[cfg(debug_assertions)]
+pub(crate) use uncounted_row_codecs::UncountedRowCodecs;
 
 /// Give back one gauge membership counted with [`bump`].
 #[inline]
@@ -335,6 +410,11 @@ pub struct SettleCounts {
     pub graph_nodes: u64,
     pub instance_evals: u64,
     pub subquery_instantiations: u64,
+    pub empty_bindings: u64,
+    pub descriptor_hashes: u64,
+    pub row_layout_compiles: u64,
+    pub row_encodes: u64,
+    pub row_decodes: u64,
     pub plan_compiles: u64,
     pub policy_row_evals: u64,
     pub scope_authz_checks: u64,
@@ -352,6 +432,7 @@ pub struct SettleCounts {
     pub storage_read_micros: u64,
     pub storage_read_ops: u64,
     pub storage_read_bytes: u64,
+    pub storage_read_scopes: u64,
     pub storage_write_micros: u64,
     pub storage_write_bytes: u64,
     pub pending_local_row_batches: u64,
@@ -375,6 +456,11 @@ impl SettleCounts {
             graph_nodes: GRAPH_NODES_EVALUATED.load(Ordering::Relaxed),
             instance_evals: SUBQUERY_INSTANCE_EVALS.load(Ordering::Relaxed),
             subquery_instantiations: SUBQUERY_INSTANTIATIONS.load(Ordering::Relaxed),
+            empty_bindings: EMPTY_BINDINGS.load(Ordering::Relaxed),
+            descriptor_hashes: DESCRIPTOR_HASHES.load(Ordering::Relaxed),
+            row_layout_compiles: ROW_LAYOUT_COMPILES.load(Ordering::Relaxed),
+            row_encodes: ROW_ENCODES.load(Ordering::Relaxed),
+            row_decodes: ROW_DECODES.load(Ordering::Relaxed),
             plan_compiles: PLAN_COMPILES.load(Ordering::Relaxed),
             policy_row_evals: POLICY_ROW_EVALS.load(Ordering::Relaxed),
             scope_authz_checks: SCOPE_AUTHZ_CHECKS.load(Ordering::Relaxed),
@@ -392,6 +478,7 @@ impl SettleCounts {
             storage_read_micros: STORAGE_READ_MICROS.load(Ordering::Relaxed),
             storage_read_ops: STORAGE_READ_OPS.load(Ordering::Relaxed),
             storage_read_bytes: STORAGE_READ_BYTES.load(Ordering::Relaxed),
+            storage_read_scopes: STORAGE_READ_SCOPES.load(Ordering::Relaxed),
             storage_write_micros: STORAGE_WRITE_MICROS.load(Ordering::Relaxed),
             storage_write_bytes: STORAGE_WRITE_BYTES.load(Ordering::Relaxed),
             pending_local_row_batches: PENDING_LOCAL_ROW_BATCHES.load(Ordering::Relaxed),
@@ -415,6 +502,15 @@ impl SettleCounts {
             subquery_instantiations: self
                 .subquery_instantiations
                 .saturating_sub(base.subquery_instantiations),
+            empty_bindings: self.empty_bindings.saturating_sub(base.empty_bindings),
+            descriptor_hashes: self
+                .descriptor_hashes
+                .saturating_sub(base.descriptor_hashes),
+            row_layout_compiles: self
+                .row_layout_compiles
+                .saturating_sub(base.row_layout_compiles),
+            row_encodes: self.row_encodes.saturating_sub(base.row_encodes),
+            row_decodes: self.row_decodes.saturating_sub(base.row_decodes),
             plan_compiles: self.plan_compiles.saturating_sub(base.plan_compiles),
             policy_row_evals: self.policy_row_evals.saturating_sub(base.policy_row_evals),
             scope_authz_checks: self
@@ -444,6 +540,9 @@ impl SettleCounts {
             storage_read_bytes: self
                 .storage_read_bytes
                 .saturating_sub(base.storage_read_bytes),
+            storage_read_scopes: self
+                .storage_read_scopes
+                .saturating_sub(base.storage_read_scopes),
             storage_write_micros: self
                 .storage_write_micros
                 .saturating_sub(base.storage_write_micros),
@@ -522,6 +621,11 @@ impl Drop for SettlePass {
             graph_nodes = cost.graph_nodes,
             instance_evals = cost.instance_evals,
             subquery_instantiations = cost.subquery_instantiations,
+            empty_bindings = cost.empty_bindings,
+            descriptor_hashes = cost.descriptor_hashes,
+            row_layout_compiles = cost.row_layout_compiles,
+            row_encodes = cost.row_encodes,
+            row_decodes = cost.row_decodes,
             plan_compiles = cost.plan_compiles,
             policy_row_evals = cost.policy_row_evals,
             scope_authz_checks = cost.scope_authz_checks,
@@ -538,6 +642,7 @@ impl Drop for SettlePass {
             storage_read_micros = cost.storage_read_micros,
             storage_read_ops = cost.storage_read_ops,
             storage_read_bytes = cost.storage_read_bytes,
+            storage_read_scopes = cost.storage_read_scopes,
             storage_write_micros = cost.storage_write_micros,
             storage_write_bytes = cost.storage_write_bytes,
             pending_local_row_batches = cost.pending_local_row_batches,

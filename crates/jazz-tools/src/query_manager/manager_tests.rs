@@ -1351,6 +1351,7 @@ mod declared_index_fill;
 mod deletes;
 mod delivery_confirmation_differential;
 mod e2e_sync;
+mod empty_binding_fills;
 mod include_routing_liveness;
 mod joins;
 mod json_storage;

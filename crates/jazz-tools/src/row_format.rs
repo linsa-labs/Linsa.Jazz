@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use crate::object::ObjectId;
 use crate::query_manager::types::{ColumnDescriptor, ColumnType, RowDescriptor, Value};
@@ -111,12 +110,12 @@ pub struct CompiledRowLayout {
     variable_column_count: usize,
 }
 
-fn compiled_row_layout_cache() -> &'static Mutex<HashMap<[u8; 32], Arc<CompiledRowLayout>>> {
-    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], Arc<CompiledRowLayout>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn compile_row_layout(descriptor: &RowDescriptor) -> CompiledRowLayout {
+    // Counted here, where the work is, so a caller that compiles past the descriptor's
+    // memo is counted too.
+    crate::query_manager::settle_cost::bump(
+        &crate::query_manager::settle_cost::ROW_LAYOUT_COMPILES,
+    );
     let mut columns = Vec::with_capacity(descriptor.columns.len());
     let mut fixed_offset = 0usize;
     let mut variable_index = 0usize;
@@ -151,22 +150,15 @@ fn compile_row_layout(descriptor: &RowDescriptor) -> CompiledRowLayout {
     }
 }
 
+/// The layout of `descriptor`'s rows, compiled once per descriptor and kept on
+/// it (every clone shares the cell).
+///
+/// It used to live in a process-wide map keyed by the descriptor's content
+/// hash, so every row decoded or encoded took a global lock, and a descriptor
+/// whose hash was not memoized yet paid a hash of its whole nested column tree
+/// first — once per freshly compiled include node.
 pub fn compiled_row_layout(descriptor: &RowDescriptor) -> Arc<CompiledRowLayout> {
-    let key = descriptor.content_hash();
-    let cache = compiled_row_layout_cache();
-    {
-        let guard = cache.lock().expect("compiled row layout cache poisoned");
-        if let Some(compiled) = guard.get(&key) {
-            return compiled.clone();
-        }
-    }
-
-    let compiled = Arc::new(compile_row_layout(descriptor));
-    cache
-        .lock()
-        .expect("compiled row layout cache poisoned")
-        .insert(key, compiled.clone());
-    compiled
+    descriptor.row_layout(compile_row_layout)
 }
 
 /// Binary row format:
@@ -191,6 +183,9 @@ pub(crate) fn encode_row_with_layout(
     layout: &CompiledRowLayout,
     values: &[Value],
 ) -> Result<Vec<u8>, EncodingError> {
+    crate::query_manager::settle_cost::bump_row_codec(
+        &crate::query_manager::settle_cost::ROW_ENCODES,
+    );
     if values.len() != descriptor.columns.len() {
         return Err(EncodingError::ColumnCountMismatch {
             expected: descriptor.columns.len(),
@@ -358,6 +353,80 @@ pub(crate) fn encode_row_with_prefix_and_projected_tail(
     }
     result.extend(var_data);
 
+    Ok(result)
+}
+
+/// Encode `src_data` extended by one trailing variable-length column, without
+/// decoding it.
+///
+/// The format keeps variable columns behind an offset table, each offset
+/// relative to the start of the variable data. A column appended at the END of
+/// the list therefore leaves every existing byte where it was: its own offset
+/// (the length of the variable data so far) joins the table, and its bytes
+/// follow the data. For a source row in the encoder's own output this is
+/// byte-identical to decoding it, pushing `value` and encoding the lot — which
+/// is what an include node did for every outer row, once per include in the
+/// chain, re-reading and re-writing every array already attached.
+///
+/// What is checked of the source row is its STRUCTURE: that it is long enough
+/// for its layout and that its offset table is ordered and stays inside the
+/// variable data, so the appended column cannot be read as part of an earlier
+/// one. The contents of its columns are not decoded and are carried over as
+/// they are, exactly as a query without includes carries its rows.
+pub(crate) fn encode_row_with_appended_variable_column(
+    src_layout: &CompiledRowLayout,
+    src_data: &[u8],
+    column: &ColumnDescriptor,
+    value: &Value,
+) -> Result<Vec<u8>, EncodingError> {
+    debug_assert!(column.column_type.is_variable());
+    validate_column_value(column, value)?;
+
+    let malformed = |message: &str| EncodingError::MalformedData {
+        message: message.into(),
+    };
+    let src_variable_columns = src_layout.variable_column_count;
+    let fixed_section_size = src_layout.fixed_section_size;
+    let var_data_start =
+        fixed_section_size + src_variable_columns.saturating_sub(1) * size_of::<u32>();
+    if src_data.len() < var_data_start {
+        return Err(malformed("source row is shorter than its layout"));
+    }
+    let (head, var_data) = if src_variable_columns == 0 {
+        // A row of fixed columns ends with them. Bytes after the fixed section
+        // belong to no column: a decode never reads them and an encode never
+        // writes them, and here they would be read as the new column's.
+        (&src_data[..fixed_section_size], &[][..])
+    } else {
+        src_data.split_at(var_data_start)
+    };
+    let mut previous_offset = 0usize;
+    for stored in head[fixed_section_size..].chunks_exact(size_of::<u32>()) {
+        let offset = u32::from_le_bytes(stored.try_into().unwrap()) as usize;
+        if offset < previous_offset {
+            return Err(malformed("variable column offsets out of order"));
+        }
+        previous_offset = offset;
+    }
+    if previous_offset > var_data.len() {
+        return Err(malformed("variable column offset out of bounds"));
+    }
+    let appended_offset = u32::try_from(var_data.len())
+        .map_err(|_| malformed("variable data too long for an offset"))?;
+
+    let mut result = Vec::with_capacity(
+        head.len()
+            + var_data.len()
+            + size_of::<u32>()
+            + estimated_variable_value_len(column, value),
+    );
+    result.extend_from_slice(head);
+    // The first variable column's offset is implicit; every later one is stored.
+    if src_variable_columns > 0 {
+        result.extend_from_slice(&appended_offset.to_le_bytes());
+    }
+    result.extend_from_slice(var_data);
+    encode_variable_value(&mut result, column, value);
     Ok(result)
 }
 
@@ -733,6 +802,9 @@ fn encode_variable_value(buf: &mut Vec<u8>, col: &ColumnDescriptor, val: &Value)
 
 /// Decode a binary row to Value slice.
 pub fn decode_row(descriptor: &RowDescriptor, data: &[u8]) -> Result<Vec<Value>, EncodingError> {
+    crate::query_manager::settle_cost::bump_row_codec(
+        &crate::query_manager::settle_cost::ROW_DECODES,
+    );
     let layout = compiled_row_layout(descriptor);
     let mut values = Vec::with_capacity(descriptor.columns.len());
 
@@ -1731,6 +1803,364 @@ pub fn project_row_with_layout(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    struct SpliceRng(u64);
+
+    impl SpliceRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        fn text(&mut self) -> String {
+            let len = self.below(12);
+            (0..len)
+                .map(|_| char::from(b'a' + self.below(26) as u8))
+                .collect()
+        }
+
+        fn object_id(&mut self) -> ObjectId {
+            ObjectId::from_uuid(Uuid::from_u128(
+                (u128::from(self.next()) << 64) | u128::from(self.next()),
+            ))
+        }
+
+        /// A column of one of the shapes an include's outer row carries: fixed and
+        /// variable, nullable and not, arrays, and the arrays of rows earlier includes
+        /// in the chain attached.
+        fn column(&mut self, name: &str) -> ColumnDescriptor {
+            let column_type = match self.below(9) {
+                0 => ColumnType::Integer,
+                1 => ColumnType::BigInt,
+                2 => ColumnType::Boolean,
+                3 => ColumnType::Uuid,
+                4 => ColumnType::Timestamp,
+                5 => ColumnType::Text,
+                6 => ColumnType::Bytea,
+                7 => ColumnType::Array {
+                    element: Box::new(ColumnType::Uuid),
+                },
+                _ => ColumnType::Array {
+                    element: Box::new(ColumnType::Row {
+                        columns: Box::new(included_row_descriptor()),
+                    }),
+                },
+            };
+            let column = ColumnDescriptor::new(name, column_type);
+            if self.below(3) == 0 {
+                column.nullable()
+            } else {
+                column
+            }
+        }
+
+        fn value(&mut self, column: &ColumnDescriptor) -> Value {
+            if column.nullable && self.below(3) == 0 {
+                return Value::Null;
+            }
+            match &column.column_type {
+                ColumnType::Integer => Value::Integer(self.next() as i32),
+                ColumnType::BigInt => Value::BigInt(self.next() as i64),
+                ColumnType::Boolean => Value::Boolean(self.below(2) == 0),
+                ColumnType::Uuid => Value::Uuid(self.object_id()),
+                ColumnType::Timestamp => Value::Timestamp(self.next()),
+                ColumnType::Text => Value::Text(self.text()),
+                ColumnType::Bytea => Value::Bytea(self.text().into_bytes()),
+                ColumnType::Array { element } => match element.as_ref() {
+                    ColumnType::Uuid => Value::Array(
+                        (0..self.below(4))
+                            .map(|_| Value::Uuid(self.object_id()))
+                            .collect(),
+                    ),
+                    _ => self.included_rows(),
+                },
+                other => unreachable!("not a shape this generator makes: {other:?}"),
+            }
+        }
+
+        fn included_rows(&mut self) -> Value {
+            Value::Array(
+                (0..self.below(4))
+                    .map(|_| Value::Row {
+                        id: Some(self.object_id()),
+                        values: vec![
+                            Value::Text(self.text()),
+                            Value::Integer(self.next() as i32),
+                            Value::Array(
+                                (0..self.below(3))
+                                    .map(|_| Value::Uuid(self.object_id()))
+                                    .collect(),
+                            ),
+                        ],
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    fn included_row_descriptor() -> RowDescriptor {
+        RowDescriptor::new(vec![
+            ColumnDescriptor::new("title", ColumnType::Text),
+            ColumnDescriptor::new("rank", ColumnType::Integer),
+            ColumnDescriptor::new(
+                "tags",
+                ColumnType::Array {
+                    element: Box::new(ColumnType::Uuid),
+                },
+            ),
+        ])
+    }
+
+    fn include_column() -> ColumnDescriptor {
+        ColumnDescriptor::new(
+            "included",
+            ColumnType::Array {
+                element: Box::new(ColumnType::Row {
+                    columns: Box::new(included_row_descriptor()),
+                }),
+            },
+        )
+    }
+
+    /// The splice an include node writes its array column with, against the long way it
+    /// replaces — decode the outer row, push the array, encode the lot — over random
+    /// outer rows: none to three variable columns in any position, nulls, empty arrays.
+    #[test]
+    fn appended_variable_column_matches_a_full_reencode() {
+        let mut rng = SpliceRng(0x9E37_79B9_7F4A_7C15);
+        let mut variable_column_counts = [0usize; 4];
+
+        for case in 0..4_000 {
+            let columns: Vec<ColumnDescriptor> = (0..rng.below(7))
+                .map(|index| rng.column(&format!("c{index}")))
+                .collect();
+            let values: Vec<Value> = columns.iter().map(|column| rng.value(column)).collect();
+            let source = RowDescriptor::new(columns.clone());
+            let variable_columns = source.variable_column_count();
+            variable_column_counts[variable_columns.min(3)] += 1;
+            let source_bytes = encode_row(&source, &values).unwrap();
+
+            let appended_column = include_column();
+            let appended_value = rng.included_rows();
+            let spliced = encode_row_with_appended_variable_column(
+                &compiled_row_layout(&source),
+                &source_bytes,
+                &appended_column,
+                &appended_value,
+            )
+            .unwrap();
+
+            let mut output_columns = columns;
+            output_columns.push(appended_column);
+            let output = RowDescriptor::new(output_columns);
+            let mut output_values = values;
+            output_values.push(appended_value);
+            assert_eq!(
+                spliced,
+                encode_row(&output, &output_values).unwrap(),
+                "case {case}: {variable_columns} variable columns"
+            );
+            assert_eq!(
+                decode_row(&output, &spliced).unwrap(),
+                output_values,
+                "case {case}"
+            );
+            for (index, value) in output_values.iter().enumerate() {
+                assert_eq!(
+                    &decode_column(&output, &spliced, index).unwrap(),
+                    value,
+                    "case {case}: column {index} read on its own"
+                );
+            }
+        }
+
+        assert!(
+            variable_column_counts.iter().all(|&count| count > 100),
+            "every count of variable columns from none to three and more is exercised: \
+             {variable_column_counts:?}"
+        );
+    }
+
+    /// The splice refuses a value the full encode refuses.
+    #[test]
+    fn appended_variable_column_validates_the_appended_value() {
+        let source = RowDescriptor::new(vec![ColumnDescriptor::new("n", ColumnType::Integer)]);
+        let source_bytes = encode_row(&source, &[Value::Integer(1)]).unwrap();
+        let layout = compiled_row_layout(&source);
+
+        assert!(matches!(
+            encode_row_with_appended_variable_column(
+                &layout,
+                &source_bytes,
+                &include_column(),
+                &Value::Null
+            ),
+            Err(EncodingError::NullNotAllowed { .. })
+        ));
+        assert!(matches!(
+            encode_row_with_appended_variable_column(
+                &layout,
+                &source_bytes,
+                &include_column(),
+                &Value::Text("not an array".into())
+            ),
+            Err(EncodingError::TypeMismatch { .. })
+        ));
+    }
+
+    /// A source row whose offset table would let the appended column be read as part of
+    /// an earlier one is refused, as the full decode refused it.
+    #[test]
+    fn appended_variable_column_refuses_a_structurally_broken_row() {
+        let source = RowDescriptor::new(vec![
+            ColumnDescriptor::new("title", ColumnType::Text),
+            ColumnDescriptor::new("body", ColumnType::Text),
+            ColumnDescriptor::new("note", ColumnType::Text),
+        ]);
+        let layout = compiled_row_layout(&source);
+        let append = |bytes: &[u8]| {
+            encode_row_with_appended_variable_column(
+                &layout,
+                bytes,
+                &include_column(),
+                &Value::Array(Vec::new()),
+            )
+        };
+        let intact = encode_row(
+            &source,
+            &[
+                Value::Text("ab".into()),
+                Value::Text("cd".into()),
+                Value::Text("ef".into()),
+            ],
+        )
+        .unwrap();
+        assert!(append(&intact).is_ok());
+
+        // An offset past the end of the variable data.
+        let mut out_of_bounds = intact.clone();
+        out_of_bounds[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_row(&source, &out_of_bounds).is_err());
+        assert!(matches!(
+            append(&out_of_bounds),
+            Err(EncodingError::MalformedData { .. })
+        ));
+
+        // Offsets that run backwards.
+        let mut out_of_order = intact.clone();
+        out_of_order[0..4].copy_from_slice(&4u32.to_le_bytes());
+        out_of_order[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_row(&source, &out_of_order).is_err());
+        assert!(matches!(
+            append(&out_of_order),
+            Err(EncodingError::MalformedData { .. })
+        ));
+
+        // Shorter than its offset table.
+        assert!(matches!(
+            append(&intact[..6]),
+            Err(EncodingError::MalformedData { .. })
+        ));
+    }
+
+    /// Bytes after the fixed section of a row with no variable columns belong to no
+    /// column: the decode never reads them and the encode never writes them, so the
+    /// appended column must not be laid over them.
+    #[test]
+    fn appended_variable_column_drops_bytes_no_column_owns() {
+        let source = RowDescriptor::new(vec![ColumnDescriptor::new("n", ColumnType::Integer)]);
+        let with_tail = [1u8, 0, 0, 0, 0x99];
+        assert_eq!(
+            decode_row(&source, &with_tail).unwrap(),
+            vec![Value::Integer(1)]
+        );
+
+        let appended_value = Value::Array(Vec::new());
+        let spliced = encode_row_with_appended_variable_column(
+            &compiled_row_layout(&source),
+            &with_tail,
+            &include_column(),
+            &appended_value,
+        )
+        .unwrap();
+        let output = RowDescriptor::new(vec![
+            ColumnDescriptor::new("n", ColumnType::Integer),
+            include_column(),
+        ]);
+        assert_eq!(
+            spliced,
+            encode_row(&output, &[Value::Integer(1), appended_value]).unwrap()
+        );
+    }
+
+    /// A descriptor's content hash and row layout are computed once for the descriptor
+    /// and every clone of it, not once per clone: a query graph clones its descriptors
+    /// into every node, and a decode used to hash the clone it was handed.
+    #[test]
+    fn a_descriptors_clones_share_its_hash_and_layout() {
+        use crate::query_manager::settle_cost::SettleCounts;
+
+        let descriptor = RowDescriptor::new(vec![
+            ColumnDescriptor::new("title", ColumnType::Text),
+            include_column(),
+        ]);
+        let values = vec![Value::Text("t".into()), Value::Array(Vec::new())];
+        // Cloned BEFORE anything is computed: what the original computes afterwards
+        // has to reach clones that already exist, not only ones taken later.
+        let clones: Vec<RowDescriptor> = (0..64).map(|_| descriptor.clone()).collect();
+        assert_eq!(descriptor.memoized(), (false, false));
+
+        // The counters are process-wide and other tests add to them, so they can only
+        // say the work happened at all. That it happened ONCE is said by the memo
+        // itself: every clone already holds the hash and the layout before it is used.
+        let before = SettleCounts::snapshot();
+        let layout = compiled_row_layout(&descriptor);
+        let hash = descriptor.content_hash();
+        let after = SettleCounts::snapshot().since(before);
+        assert!(after.descriptor_hashes >= 1 && after.row_layout_compiles >= 1);
+        for clone in &clones {
+            assert!(
+                clone.shares_memo_with(&descriptor),
+                "a clone keeps a memo of its own"
+            );
+            assert_eq!(
+                clone.memoized(),
+                (true, true),
+                "a clone has to hash and lay out its columns again"
+            );
+            let bytes = encode_row(clone, &values).unwrap();
+            assert_eq!(decode_row(clone, &bytes).unwrap(), values);
+            assert!(
+                Arc::ptr_eq(&compiled_row_layout(clone), &layout),
+                "a clone compiled a layout of its own"
+            );
+            assert_eq!(clone.content_hash(), hash);
+        }
+
+        // A descriptor built again from equal columns is equal and hashes the same.
+        // Whether it also shares the memo is not promised either way.
+        let rebuilt = RowDescriptor::new(descriptor.columns.to_vec());
+        assert_eq!(rebuilt, descriptor);
+        assert_eq!(rebuilt.content_hash(), hash);
+        let bytes = encode_row(&rebuilt, &values).unwrap();
+        assert_eq!(decode_row(&descriptor, &bytes).unwrap(), values);
+
+        // Serialization carries the columns and nothing of the memo.
+        let json = serde_json::to_string(&descriptor).unwrap();
+        let reread: RowDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(reread, descriptor);
+        assert_eq!(reread.content_hash(), hash);
+        assert_eq!(
+            json,
+            serde_json::to_string(&descriptor.columns.to_vec()).unwrap()
+        );
+    }
 
     fn test_descriptor() -> RowDescriptor {
         RowDescriptor::new(vec![

@@ -149,6 +149,317 @@ fn uuid_array_fk_reverse_membership_and_index_updates_on_edit() {
     assert!(ids_for_b_after.contains(&file.row_id));
 }
 
+/// A live reverse include over a UUID[] foreign key. A file names several parts, so
+/// one written file must reach the include of EVERY part it names — and of every part
+/// it stops naming. The subscription is held live across the writes and compared with
+/// a query run from scratch: a mark that routes nowhere leaves the live arrays as they
+/// were, and nothing else would say so.
+#[test]
+fn uuid_array_fk_reverse_include_follows_live_writes() {
+    use crate::query_manager::graph_nodes::include_routing::{
+        force_include_empty_probe, force_include_routing,
+    };
+    use crate::query_manager::precise_dirty::force_precise_dirty;
+
+    fn files_per_part(
+        rows: &[(ObjectId, Vec<Value>)],
+    ) -> std::collections::BTreeMap<String, usize> {
+        rows.iter()
+            .map(|(_, values)| {
+                let label = match &values[0] {
+                    Value::Text(label) => label.clone(),
+                    other => panic!("expected label text, got {other:?}"),
+                };
+                let files = values[1].as_array().expect("files include should be array");
+                (label, files.len())
+            })
+            .collect()
+    }
+
+    // Every mode runs to the end, so a failure names every mode that has it.
+    let mut stale: Vec<String> = Vec::new();
+    for (routed, empty_probe) in [(true, true), (true, false), (false, true), (false, false)] {
+        let _precise = force_precise_dirty(true);
+        let _routing = force_include_routing(routed);
+        let _empty = force_include_empty_probe(empty_probe);
+        let mode = format!("routed={routed} empty_probe={empty_probe}");
+
+        let (mut qm, mut storage) = create_query_manager(SyncManager::new(), file_storage_schema());
+        // Enough parts for the include to route rather than broadcast.
+        let parts: Vec<ObjectId> = ["A", "B", "C", "D", "E"]
+            .into_iter()
+            .map(|label| {
+                qm.insert(&mut storage, "file_parts", &[Value::Text(label.into())])
+                    .unwrap()
+                    .row_id
+            })
+            .collect();
+        let part_ids = |indices: &[usize]| {
+            Value::Array(
+                indices
+                    .iter()
+                    .map(|&index| Value::Uuid(parts[index]))
+                    .collect(),
+            )
+        };
+        // One part has a file from the start, so the include holds an instance as well
+        // as bindings that scan nothing.
+        qm.insert(&mut storage, "files", &[part_ids(&[4])]).unwrap();
+
+        let query = qm
+            .query("file_parts")
+            .with_array("files", |sub| {
+                sub.from("files").correlate("parts", "file_parts.id")
+            })
+            .build();
+        let live = qm.subscribe(query.clone()).unwrap();
+        qm.process(&mut storage);
+        qm.take_updates();
+
+        let mut check = |qm: &mut QueryManager,
+                         storage: &mut MemoryStorage,
+                         step: &str,
+                         expected: [usize; 5]| {
+            qm.process(storage);
+            qm.take_updates();
+            let held = files_per_part(&qm.get_subscription_results(live));
+            let fresh = files_per_part(&execute_query(qm, storage, query.clone()).unwrap());
+            let expected: std::collections::BTreeMap<String, usize> = ["A", "B", "C", "D", "E"]
+                .into_iter()
+                .map(String::from)
+                .zip(expected)
+                .collect();
+            assert_eq!(
+                fresh, expected,
+                "{mode}: a query run from scratch after {step}"
+            );
+            if held != expected {
+                stale.push(format!(
+                    "{mode}: after {step} the live include holds {held:?}"
+                ));
+            }
+        };
+
+        let file = qm
+            .insert(&mut storage, "files", &[part_ids(&[0, 1])])
+            .unwrap();
+        check(
+            &mut qm,
+            &mut storage,
+            "a file naming A and B was inserted",
+            [1, 1, 0, 0, 1],
+        );
+
+        qm.update(&mut storage, file.row_id, &[part_ids(&[1, 2])])
+            .unwrap();
+        check(
+            &mut qm,
+            &mut storage,
+            "the file was edited to name B and C",
+            [0, 1, 1, 0, 1],
+        );
+
+        qm.delete(&mut storage, file.row_id).unwrap();
+        check(
+            &mut qm,
+            &mut storage,
+            "the file was deleted",
+            [0, 0, 0, 0, 1],
+        );
+    }
+    assert!(stale.is_empty(), "{}", stale.join("\n"));
+}
+
+/// The include's rows are the docs with `creator = <the user>`, but `creator` carries
+/// no index on this table, so the planner scans by the include's own filter instead,
+/// `owner = <me>`. For the one user that IS `me`, the value scanned equals the binding.
+/// Taking "the scan's value is the binding" for "the scan is by the correlation column"
+/// would then answer every other user's include from the `owner` index asked about
+/// THAT user — nothing — while the docs they created sit under `owner = me`.
+#[test]
+fn an_include_scanned_by_its_filter_is_not_answered_from_the_filters_index() {
+    use crate::query_manager::graph_nodes::include_routing::{
+        force_include_empty_probe, force_include_routing,
+    };
+    use crate::query_manager::precise_dirty::force_precise_dirty;
+    use crate::query_manager::types::TableSchemaBuilder;
+
+    let _precise = force_precise_dirty(true);
+    let _routing = force_include_routing(true);
+    let _empty = force_include_empty_probe(true);
+
+    let mut schema = Schema::new();
+    let (name, table) = TableSchemaBuilder::new("users")
+        .column("name", ColumnType::Text)
+        .build_named();
+    schema.insert(name, table);
+    let (name, table) = TableSchemaBuilder::new("docs")
+        .fk_column("creator", "users")
+        .fk_column("owner", "users")
+        .index_only(["owner"])
+        .build_named();
+    schema.insert(name, table);
+    let (mut qm, mut storage) = create_query_manager(SyncManager::new(), schema);
+
+    let me = qm
+        .insert(&mut storage, "users", &[Value::Text("me".into())])
+        .unwrap()
+        .row_id;
+    let query = qm
+        .query("users")
+        .with_array("docs", |sub| {
+            sub.from("docs")
+                .correlate("creator", "users.id")
+                .filter_eq("owner", Value::Uuid(me))
+        })
+        .build();
+    let live = qm.subscribe(query).unwrap();
+    // `me` is the only user so far: the include's first instance is bound to `me`.
+    qm.process(&mut storage);
+    qm.take_updates();
+
+    let other = qm
+        .insert(&mut storage, "users", &[Value::Text("other".into())])
+        .unwrap()
+        .row_id;
+    qm.insert(&mut storage, "docs", &[Value::Uuid(other), Value::Uuid(me)])
+        .unwrap();
+    qm.process(&mut storage);
+    qm.take_updates();
+
+    let docs_per_user: std::collections::BTreeMap<String, usize> = qm
+        .get_subscription_results(live)
+        .iter()
+        .map(|(_, values)| {
+            let name = match &values[0] {
+                Value::Text(name) => name.clone(),
+                other => panic!("expected a name, got {other:?}"),
+            };
+            (name, values[1].as_array().expect("docs include").len())
+        })
+        .collect();
+    assert_eq!(
+        docs_per_user.get("other"),
+        Some(&1),
+        "the doc `other` created is missing from their include"
+    );
+    assert_eq!(docs_per_user.get("me"), Some(&0));
+}
+
+/// An include over more outer rows than one node keeps empty bindings for. The rows
+/// past the ceiling hold neither an instance nor a binding, and nothing routes to
+/// them — they have to be asked again whenever the include re-evaluates, or a child
+/// written under one of them never shows.
+#[test]
+fn an_include_past_its_empty_binding_ceiling_stays_live() {
+    use crate::query_manager::graph_nodes::array_subquery::MAX_EMPTY_BINDINGS;
+    use crate::query_manager::graph_nodes::include_routing::{
+        empty_bindings_bound_on_this_thread, force_include_empty_probe, force_include_routing,
+    };
+    use crate::query_manager::precise_dirty::force_precise_dirty;
+    use crate::query_manager::types::TableSchemaBuilder;
+
+    let _precise = force_precise_dirty(true);
+    let _routing = force_include_routing(true);
+    let _empty = force_include_empty_probe(true);
+
+    let mut schema = Schema::new();
+    let (name, table) = TableSchemaBuilder::new("parents")
+        .column("name", ColumnType::Text)
+        .build_named();
+    schema.insert(name, table);
+    let (name, table) = TableSchemaBuilder::new("children")
+        .fk_column("parent", "parents")
+        .build_named();
+    schema.insert(name, table);
+    let (mut qm, mut storage) = create_query_manager(SyncManager::new(), schema);
+
+    let parent_count = MAX_EMPTY_BINDINGS + 40;
+    let parents: Vec<ObjectId> = (0..parent_count)
+        .map(|index| {
+            qm.insert(&mut storage, "parents", &[Value::Text(format!("p{index}"))])
+                .unwrap()
+                .row_id
+        })
+        .collect();
+
+    let query = qm
+        .query("parents")
+        .with_array("children", |sub| {
+            sub.from("children").correlate("parent", "parents.id")
+        })
+        .build();
+    let bound_before = empty_bindings_bound_on_this_thread();
+    let live = qm.subscribe(query.clone()).unwrap();
+    qm.process(&mut storage);
+    qm.take_updates();
+    assert!(
+        empty_bindings_bound_on_this_thread() - bound_before >= (parent_count - 1) as u64,
+        "the childless parents were not answered from the index"
+    );
+
+    let children_per_parent = |rows: &[(ObjectId, Vec<Value>)]| -> HashMap<ObjectId, usize> {
+        rows.iter()
+            .map(|(id, values)| (*id, values[1].as_array().expect("children include").len()))
+            .collect()
+    };
+
+    // Which parents sit past the ceiling is the settle's business: write under a
+    // spread of them wide enough to cover both kinds.
+    let written: Vec<ObjectId> = parents.iter().copied().step_by(7).collect();
+    let mut children = Vec::new();
+    for parent in &written {
+        children.push(
+            qm.insert(&mut storage, "children", &[Value::Uuid(*parent)])
+                .unwrap()
+                .row_id,
+        );
+        qm.process(&mut storage);
+    }
+    qm.take_updates();
+    let held = children_per_parent(&qm.get_subscription_results(live));
+    assert_eq!(held.len(), parent_count);
+    let missing: Vec<usize> = written
+        .iter()
+        .enumerate()
+        .filter(|(_, parent)| held[*parent] != 1)
+        .map(|(index, _)| index * 7)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {} written parents show no child, first at slot {:?}",
+        missing.len(),
+        written.len(),
+        missing.first()
+    );
+    assert_eq!(held.values().sum::<usize>(), written.len());
+
+    // And back: the children go, the includes empty again.
+    for child in children {
+        qm.delete(&mut storage, child).unwrap();
+    }
+    qm.process(&mut storage);
+    qm.take_updates();
+    let held = children_per_parent(&qm.get_subscription_results(live));
+    assert_eq!(held.values().sum::<usize>(), 0);
+
+    // One write under EVERY parent, settled in a single pass: the bindings that are
+    // kept and the slots past the ceiling are filled by the same marks, and none of
+    // them may be left for a later pass that never comes.
+    for parent in &parents {
+        qm.insert(&mut storage, "children", &[Value::Uuid(*parent)])
+            .unwrap();
+    }
+    qm.process(&mut storage);
+    qm.take_updates();
+    let held = children_per_parent(&qm.get_subscription_results(live));
+    let unfilled = parents.iter().filter(|parent| held[*parent] != 1).count();
+    assert_eq!(
+        unfilled, 0,
+        "{unfilled} of {parent_count} parents written in one batch show no child"
+    );
+}
+
 #[test]
 fn array_subquery_single_user_with_posts() {
     let sync_manager = SyncManager::new();

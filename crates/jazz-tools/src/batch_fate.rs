@@ -852,64 +852,78 @@ fn decode_nullable_durability_tier(value: &Value) -> Result<Option<DurabilityTie
 }
 
 fn storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-        ColumnDescriptor::new(
-            "mode",
-            ColumnType::Enum {
-                variants: vec!["direct".to_string(), "transactional".to_string()],
-            },
-        ),
-        ColumnDescriptor::new("sealed", ColumnType::Boolean),
-        ColumnDescriptor::new(
-            "members",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("table_name", ColumnType::Text),
-                        ColumnDescriptor::new("branch_name", ColumnType::Text),
-                        ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
-                        ColumnDescriptor::new("row_digest", ColumnType::Bytea),
-                    ])),
-                }),
-            },
-        ),
-        ColumnDescriptor::new("sealed_submission", ColumnType::Bytea).nullable(),
-        ColumnDescriptor::new("latest_fate", ColumnType::Bytea).nullable(),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: OnceLock<RowDescriptor> = OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                ColumnDescriptor::new(
+                    "mode",
+                    ColumnType::Enum {
+                        variants: vec!["direct".to_string(), "transactional".to_string()],
+                    },
+                ),
+                ColumnDescriptor::new("sealed", ColumnType::Boolean),
+                ColumnDescriptor::new(
+                    "members",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("table_name", ColumnType::Text),
+                                ColumnDescriptor::new("branch_name", ColumnType::Text),
+                                ColumnDescriptor::new("schema_hash", ColumnType::Bytea),
+                                ColumnDescriptor::new("row_digest", ColumnType::Bytea),
+                            ])),
+                        }),
+                    },
+                ),
+                ColumnDescriptor::new("sealed_submission", ColumnType::Bytea).nullable(),
+                ColumnDescriptor::new("latest_fate", ColumnType::Bytea).nullable(),
+            ])
+        })
+        .clone()
 }
 
 fn sealed_batch_submission_storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-        ColumnDescriptor::new("mode", ColumnType::Text),
-        ColumnDescriptor::new("target_branch_name", ColumnType::Text),
-        ColumnDescriptor::new("batch_digest", ColumnType::Bytea),
-        ColumnDescriptor::new(
-            "members",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("row_digest", ColumnType::Bytea),
-                    ])),
-                }),
-            },
-        ),
-        ColumnDescriptor::new(
-            "captured_frontier",
-            ColumnType::Array {
-                element: Box::new(ColumnType::Row {
-                    columns: Box::new(RowDescriptor::new(vec![
-                        ColumnDescriptor::new("object_id", ColumnType::Bytea),
-                        ColumnDescriptor::new("branch_name", ColumnType::Text),
-                        ColumnDescriptor::new("batch_id", ColumnType::BatchId),
-                    ])),
-                }),
-            },
-        ),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: OnceLock<RowDescriptor> = OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                ColumnDescriptor::new("mode", ColumnType::Text),
+                ColumnDescriptor::new("target_branch_name", ColumnType::Text),
+                ColumnDescriptor::new("batch_digest", ColumnType::Bytea),
+                ColumnDescriptor::new(
+                    "members",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("row_digest", ColumnType::Bytea),
+                            ])),
+                        }),
+                    },
+                ),
+                ColumnDescriptor::new(
+                    "captured_frontier",
+                    ColumnType::Array {
+                        element: Box::new(ColumnType::Row {
+                            columns: Box::new(RowDescriptor::new(vec![
+                                ColumnDescriptor::new("object_id", ColumnType::Bytea),
+                                ColumnDescriptor::new("branch_name", ColumnType::Text),
+                                ColumnDescriptor::new("batch_id", ColumnType::BatchId),
+                            ])),
+                        }),
+                    },
+                ),
+            ])
+        })
+        .clone()
 }
 
 fn batch_fate_storage_descriptor() -> &'static RowDescriptor {

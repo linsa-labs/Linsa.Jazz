@@ -58,8 +58,15 @@ impl CatalogueEntry {
 }
 
 fn storage_descriptor() -> RowDescriptor {
-    RowDescriptor::new(vec![
-        ColumnDescriptor::new("metadata", ColumnType::Bytea),
-        ColumnDescriptor::new("content", ColumnType::Bytea),
-    ])
+    // Built once: the columns never change, and a descriptor built per call lays
+    // its rows out again on every call.
+    static DESCRIPTOR: std::sync::OnceLock<RowDescriptor> = std::sync::OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("metadata", ColumnType::Bytea),
+                ColumnDescriptor::new("content", ColumnType::Bytea),
+            ])
+        })
+        .clone()
 }
