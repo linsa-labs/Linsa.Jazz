@@ -46,7 +46,7 @@ import {
 } from "./browser-broker-errors.js";
 import type { AuthFailureReason } from "./sync-transport.js";
 import { translateQuery } from "./query-adapter.js";
-import { transformRow, transformRows } from "./row-transformer.js";
+import { createRowTransformer, transformRow, transformRows } from "./row-transformer.js";
 import { toWriteRecord } from "./value-converter.js";
 import { SubscriptionManager, type SubscriptionDelta } from "./subscription-manager.js";
 import { createAuthStateStore, type AuthState, type AuthStateStoreOptions } from "./auth-state.js";
@@ -56,7 +56,7 @@ import {
   type FileReadOptions,
   type FileWriteOptions,
 } from "./file-storage.js";
-import { analyzeRelations } from "../codegen/relation-analyzer.js";
+import { relationsForSchema } from "../codegen/relation-analyzer.js";
 import { isPermissionIntrospectionColumn, magicColumnType } from "../magic-columns.js";
 import {
   normalizeBuiltQuery,
@@ -257,7 +257,7 @@ function resolveHopOutputTable(
   if (hops.length === 0) {
     return startTable;
   }
-  const relations = analyzeRelations(schema);
+  const relations = relationsForSchema(schema);
   let currentTable = startTable;
   for (const hopName of hops) {
     const candidates = relations.get(currentTable) ?? [];
@@ -355,7 +355,7 @@ function resolveNativeSubscriptionColumns(
     return columns;
   }
 
-  const relationsByTable = analyzeRelations(schema);
+  const relationsByTable = relationsForSchema(schema);
   const relations = relationsByTable.get(tableName) ?? [];
 
   for (const [relationName, include] of Object.entries(includes)) {
@@ -1485,10 +1485,16 @@ export class Db {
     );
     const wasmQuery = translateQuery(builderJson, planningSchema);
 
+    const transformSubscriptionRow = createRowTransformer<Record<string, unknown>>(
+      outputSchema,
+      outputTable,
+      outputIncludes,
+      builtQuery.select,
+    );
     const transform = (row: WasmRow): T =>
       transformOutputRow(
         outputTable === builtQuery.table ? query : {},
-        transformRow(row, outputSchema, outputTable, outputIncludes, builtQuery.select),
+        transformSubscriptionRow(row),
       );
     const nativeTransform =
       Object.keys(outputIncludes).length === 0 && builtQuery.select.length === 0

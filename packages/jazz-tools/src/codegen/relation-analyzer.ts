@@ -113,3 +113,43 @@ export function analyzeRelations(schema: WasmSchema): Map<string, Relation[]> {
 
   return relations;
 }
+
+type MemoizedRelations = {
+  relations: Map<string, Relation[]>;
+  tableCount: number;
+  columnCount: number;
+};
+
+const relationsBySchema = new WeakMap<WasmSchema, MemoizedRelations>();
+
+/**
+ * `analyzeRelations` for a schema object, analysed once per object instead of once per
+ * query (and, before that, once per delivered row).
+ *
+ * The runtime never mutates a schema object it has handed out. A caller that grows one in
+ * place — another table, another column — gets a fresh analysis: the memo is keyed by the
+ * object AND by how many tables and columns it had. Editing a column that is already
+ * there is not seen; build a new schema object for that.
+ *
+ * The result is shared between callers: treat it as read-only.
+ */
+export function relationsForSchema(schema: WasmSchema): Map<string, Relation[]> {
+  const tableNames = Object.keys(schema);
+  let columnCount = 0;
+  for (const tableName of tableNames) {
+    columnCount += schema[tableName]!.columns.length;
+  }
+
+  const memoized = relationsBySchema.get(schema);
+  if (
+    memoized &&
+    memoized.tableCount === tableNames.length &&
+    memoized.columnCount === columnCount
+  ) {
+    return memoized.relations;
+  }
+
+  const relations = analyzeRelations(schema);
+  relationsBySchema.set(schema, { relations, tableCount: tableNames.length, columnCount });
+  return relations;
+}

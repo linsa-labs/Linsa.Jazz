@@ -3,7 +3,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { unwrapValue, transformRows, type WasmValue } from "./row-transformer.js";
+import {
+  createRowTransformer,
+  transformRow,
+  transformRows,
+  unwrapValue,
+  type IncludeSpec,
+  type WasmValue,
+} from "./row-transformer.js";
 import type { WasmSchema, WasmRow } from "../drivers/types.js";
 
 describe("unwrapValue", () => {
@@ -685,5 +692,181 @@ describe("transformRows", () => {
         },
       },
     ]);
+  });
+});
+
+describe("createRowTransformer", () => {
+  const schema: WasmSchema = {
+    users: {
+      columns: [
+        { name: "name", column_type: { type: "Text" }, nullable: false },
+        { name: "manager_id", column_type: { type: "Uuid" }, nullable: true, references: "users" },
+        { name: "joined_at", column_type: { type: "Timestamp" }, nullable: true },
+      ],
+    },
+    todos: {
+      columns: [
+        { name: "title", column_type: { type: "Text" }, nullable: false },
+        { name: "owner_id", column_type: { type: "Uuid" }, nullable: false, references: "users" },
+        { name: "meta", column_type: { type: "Json" }, nullable: true },
+        {
+          name: "watcher_ids",
+          column_type: { type: "Array", element: { type: "Uuid" } },
+          nullable: false,
+          references: "users",
+        },
+      ],
+    },
+  };
+
+  const text = (value: string): WasmValue => ({ type: "Text", value });
+  const uuid = (value: string): WasmValue => ({ type: "Uuid", value });
+  const nil: WasmValue = { type: "Null" };
+  const rowsOf = (...rows: Array<{ id: string; values: WasmValue[] }>): WasmValue => ({
+    type: "Array",
+    value: rows.map((value) => ({ type: "Row", value })) as WasmValue[],
+  });
+
+  const user = (id: string, name: string, ...included: WasmValue[]) => ({
+    id,
+    values: [
+      text(name),
+      nil,
+      { type: "Timestamp", value: 1704067200000 } as WasmValue,
+      ...included,
+    ],
+  });
+  const todo = (id: string, title: string, ...included: WasmValue[]): WasmRow => ({
+    id,
+    values: [
+      text(title),
+      uuid("user-1"),
+      text('{"tags":["a","b"]}'),
+      { type: "Array", value: [uuid("user-2"), uuid("user-3")] },
+      ...included,
+    ],
+  });
+
+  // Every shape `transformRows` resolves per call: no include, forward, reverse, a
+  // UUID[] forward array, an include that holds nothing, nested, projected at the root
+  // and inside an include.
+  const cases: Array<{
+    name: string;
+    table: string;
+    includes?: IncludeSpec;
+    projection?: readonly string[];
+    rows: WasmRow[];
+  }> = [
+    { name: "no include", table: "todos", rows: [todo("todo-1", "Buy milk")] },
+    {
+      name: "forward include",
+      table: "todos",
+      includes: { owner: true },
+      rows: [todo("todo-1", "Buy milk", rowsOf(user("user-1", "Alice")))],
+    },
+    {
+      name: "forward include that holds nothing",
+      table: "todos",
+      includes: { owner: true },
+      rows: [todo("todo-1", "Buy milk", rowsOf())],
+    },
+    {
+      name: "forward array include",
+      table: "todos",
+      includes: { watchers: true },
+      rows: [todo("todo-1", "Buy milk", rowsOf(user("user-2", "Bob"), user("user-3", "Cy")))],
+    },
+    {
+      name: "reverse include, one row holding rows and one holding none",
+      table: "users",
+      includes: { todosViaOwner: true },
+      rows: [
+        user("user-1", "Alice", rowsOf(todo("todo-1", "Buy milk"), todo("todo-2", "Write tests"))),
+        user("user-2", "Bob", rowsOf()),
+      ],
+    },
+    {
+      name: "nested include",
+      table: "todos",
+      includes: { owner: { todosViaOwner: true }, watchers: true },
+      rows: [
+        todo(
+          "todo-1",
+          "Buy milk",
+          rowsOf(user("user-1", "Alice", rowsOf(todo("todo-1", "Buy milk")))),
+          rowsOf(user("user-2", "Bob")),
+        ),
+      ],
+    },
+    {
+      name: "root projection with an include",
+      table: "todos",
+      includes: { owner: true },
+      projection: ["title"],
+      rows: [{ id: "todo-1", values: [text("Buy milk"), rowsOf(user("user-1", "Alice"))] }],
+    },
+    {
+      name: "projection inside an include",
+      table: "todos",
+      includes: { owner: { select: ["name"] } } as unknown as IncludeSpec,
+      rows: [todo("todo-1", "Buy milk", rowsOf({ id: "user-1", values: [text("Alice")] }))],
+    },
+  ];
+
+  for (const { name, table, includes, projection, rows } of cases) {
+    it(`gives what transformRows and transformRow give: ${name}`, () => {
+      const transform = createRowTransformer(schema, table, includes, projection);
+      // Twice over the same rows: the second pass runs on the shape the first one resolved.
+      const first = rows.map((row) => transform(row));
+      const second = rows.map((row) => transform(row));
+
+      const expected = transformRows(rows, schema, table, includes, projection);
+      expect(first).toEqual(expected);
+      expect(second).toEqual(expected);
+      expect(rows.map((row) => transformRow(row, schema, table, includes, projection))).toEqual(
+        expected,
+      );
+    });
+  }
+
+  it("fails where transformRow fails: when a row arrives, with the same error", () => {
+    const unknownTable = createRowTransformer(schema, "nonexistent");
+    expect(() => unknownTable(todo("todo-1", "Buy milk"))).toThrow(
+      'Unknown table "nonexistent" in schema',
+    );
+
+    const unknownRelation = createRowTransformer(schema, "todos", { nope: true });
+    expect(() => unknownRelation(todo("todo-1", "Buy milk"))).toThrow(
+      'Unknown relation "nope" on table "todos"',
+    );
+  });
+
+  it("reads the schema for its first row and for no row after it", () => {
+    let reads = 0;
+    const counted = new Proxy(structuredClone(schema), {
+      get(target, property, receiver) {
+        reads += 1;
+        return Reflect.get(target, property, receiver);
+      },
+      ownKeys(target) {
+        reads += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+    const includes = { owner: { todosViaOwner: true }, watchers: true };
+    const row = cases.find((candidate) => candidate.name === "nested include")!.rows[0]!;
+
+    const transform = createRowTransformer(counted, "todos", includes);
+    expect(reads).toBe(0);
+    transform(row);
+    const readsForTheShape = reads;
+    expect(readsForTheShape).toBeGreaterThan(0);
+
+    for (let i = 0; i < 50; i++) transform(row);
+    expect(reads).toBe(readsForTheShape);
+
+    // What it replaces resolves the shape again for every row it is handed.
+    transformRow(row, counted, "todos", includes);
+    expect(reads).toBeGreaterThan(readsForTheShape);
   });
 });

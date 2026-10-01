@@ -10,7 +10,7 @@
 
 import type { ColumnType, WasmSchema } from "../drivers/types.js";
 import { toJsonText } from "./json-text.js";
-import { analyzeRelations, type Relation } from "../codegen/relation-analyzer.js";
+import { relationsForSchema, type Relation } from "../codegen/relation-analyzer.js";
 import { isProvenanceMagicTimestampColumn, magicColumnType } from "../magic-columns.js";
 import {
   normalizeBuiltQuery,
@@ -711,7 +711,7 @@ function translateBuiltRelationToRelExpr(
  */
 export function translateBuilderToRelationIr(builderJson: string, schema: WasmSchema): RelExpr {
   const builder = normalizeBuiltQuery(JSON.parse(builderJson), "");
-  const relations = analyzeRelations(schema);
+  const relations = relationsForSchema(schema);
   const hops = builder.hops;
 
   if (builder.gather && Object.keys(builder.includes).length > 0) {
@@ -799,7 +799,7 @@ export function translateBuilderToRelationIr(builderJson: string, schema: WasmSc
  */
 export function translateQuery(builderJson: string, schema: WasmSchema): string {
   const builder = normalizeBuiltQuery(JSON.parse(builderJson), "");
-  const relations = analyzeRelations(schema);
+  const relations = relationsForSchema(schema);
   const relation = translateBuilderToRelationIr(builderJson, schema);
   const hasExplicitSelect = builder.select.length > 0;
   const selectColumns = hasExplicitSelect
