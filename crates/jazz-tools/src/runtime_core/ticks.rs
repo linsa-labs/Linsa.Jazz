@@ -1316,6 +1316,23 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         self.scheduler.schedule_batched_tick();
     }
 
+    /// Park a message a client sent on `connection`, one of the connections counted by
+    /// `SyncManager::client_connection`. A subscription is answered once per connection,
+    /// and by the time it is taken up the client may be on another.
+    pub fn park_client_sync_message(&mut self, message: InboxEntry, connection: u64) {
+        if let (
+            crate::sync_manager::Source::Client(client_id),
+            crate::sync_manager::SyncPayload::QuerySubscription { query_id, .. },
+        ) = (&message.source, &message.payload)
+        {
+            self.schema_manager
+                .query_manager_mut()
+                .sync_manager_mut()
+                .note_subscription_asked_on(*client_id, *query_id, connection);
+        }
+        self.park_sync_message(message);
+    }
+
     /// Park a sequenced sync message for in-order processing in next batched_tick.
     pub fn park_sync_message_with_sequence(&mut self, message: InboxEntry, sequence: u64) {
         match message.source {

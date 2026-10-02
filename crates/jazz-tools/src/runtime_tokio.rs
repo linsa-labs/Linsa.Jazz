@@ -570,6 +570,26 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         Ok(())
     }
 
+    /// Push messages a client sent on `connection`, under a single core lock. Without a
+    /// connection they are taken to have come on the one the client opened last.
+    pub fn push_client_sync_inbox(
+        &self,
+        entries: Vec<InboxEntry>,
+        connection: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
+        for entry in entries {
+            match connection {
+                Some(connection) => core.park_client_sync_message(entry, connection),
+                None => core.park_sync_message(entry),
+            }
+        }
+        Ok(())
+    }
+
     /// Push a sync message with an explicit stream sequence (from network).
     pub fn push_sync_inbox_with_sequence(
         &self,
@@ -641,19 +661,20 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         Ok(())
     }
 
+    /// Returns the connection this opened, as `SyncManager::client_connection` counts them.
     pub fn ensure_client_with_session_and_catalogue_state_hash(
         &self,
         client_id: ClientId,
         session: Session,
         remote_catalogue_state_hash: Option<&str>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<u64, RuntimeError> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
         core.ensure_client_with_session_and_catalogue_state_hash(
             client_id,
             session,
             remote_catalogue_state_hash,
         );
-        Ok(())
+        Ok(core.client_connection(client_id))
     }
 
     /// Ensure a client exists and is marked as Backend without resetting state.
@@ -663,17 +684,18 @@ impl<S: Storage + Send + 'static> TokioRuntime<S> {
         Ok(())
     }
 
+    /// Returns the connection this opened, as `SyncManager::client_connection` counts them.
     pub fn ensure_client_as_backend_with_catalogue_state_hash(
         &self,
         client_id: ClientId,
         remote_catalogue_state_hash: Option<&str>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<u64, RuntimeError> {
         let mut core = self.core.lock().map_err(|_| RuntimeError::LockError)?;
         core.ensure_client_as_backend_with_catalogue_state_hash(
             client_id,
             remote_catalogue_state_hash,
         );
-        Ok(())
+        Ok(core.client_connection(client_id))
     }
 
     /// Ensure a client exists and is marked as Peer without resetting state.

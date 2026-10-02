@@ -217,6 +217,16 @@ pub struct SyncManager {
     /// and no fate is invented, because on the peer a `Rejected` destroys the row and the
     /// graft tool is offline-only.
     pub(super) missing_answers: HashMap<ClientId, ClientMissingAnswers>,
+    /// How many connections each client has opened. A client id outlives a connection, and
+    /// outlives the engine at the other end of it: an app that is closed and opened comes
+    /// back under the id it had. What a peer was told is known only for the connection it
+    /// was told on, and this is what tells one connection from the next.
+    pub(super) client_connections: HashMap<ClientId, u64>,
+    /// The connection a subscription was sent on, from when it is received to when it is
+    /// taken up. A client may have more than one connection open, and one that has closed
+    /// may still have a frame on its way through this node: "the connection the client is
+    /// on now" is not the one every frame came on. Where nobody said, it is taken to be.
+    pub(super) subscriptions_asked_on: HashMap<(ClientId, QueryId), u64>,
     /// Rows that could not be applied, and what they have cost since. Keeps the repeat
     /// failures out of the log while making the row itself nameable — see
     /// `UNAPPLIABLE_ROW_WARN_INTERVAL_MICROS`.
@@ -458,6 +468,8 @@ impl SyncManager {
             outbox: Vec::new(),
             pending_client_deliveries: HashMap::new(),
             missing_answers: HashMap::new(),
+            client_connections: HashMap::new(),
+            subscriptions_asked_on: HashMap::new(),
             unappliable_rows: HashMap::new(),
             parked_row_batches: HashMap::new(),
             parked_rows_order: VecDeque::new(),
@@ -838,6 +850,7 @@ impl SyncManager {
         // A fresh connection is new information about what the peer can send, so whatever
         // this authority stopped answering for the previous one gets another chance.
         self.missing_answers.remove(&client_id);
+        *self.client_connections.entry(client_id).or_default() += 1;
     }
 
     /// Add a client connection using storage-backed catalogue replay.
@@ -887,6 +900,9 @@ impl SyncManager {
         // scratch on the next connection.
         self.pending_client_deliveries.remove(&client_id);
         self.missing_answers.remove(&client_id);
+        self.client_connections.remove(&client_id);
+        self.subscriptions_asked_on
+            .retain(|(asked_by, _), _| *asked_by != client_id);
         self.clients.remove(&client_id);
         // Clean up interest map
         self.row_batch_interest.retain(|_, clients| {
@@ -967,6 +983,29 @@ impl SyncManager {
     /// deferral rather than an abandonment.
     pub fn note_client_connected(&mut self, client_id: ClientId) {
         self.missing_answers.remove(&client_id);
+        *self.client_connections.entry(client_id).or_default() += 1;
+    }
+
+    /// Which of its connections a client is on, counted from its first: the one it opened
+    /// last.
+    pub fn client_connection(&self, client_id: ClientId) -> u64 {
+        self.client_connections
+            .get(&client_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// A subscription has been received from `client_id` on `connection`, and waits to be
+    /// taken up. Of several not yet taken up under one query id the last received is kept;
+    /// the others are taken up as asked on the client's newest connection.
+    pub fn note_subscription_asked_on(
+        &mut self,
+        client_id: ClientId,
+        query_id: QueryId,
+        connection: u64,
+    ) {
+        self.subscriptions_asked_on
+            .insert((client_id, query_id), connection);
     }
 
     /// Set the role for a client.

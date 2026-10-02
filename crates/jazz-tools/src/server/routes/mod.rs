@@ -92,6 +92,9 @@ pub fn create_router(state: Arc<ServerState>) -> Router {
 mod reconnect_storm_tests;
 
 #[cfg(test)]
+mod relaunched_client_ws_tests;
+
+#[cfg(test)]
 mod tests {
     use super::http::*;
     use super::utils::*;

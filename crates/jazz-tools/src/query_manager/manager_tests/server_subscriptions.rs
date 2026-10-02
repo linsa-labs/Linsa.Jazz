@@ -356,6 +356,340 @@ fn duplicate_server_subscription_does_not_replay_same_scope_same_tier_settlement
     );
 }
 
+/// A server at `server_tier` holding one user, a client that subscribed to it under query
+/// id 1 requiring `required_tier`, was answered, and confirmed what it was sent. Returns
+/// what the server sent for that first subscription.
+fn a_subscription_answered_and_confirmed(
+    server_tier: Option<DurabilityTier>,
+    required_tier: Option<DurabilityTier>,
+) -> (
+    QueryManager,
+    MemoryStorage,
+    crate::sync_manager::ClientId,
+    Vec<crate::sync_manager::OutboxEntry>,
+) {
+    let sync_manager = match server_tier {
+        Some(tier) => SyncManager::new().with_durability_tier(tier),
+        None => SyncManager::new(),
+    };
+    let (mut server_qm, mut storage) = create_query_manager(sync_manager, test_schema());
+    server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("Alice".into()), Value::Integer(100)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+
+    let client_id = crate::sync_manager::ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let first = send_the_subscription(&mut server_qm, &mut storage, client_id, required_tier);
+    (server_qm, storage, client_id, first)
+}
+
+/// The client sends its subscription under query id 1; the server works through it; what
+/// it sent back is confirmed and returned.
+fn send_the_subscription(
+    server_qm: &mut QueryManager,
+    storage: &mut MemoryStorage,
+    client_id: crate::sync_manager::ClientId,
+    required_tier: Option<DurabilityTier>,
+) -> Vec<crate::sync_manager::OutboxEntry> {
+    use crate::sync_manager::{InboxEntry, QueryId, Source, SyncPayload};
+
+    let query = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    server_qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Client(client_id),
+        payload: SyncPayload::QuerySubscription {
+            query_id: QueryId(1),
+            query: Box::new(query),
+            session: None,
+            required_tier,
+            propagation: crate::sync_manager::QueryPropagation::Full,
+            policy_context_tables: vec![],
+        },
+    });
+    server_qm.process(storage);
+    let sent = server_qm.sync_manager_mut().take_outbox();
+    confirm_delivered(server_qm, &sent);
+    sent
+}
+
+fn settled_tiers(
+    sent: &[crate::sync_manager::OutboxEntry],
+    client_id: crate::sync_manager::ClientId,
+) -> Vec<(DurabilityTier, usize)> {
+    use crate::sync_manager::{Destination, QueryId, SyncPayload};
+    sent.iter()
+        .filter_map(|entry| match (&entry.destination, &entry.payload) {
+            (
+                Destination::Client(id),
+                SyncPayload::QuerySettled {
+                    query_id: QueryId(1),
+                    tier,
+                    scope,
+                    ..
+                },
+            ) if *id == client_id => Some((*tier, scope.len())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rows_sent(sent: &[crate::sync_manager::OutboxEntry]) -> usize {
+    use crate::sync_manager::SyncPayload;
+    sent.iter()
+        .filter(|entry| {
+            matches!(
+                entry.payload,
+                SyncPayload::RowBatchNeeded { .. } | SyncPayload::RowBatchCreated { .. }
+            )
+        })
+        .count()
+}
+
+/// An app that is closed and opened keeps its client id and numbers its queries from the
+/// start, so it sends the subscription the server holds, under the id the server holds it
+/// under — and it is a new engine, which was told nothing.
+#[test]
+fn a_subscription_sent_again_on_a_new_connection_is_answered_from_the_scope_held() {
+    let tier = DurabilityTier::EdgeServer;
+    let (mut server_qm, mut storage, client_id, first) =
+        a_subscription_answered_and_confirmed(Some(tier), Some(tier));
+    assert_eq!(
+        settled_tiers(&first, client_id),
+        vec![(tier, 1)],
+        "the first subscription is not answered, so nothing below measures a second"
+    );
+
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let again = send_the_subscription(&mut server_qm, &mut storage, client_id, Some(tier));
+
+    assert_eq!(
+        settled_tiers(&again, client_id),
+        vec![(tier, 1)],
+        "a read that waits for this tier is given nothing to stop waiting on"
+    );
+    assert_eq!(
+        rows_sent(&again),
+        0,
+        "the peer confirmed the row; the answer is the scope, not the rows again"
+    );
+}
+
+#[test]
+fn a_subscription_sent_twice_on_one_connection_is_answered_once() {
+    let tier = DurabilityTier::EdgeServer;
+    let (mut server_qm, mut storage, client_id, _first) =
+        a_subscription_answered_and_confirmed(Some(tier), Some(tier));
+
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let _ = send_the_subscription(&mut server_qm, &mut storage, client_id, Some(tier));
+    let third = send_the_subscription(&mut server_qm, &mut storage, client_id, Some(tier));
+
+    assert_eq!(
+        settled_tiers(&third, client_id),
+        Vec::new(),
+        "the engine on this connection was told; telling it again is a scope to decode \
+         for nothing"
+    );
+}
+
+/// A server below the tier a subscription waits for still hands over its scope once, as
+/// the first snapshot the reader has. A new connection is owed that snapshot as well.
+#[test]
+fn a_new_connection_is_given_the_scope_of_a_server_below_the_tier_asked_for() {
+    let required = DurabilityTier::GlobalServer;
+    let (mut server_qm, mut storage, client_id, first) =
+        a_subscription_answered_and_confirmed(Some(DurabilityTier::EdgeServer), Some(required));
+    assert_eq!(
+        settled_tiers(&first, client_id),
+        vec![(DurabilityTier::EdgeServer, 1)]
+    );
+
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let again = send_the_subscription(&mut server_qm, &mut storage, client_id, Some(required));
+
+    assert_eq!(
+        settled_tiers(&again, client_id),
+        vec![(DurabilityTier::EdgeServer, 1)]
+    );
+}
+
+/// The client's subscription under query id 1, read from the socket that opened
+/// `connection`.
+fn send_the_subscription_on(
+    server_qm: &mut QueryManager,
+    storage: &mut MemoryStorage,
+    client_id: crate::sync_manager::ClientId,
+    required_tier: Option<DurabilityTier>,
+    connection: u64,
+) -> Vec<crate::sync_manager::OutboxEntry> {
+    server_qm.sync_manager_mut().note_subscription_asked_on(
+        client_id,
+        crate::sync_manager::QueryId(1),
+        connection,
+    );
+    send_the_subscription(server_qm, storage, client_id, required_tier)
+}
+
+/// An app is closed with a frame of its still on the way through the server, and opened:
+/// the new engine's connection is counted before the old engine's frame is taken up. The
+/// frame is the old engine's, which was told; the answer a new connection is owed is owed
+/// to what comes on that connection.
+#[test]
+fn a_subscription_on_its_way_when_a_new_connection_opened_does_not_take_its_answer() {
+    let tier = DurabilityTier::EdgeServer;
+    let (mut server_qm, mut storage, client_id, _first) =
+        a_subscription_answered_and_confirmed(Some(tier), Some(tier));
+    let old = server_qm.sync_manager().client_connection(client_id);
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let new = server_qm.sync_manager().client_connection(client_id);
+
+    let late = send_the_subscription_on(&mut server_qm, &mut storage, client_id, Some(tier), old);
+    assert_eq!(
+        settled_tiers(&late, client_id),
+        Vec::new(),
+        "the engine that sent it was told on its own connection, and is gone"
+    );
+
+    let asked = send_the_subscription_on(&mut server_qm, &mut storage, client_id, Some(tier), new);
+    assert_eq!(
+        settled_tiers(&asked, client_id),
+        vec![(tier, 1)],
+        "the new engine's subscription found its answer taken by a frame of the old one, \
+         and its read waits for ever"
+    );
+}
+
+/// A client may have more than one connection open. Each is a reader that was told
+/// nothing, whichever of them the subscription first came from.
+#[test]
+fn each_connection_a_client_has_open_is_answered_the_first_time_it_asks() {
+    let tier = DurabilityTier::EdgeServer;
+    let (mut server_qm, mut storage) =
+        create_query_manager(SyncManager::new().with_durability_tier(tier), test_schema());
+    server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("Alice".into()), Value::Integer(100)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let client_id = crate::sync_manager::ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let first = server_qm.sync_manager().client_connection(client_id);
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let second = server_qm.sync_manager().client_connection(client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let to_first =
+        send_the_subscription_on(&mut server_qm, &mut storage, client_id, Some(tier), first);
+    assert_eq!(settled_tiers(&to_first, client_id), vec![(tier, 1)]);
+
+    let to_second =
+        send_the_subscription_on(&mut server_qm, &mut storage, client_id, Some(tier), second);
+    assert_eq!(
+        settled_tiers(&to_second, client_id),
+        vec![(tier, 1)],
+        "the subscription was made on the client's older connection, and the newer one \
+         asking for it was taken to have been told"
+    );
+}
+
+/// A client that comes back replays every subscription it holds, and each is answered with
+/// its scope. That is bounded per pass like any other replay: the answers of one client do
+/// not hold the pass for everyone.
+#[test]
+fn a_client_that_comes_back_with_many_subscriptions_is_answered_a_pass_at_a_time() {
+    use crate::sync_manager::{InboxEntry, QueryId, Source, SyncPayload};
+    const SUBSCRIPTIONS: u64 = 40;
+    const PER_PASS: usize = 32;
+
+    let tier = DurabilityTier::EdgeServer;
+    let (mut server_qm, mut storage) =
+        create_query_manager(SyncManager::new().with_durability_tier(tier), test_schema());
+    server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("Alice".into()), Value::Integer(100)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+    let client_id = crate::sync_manager::ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    // Every subscription the client holds, sent at once; then pass after pass until the
+    // server has nothing more to say. Returns how many it answered in each pass.
+    let send_them_all = |server_qm: &mut QueryManager, storage: &mut MemoryStorage| {
+        let query = server_qm
+            .query("users")
+            .filter_gt("score", Value::Integer(50))
+            .build();
+        for id in 1..=SUBSCRIPTIONS {
+            server_qm.sync_manager_mut().push_inbox(InboxEntry {
+                source: Source::Client(client_id),
+                payload: SyncPayload::QuerySubscription {
+                    query_id: QueryId(id),
+                    query: Box::new(query.clone()),
+                    session: None,
+                    required_tier: Some(tier),
+                    propagation: crate::sync_manager::QueryPropagation::Full,
+                    policy_context_tables: vec![],
+                },
+            });
+        }
+        let mut answered = Vec::new();
+        loop {
+            server_qm.process(storage);
+            let sent = server_qm.sync_manager_mut().take_outbox();
+            if sent.is_empty() {
+                return answered;
+            }
+            confirm_delivered(server_qm, &sent);
+            answered.push(
+                sent.iter()
+                    .filter(|entry| matches!(entry.payload, SyncPayload::QuerySettled { .. }))
+                    .count(),
+            );
+        }
+    };
+
+    let first = send_them_all(&mut server_qm, &mut storage);
+    assert_eq!(
+        first.iter().sum::<usize>(),
+        SUBSCRIPTIONS as usize,
+        "not every subscription was answered the first time, so nothing below measures a \
+         replay"
+    );
+
+    server_qm
+        .sync_manager_mut()
+        .note_client_connected(client_id);
+    let replay = send_them_all(&mut server_qm, &mut storage);
+
+    assert_eq!(replay, vec![PER_PASS, SUBSCRIPTIONS as usize - PER_PASS]);
+}
+
 #[test]
 fn pending_duplicate_server_subscription_is_compiled_once() {
     use crate::sync_manager::{ClientId, Destination, InboxEntry, QueryId, Source, SyncPayload};

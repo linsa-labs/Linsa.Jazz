@@ -463,26 +463,25 @@ async fn handle_ws_connection(
     }
     state.on_client_connected(client_id).await;
 
-    // 5. Ensure the client state in the runtime.
-    match setup {
-        WsClientSetup::Backend => {
-            let _ = state
-                .runtime
-                .ensure_client_as_backend_with_catalogue_state_hash(
-                    client_id,
-                    handshake.catalogue_state_hash.as_deref(),
-                );
-        }
-        WsClientSetup::Session(session) => {
-            let _ = state
-                .runtime
-                .ensure_client_with_session_and_catalogue_state_hash(
-                    client_id,
-                    session,
-                    handshake.catalogue_state_hash.as_deref(),
-                );
-        }
+    // 5. Ensure the client state in the runtime. Which of the client's connections this
+    // socket is goes with every frame read from it: what a client was told about a
+    // subscription is known per connection.
+    let connection = match setup {
+        WsClientSetup::Backend => state
+            .runtime
+            .ensure_client_as_backend_with_catalogue_state_hash(
+                client_id,
+                handshake.catalogue_state_hash.as_deref(),
+            ),
+        WsClientSetup::Session(session) => state
+            .runtime
+            .ensure_client_with_session_and_catalogue_state_hash(
+                client_id,
+                session,
+                handshake.catalogue_state_hash.as_deref(),
+            ),
     }
+    .ok();
 
     // 5a. Record whether this client confirms what it applies. Known here, before it
     // subscribes, which is what the delivery bookkeeping needs: a client that does not
@@ -557,7 +556,10 @@ async fn handle_ws_connection(
                     let Some(payload) = crate::transport_manager::frame_decode(&data) else {
                         continue;
                     };
-                    if let Err(e) = state.process_ws_client_frame(client_id, &payload).await {
+                    if let Err(e) = state
+                        .process_ws_client_frame_on_connection(client_id, connection, &payload)
+                        .await
+                    {
                         tracing::warn!(error = ?e, "ws client frame rejected");
                     }
                 }

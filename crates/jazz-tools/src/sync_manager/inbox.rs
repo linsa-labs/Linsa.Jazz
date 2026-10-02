@@ -2969,6 +2969,10 @@ impl SyncManager {
                     ?propagation,
                     "jazz trace received query subscription from client"
                 );
+                let connection = self
+                    .subscriptions_asked_on
+                    .remove(&(client_id, *query_id))
+                    .unwrap_or_else(|| self.client_connection(client_id));
                 self.pending_query_subscriptions
                     .push(PendingQuerySubscription {
                         client_id,
@@ -2978,6 +2982,7 @@ impl SyncManager {
                         required_tier: *required_tier,
                         propagation: *propagation,
                         policy_context_tables: policy_context_tables.clone(),
+                        connection,
                     });
             }
             // Handle query unsubscription

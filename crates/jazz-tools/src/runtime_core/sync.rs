@@ -142,6 +142,14 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
     // Sync Operations
     // =========================================================================
 
+    /// Which of its connections a client is on (`SyncManager::client_connection`).
+    pub fn client_connection(&self, client_id: ClientId) -> u64 {
+        self.schema_manager
+            .query_manager()
+            .sync_manager()
+            .client_connection(client_id)
+    }
+
     /// Push a sync message to the inbox (from network).
     pub fn push_sync_inbox(&mut self, entry: InboxEntry) {
         if matches!(

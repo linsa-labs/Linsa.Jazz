@@ -79,6 +79,7 @@ fn memory_size_separates_sync_state_buckets() {
             required_tier: None,
             propagation: QueryPropagation::Full,
             policy_context_tables: vec![],
+            connection: 0,
         });
     sm.pending_query_unsubscriptions
         .push(PendingQueryUnsubscription {

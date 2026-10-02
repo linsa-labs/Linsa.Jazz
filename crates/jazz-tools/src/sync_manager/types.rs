@@ -788,6 +788,8 @@ pub struct PendingQuerySubscription {
     pub required_tier: Option<DurabilityTier>,
     pub propagation: QueryPropagation,
     pub policy_context_tables: Vec<String>,
+    /// The client's connection this was sent on (`SyncManager::client_connection`).
+    pub connection: u64,
 }
 
 /// A pending query unsubscription that needs cleanup.

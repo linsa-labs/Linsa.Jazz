@@ -504,6 +504,10 @@ pub(super) struct ServerQuerySubscription {
     /// Flag indicating this server subscription has settled at least once.
     /// Used to emit QuerySettled to the client on first settlement.
     pub(super) settled_once: bool,
+    /// The connection of the client's on which it last sent this subscription
+    /// (`PendingQuerySubscription::connection`). The first time a connection asks, it is
+    /// answered.
+    pub(super) asked_on_connection: u64,
     /// Whether this subscription should be propagated to upstream servers.
     pub(super) propagation: QueryPropagation,
     /// Schema mismatch warnings already emitted for the latest settled state.

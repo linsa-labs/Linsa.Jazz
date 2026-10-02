@@ -634,6 +634,19 @@ impl ServerState {
         client_id: ClientId,
         payload: &[u8],
     ) -> Result<(), String> {
+        self.process_ws_client_frame_on_connection(client_id, None, payload)
+            .await
+    }
+
+    /// As `process_ws_client_frame`, for a frame read from the socket that opened
+    /// `connection` (what `ensure_client_*` returned for it). A client can have several
+    /// sockets open, and what it was told is known per socket.
+    pub async fn process_ws_client_frame_on_connection(
+        &self,
+        client_id: ClientId,
+        connection: Option<u64>,
+        payload: &[u8],
+    ) -> Result<(), String> {
         if self.shutdown.is_shutting_down() {
             return Err("server is shutting down".to_string());
         }
@@ -645,7 +658,7 @@ impl ServerState {
             };
             return self
                 .runtime
-                .push_sync_inbox(inbox)
+                .push_client_sync_inbox(vec![inbox], connection)
                 .map_err(|e| e.to_string());
         }
 
@@ -660,7 +673,7 @@ impl ServerState {
                     })
                     .collect();
                 self.runtime
-                    .push_sync_inbox_batch(entries)
+                    .push_client_sync_inbox(entries, connection)
                     .map_err(|e| e.to_string())
             }
             Err(e) => Err(format!("invalid ws payload: {e}")),

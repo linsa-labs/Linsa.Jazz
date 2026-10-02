@@ -119,6 +119,7 @@ fn remove_client_cleans_pending_query_subscriptions() {
             required_tier: None,
             propagation: QueryPropagation::Full,
             policy_context_tables: vec![],
+            connection: 0,
         });
     sm.pending_query_subscriptions
         .push(PendingQuerySubscription {
@@ -129,12 +130,44 @@ fn remove_client_cleans_pending_query_subscriptions() {
             required_tier: None,
             propagation: QueryPropagation::Full,
             policy_context_tables: vec![],
+            connection: 0,
         });
 
     sm.remove_client(alice);
 
     assert_eq!(sm.pending_query_subscriptions.len(), 1);
     assert_eq!(sm.pending_query_subscriptions[0].client_id, bob);
+}
+
+/// A subscription received from a client and not yet taken up goes with the client when it
+/// is reaped: the connection it was asked on means nothing to the state that replaces it,
+/// which counts its connections from one again.
+#[test]
+fn a_reaped_clients_subscriptions_on_their_way_are_forgotten_with_it() {
+    let mut sm = SyncManager::new();
+    let io = MemoryStorage::new();
+    let alice = ClientId::new();
+    let bob = ClientId::new();
+    add_client(&mut sm, &io, alice);
+    add_client(&mut sm, &io, bob);
+    assert_eq!(
+        sm.client_connection(alice),
+        1,
+        "a client's connections are counted from its first; none is zero",
+    );
+
+    sm.note_subscription_asked_on(alice, QueryId(0), sm.client_connection(alice));
+    sm.note_subscription_asked_on(alice, QueryId(1), sm.client_connection(alice));
+    sm.note_subscription_asked_on(bob, QueryId(0), sm.client_connection(bob));
+
+    assert!(sm.remove_client(alice));
+
+    assert_eq!(
+        sm.subscriptions_asked_on.keys().collect::<Vec<_>>(),
+        vec![&(bob, QueryId(0))],
+        "what a reaped client asked on a connection it no longer has is still kept",
+    );
+    assert_eq!(sm.client_connection(alice), 0);
 }
 
 #[test]

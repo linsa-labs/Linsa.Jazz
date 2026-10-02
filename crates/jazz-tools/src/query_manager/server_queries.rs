@@ -1535,15 +1535,30 @@ impl QueryManager {
                 if let Some(existing) = self
                     .server_subscriptions
                     .get_mut(&(sub.client_id, sub.query_id))
-                    && Self::should_emit_query_settled_to_downstream(
+                {
+                    // A subscription is a question, and what this client was told about it
+                    // is known only for the connection it was told on. The engine at the
+                    // end of a new one may be the one that was told, replaying what it
+                    // holds — or a new one under the same client id, whose query ids start
+                    // over, asking what the last asked: an app closed and opened again.
+                    // That one holds no answer, and a read that waits for this tier waits
+                    // for as long as it is given none. So the first time a connection
+                    // asks, it is answered from the scope this node already holds — nothing
+                    // is derived again. Asked twice on one connection, it was told.
+                    let first_on_this_connection = existing.asked_on_connection != sub.connection;
+                    existing.asked_on_connection = sub.connection;
+                    if first_on_this_connection {
+                        existing.sent_below_required_settled = false;
+                    }
+                    if Self::should_emit_query_settled_to_downstream(
                         existing.required_tier,
                         settled_tier,
                         &mut existing.sent_below_required_settled,
                         &mut existing.last_emitted_settled_tier,
-                        false,
-                    )
-                {
-                    emission_scope = Some(existing.last_scope.clone());
+                        first_on_this_connection,
+                    ) {
+                        emission_scope = Some(existing.last_scope.clone());
+                    }
                 }
 
                 if let Some(scope) = emission_scope.as_ref() {
@@ -1553,6 +1568,17 @@ impl QueryManager {
                         settled_tier,
                         scope,
                     );
+                    // A client that comes back replays every subscription it holds, and
+                    // each is answered with its scope: the same bound as any other replay.
+                    if self.sync_manager.outbox().len() >= MAX_INITIAL_QUERY_REPLAY_OUTBOX_PER_PASS
+                    {
+                        for remaining_key in pending_keys.iter().skip(key_index + 1) {
+                            if let Some(sub) = pending_by_key.remove(remaining_key) {
+                                deferred.push(sub);
+                            }
+                        }
+                        break;
+                    }
                 }
 
                 continue;
@@ -1887,6 +1913,7 @@ impl QueryManager {
                     needs_recompile: false,
                     needs_reauthorization: false,
                     settled_once,
+                    asked_on_connection: sub.connection,
                     propagation: sub.propagation,
                     reported_schema_warnings,
                     includes_past_page,
