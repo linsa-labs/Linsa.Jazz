@@ -29,6 +29,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
 ] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 uniffi = { version = "0.30.0", features = ["build"] }
 # Compiles the Apple unified-logging shim (src/os_log_shim.c); skipped on
