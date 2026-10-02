@@ -1106,6 +1106,12 @@ fn seal_batch_rejects_members_spanning_multiple_target_branches() {
             reason: "sealed batch rows must belong to the declared target branch".to_string(),
         })
     );
+    let withdrawn = sm.take_pending_row_withdrawals();
+    assert!(
+        withdrawn.contains(&main_row_id) && withdrawn.contains(&draft_row_id),
+        "rows of a rejected batch were not reported to whoever keeps something per row: \
+         {withdrawn:?}"
+    );
     assert_eq!(
         io.load_visible_region_row("users", "main", main_row_id)
             .unwrap(),

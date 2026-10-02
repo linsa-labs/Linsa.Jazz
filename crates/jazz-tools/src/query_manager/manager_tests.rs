@@ -164,6 +164,8 @@ struct CountingCatalogueUpsertsStorage {
     catalogue_loads: Cell<usize>,
     visible_query_loads: Cell<usize>,
     visible_region_scans: Cell<usize>,
+    /// The visible row load that panics, counted from when it was armed.
+    visible_query_load_that_panics: Cell<Option<usize>>,
 }
 
 impl CountingCatalogueUpsertsStorage {
@@ -178,7 +180,13 @@ impl CountingCatalogueUpsertsStorage {
             catalogue_loads: Cell::new(0),
             visible_query_loads: Cell::new(0),
             visible_region_scans: Cell::new(0),
+            visible_query_load_that_panics: Cell::new(None),
         }
+    }
+
+    /// The `nth` visible row load from now panics, as a binding's storage can.
+    fn panic_at_visible_query_load(&self, nth: usize) {
+        self.visible_query_load_that_panics.set(Some(nth));
     }
 
     fn catalogue_upserts(&self) -> usize {
@@ -317,6 +325,14 @@ impl Storage for CountingCatalogueUpsertsStorage {
     ) -> Result<Option<crate::row_histories::QueryRowBatch>, StorageError> {
         self.visible_query_loads
             .set(self.visible_query_loads.get() + 1);
+        match self.visible_query_load_that_panics.get() {
+            Some(0) | Some(1) => {
+                self.visible_query_load_that_panics.set(None);
+                panic!("injected: a visible row load failed");
+            }
+            Some(left) => self.visible_query_load_that_panics.set(Some(left - 1)),
+            None => {}
+        }
         self.inner.load_visible_query_row(table, branch, row_id)
     }
 
@@ -1355,6 +1371,7 @@ mod empty_binding_fills;
 mod include_routing_liveness;
 mod joins;
 mod json_storage;
+mod kept_verdicts;
 mod local_write_exemption;
 mod misc;
 mod policies;

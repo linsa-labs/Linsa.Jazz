@@ -13,7 +13,7 @@ use crate::sync_manager::{
     ClientId, ClientRole, DurabilityTier, PendingPermissionCheck, SyncPayload,
 };
 
-use super::authz_cache::{AuthzMarker, AuthzSessionKey};
+use super::authz_cache::{AuthzMarker, AuthzScope, AuthzSessionKey};
 use super::graph::IncludePlacement;
 use super::manager::{QueryManager, SchemaWarningAccumulator, ServerQuerySubscription};
 use super::policy::{ComplexClause, Operation, PolicyExpr};
@@ -41,32 +41,23 @@ enum AuthorizedTuplesResult {
 /// The sanctioned branch universe read-path policy evaluation sees: the
 /// authorization context's whole same-lineage family (current + activated
 /// live generations), i.e. the same cross-branch universe plain reads serve
-/// (defects 19/22/23/24). Carries a fingerprint so cached verdicts computed
-/// under another universe are never served (the family can grow without the
-/// authorization schema hash or generation moving).
+/// (defects 19/22/23/24). The family can grow without the authorization schema hash
+/// or generation moving, so the branches are part of the scope a verdict is kept under
+/// (`AuthzVerdictCache::scope`): one reached under another universe is never served.
 pub(super) struct ReadPolicyBranchUniverse {
     pub(super) branches: Vec<String>,
-    pub(super) fingerprint: u64,
 }
 
 impl ReadPolicyBranchUniverse {
     pub(super) fn from_authorization_context(
         auth_context: &crate::schema_manager::SchemaContext,
     ) -> Self {
-        use std::hash::{Hash, Hasher};
         let branches: Vec<String> = auth_context
             .all_branch_names()
             .into_iter()
             .map(|branch| branch.as_str().to_string())
             .collect();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for branch in &branches {
-            branch.hash(&mut hasher);
-        }
-        Self {
-            fingerprint: hasher.finish(),
-            branches,
-        }
+        Self { branches }
     }
 }
 
@@ -674,6 +665,8 @@ impl QueryManager {
         object_id: ObjectId,
         branch_name: BranchName,
         session: Option<&Session>,
+        session_key: AuthzSessionKey,
+        scope: AuthzScope,
         auth_schema: &Schema,
         auth_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
@@ -691,16 +684,16 @@ impl QueryManager {
         // policy evaluation per row, making write cost proportional to subscribed
         // result sizes. Invalidation happens where visibility effects are applied
         // (changed rows, policy-dependency tables, schema/mode changes).
+        self.forget_verdicts_of_withdrawn_rows();
         let marker = AuthzMarker {
             schema_hash: auth_context.current_hash,
             auth_generation: self.authz_schema_generation,
             mode: self.row_policy_mode,
-            branch_universe: universe.fingerprint,
+            context_epoch: self.authz_context_epoch,
         };
-        let session_key = AuthzSessionKey::for_session(session);
-        if let Some(cached) = self
-            .authz_verdicts
-            .get(marker, object_id, branch_name, session_key)
+        if let Some(cached) =
+            self.authz_verdicts
+                .get(marker, object_id, branch_name, scope, session_key)
         {
             // Parity harness: in debug builds every hit is re-verified against a fresh
             // evaluation, so the whole test suite continuously checks the cache's
@@ -741,13 +734,22 @@ impl QueryManager {
             universe,
         );
         if let Some(table) = table {
+            // A policy that reads neither the row nor anything else.
+            let constant = matches!(
+                auth_schema
+                    .get(&table)
+                    .and_then(|table_schema| table_schema.policies.select_policy()),
+                Some(PolicyExpr::True)
+            );
             self.authz_verdicts.store(
                 marker,
                 object_id,
                 branch_name,
                 table,
+                scope,
                 session_key,
                 verdict,
+                constant,
                 auth_schema,
             );
         }
@@ -853,6 +855,11 @@ impl QueryManager {
 
         let universe = ReadPolicyBranchUniverse::from_authorization_context(&auth_context);
         let mut authorization_cache: HashMap<(ObjectId, BranchName), bool> = HashMap::new();
+        // Keying a session serializes its claims: once per walk, not once per row.
+        let session_key = self.authz_verdicts.session_key(session);
+        let scope = self
+            .authz_verdicts
+            .scope(&universe.branches, source_branch_schema_map);
 
         // Policy clips at its own level (defect 24): the verdicts of the
         // tuple's IDENTITY rows — the outer row and every join leg, whose
@@ -877,6 +884,8 @@ impl QueryManager {
                                     object_id,
                                     branch_name,
                                     session,
+                                    session_key,
+                                    scope,
                                     &auth_schema,
                                     &auth_context,
                                     source_branch_schema_map,
@@ -1226,6 +1235,11 @@ impl QueryManager {
 
         let universe = ReadPolicyBranchUniverse::from_authorization_context(&auth_context);
         let mut authorization_cache: HashMap<(ObjectId, BranchName), bool> = HashMap::new();
+        // Keying a session serializes its claims: once per walk, not once per row.
+        let session_key = self.authz_verdicts.session_key(session);
+        let scope = self
+            .authz_verdicts
+            .scope(&universe.branches, source_branch_schema_map);
 
         // Policy clips at its own level (defect 24): a tuple stays in scope
         // when its IDENTITY rows (outer row and join legs) are readable — a
@@ -1245,6 +1259,8 @@ impl QueryManager {
                                 object_id,
                                 branch_name,
                                 session,
+                                session_key,
+                                scope,
                                 &auth_schema,
                                 &auth_context,
                                 source_branch_schema_map,

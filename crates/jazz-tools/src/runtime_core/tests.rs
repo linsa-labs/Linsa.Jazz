@@ -2369,6 +2369,7 @@ mod delivery_convergence_differential;
 mod fk_remove_error;
 mod incremental_scan;
 mod install_transport_tests;
+mod kept_verdict_differential;
 mod locator_ladder_heal;
 mod policy_dependency_differential;
 mod policy_dependency_rejection;

@@ -580,6 +580,7 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
 
         let mut withdrawn = Vec::new();
         let query_manager = self.schema_manager.query_manager_mut();
+        let patched_by_batch = !cleared_rows.is_empty();
         for (
             table,
             schema_hash,
@@ -660,6 +661,16 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
             } else {
                 query_manager.clear_local_pending_row_overlay(&table, row_id);
             }
+        }
+
+        // The patches by batch id above go over every row of the batch in a table — on any
+        // branch, tracked here or not — and can take a row out of sight. Which rows those
+        // were only the patch knows, and a kept verdict carries the table name of the
+        // authorization schema, not the one the patch went by. So everything kept goes: a
+        // rejected or rolled-back local batch costs the next settle a check of every row it
+        // serves, as every write did before verdicts were kept.
+        if patched_by_batch {
+            query_manager.forget_every_kept_verdict();
         }
 
         // Rows this node had made visible may have reached its clients. A client that was sent only

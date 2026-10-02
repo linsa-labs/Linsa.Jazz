@@ -266,6 +266,8 @@ impl SyncManager {
             )
             .ok()
             .flatten();
+            // Told whatever the patch returned: it returns nothing when the row is gone.
+            self.row_withdrawn(row.row_id);
 
             if let Some(update) = visibility_change {
                 self.pending_row_visibility_changes.push(update);

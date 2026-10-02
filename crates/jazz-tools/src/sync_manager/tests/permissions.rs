@@ -256,6 +256,81 @@ fn rejecting_one_user_write_rejects_the_whole_direct_batch() {
     );
 }
 
+/// The approved member of a batch is visible until another member is refused, and the
+/// rejection then takes it out of sight with nothing to show in its place. That is not
+/// a visibility change — there is no row to carry — so the row is named on its own, for
+/// whoever keeps something about it.
+#[test]
+fn a_row_a_rejection_takes_out_of_sight_is_reported_withdrawn() {
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);
+    let mut io = MemoryStorage::new();
+    seed_users_schema(&mut io);
+    let client_id = ClientId::new();
+    let batch_id = BatchId::new();
+    let alice_id = ObjectId::new();
+    let bob_id = ObjectId::new();
+
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::User);
+    sm.set_client_session(
+        client_id,
+        crate::query_manager::session::Session::new("alice"),
+    );
+    sm.take_outbox();
+
+    for (row_id, at, name) in [
+        (alice_id, 1_000, b"alice".as_slice()),
+        (bob_id, 1_001, b"bob"),
+    ] {
+        sm.process_from_client(
+            &mut io,
+            client_id,
+            SyncPayload::RowBatchCreated {
+                metadata: Some(RowMetadata {
+                    id: row_id,
+                    metadata: row_metadata("users"),
+                }),
+                row: row_with_batch_state(
+                    visible_row(row_id, "main", Vec::new(), at, name),
+                    batch_id,
+                    crate::row_histories::RowState::VisibleDirect,
+                    Some(DurabilityTier::Local),
+                ),
+            },
+        );
+    }
+    let mut pending = sm.take_pending_permission_checks();
+    assert_eq!(pending.len(), 2);
+    sm.approve_permission_check(&mut io, pending.remove(0));
+    assert!(
+        io.load_visible_region_row("users", "main", alice_id)
+            .unwrap()
+            .is_some(),
+        "fixture: the approved member is visible"
+    );
+    assert!(sm.take_pending_row_withdrawals().is_empty(), "fixture");
+    sm.take_pending_row_visibility_changes();
+
+    sm.reject_permission_check(&mut io, pending.remove(0), "bob denied".to_string());
+
+    assert_eq!(
+        io.load_visible_region_row("users", "main", alice_id)
+            .unwrap(),
+        None,
+        "fixture: the rejection took the approved member out of sight"
+    );
+    assert!(
+        sm.take_pending_row_visibility_changes()
+            .iter()
+            .all(|change| change.object_id != alice_id),
+        "fixture: no visibility change carries a row that is gone"
+    );
+    assert!(
+        sm.take_pending_row_withdrawals().contains(&alice_id),
+        "a row left the store and nobody who keeps anything about it was told"
+    );
+}
+
 #[test]
 fn row_batch_created_from_user_with_older_exact_history_match_skips_permission_check() {
     let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::Local);

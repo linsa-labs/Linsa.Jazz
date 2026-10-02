@@ -268,6 +268,10 @@ pub struct SyncManager {
     pub(super) pending_query_unsubscriptions: Vec<PendingQueryUnsubscription>,
     /// Row visibility changes applied through row-history sync.
     pub(super) pending_row_visibility_changes: Vec<RowVisibilityChange>,
+    /// Rows a rejected batch was a version of. A rejection can take a row out of sight
+    /// with nothing to show in its place, and that is not a visibility change — there
+    /// is no row to carry — so whoever keeps anything per row is told here.
+    pub(super) pending_row_withdrawals: Vec<ObjectId>,
     /// Catalogue/system entry updates awaiting SchemaManager processing.
     pub(super) pending_catalogue_updates: Vec<CatalogueEntry>,
     /// Digest of every catalogue entry this node has already handed to the
@@ -479,6 +483,7 @@ impl SyncManager {
             pending_query_subscriptions: Vec::new(),
             pending_query_unsubscriptions: Vec::new(),
             pending_row_visibility_changes: Vec::new(),
+            pending_row_withdrawals: Vec::new(),
             pending_catalogue_updates: Vec::new(),
             handed_to_schema_layer: HashMap::new(),
             next_pending_id: 0,
@@ -1603,6 +1608,17 @@ impl SyncManager {
     /// into indices and subscriptions.
     pub fn take_pending_row_visibility_changes(&mut self) -> Vec<RowVisibilityChange> {
         std::mem::take(&mut self.pending_row_visibility_changes)
+    }
+
+    /// A batch of `row_id` was rejected: the row may have gone out of sight.
+    pub(crate) fn row_withdrawn(&mut self, row_id: ObjectId) {
+        self.pending_row_withdrawals.push(row_id);
+    }
+
+    /// Take the rows whose batch was rejected since the last call, for QueryManager to
+    /// drop what it keeps about them.
+    pub fn take_pending_row_withdrawals(&mut self) -> Vec<ObjectId> {
+        std::mem::take(&mut self.pending_row_withdrawals)
     }
 
     /// Take pending catalogue/system entry updates for QueryManager/SchemaManager.

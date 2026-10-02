@@ -605,6 +605,9 @@ pub struct QueryManager {
     pub(super) authorization_context_cache: HashMap<(String, String), Arc<SchemaContext>>,
     /// Cross-tick row-authorization verdicts. See `authz_cache`.
     pub(super) authz_verdicts: super::authz_cache::AuthzVerdictCache,
+    /// How many times the authorization contexts were thrown away. Part of what a kept
+    /// verdict belongs to: a context is what its row was transformed through.
+    pub(super) authz_context_epoch: u64,
     /// Bumped on every authorization-schema assignment; part of the verdict-cache
     /// marker so republished permissions invalidate cached verdicts even when the
     /// data-schema hash is unchanged.
@@ -863,6 +866,7 @@ impl QueryManager {
             authorization_schema_required: false,
             authorization_context_cache: HashMap::new(),
             authz_verdicts: super::authz_cache::AuthzVerdictCache::default(),
+            authz_context_epoch: 0,
             authz_schema_generation: 0,
             pending_catalogue_updates: Vec::new(),
             subscriptions: HashMap::new(),
@@ -940,7 +944,7 @@ impl QueryManager {
         self.select_policy_deps.clear();
         self.policy_read_tables = None;
         self.authz_schema_generation += 1;
-        self.authorization_context_cache.clear();
+        self.forget_authorization_contexts();
         self.authorization_schema_required = false;
         self.write_table_cache.clear();
 
@@ -954,10 +958,32 @@ impl QueryManager {
         self.mark_schema_catalogue_dirty(self.schema_context.current_hash);
     }
 
+    /// Throws the authorization contexts away, to be rebuilt from what the runtime knows
+    /// now. Verdicts reached through the old ones go with them: the one place either is
+    /// dropped, so neither outlives the other.
+    pub(super) fn forget_authorization_contexts(&mut self) {
+        self.authorization_context_cache.clear();
+        self.authz_context_epoch += 1;
+    }
+
+    /// Test hook: while set, no row-authorization verdict is served or kept — every one
+    /// is evaluated from storage. What a comparison against the kept verdicts is made
+    /// with.
+    #[cfg(any(test, feature = "test"))]
+    pub fn bypass_authz_verdicts_for_tests(&mut self, bypassed: bool) {
+        self.authz_verdicts.bypassed = bypassed;
+    }
+
     /// How many row-authorization verdicts were served from the cross-tick cache.
     /// Exposed for tests and diagnostics.
     pub fn authz_cache_hit_count(&self) -> u64 {
         self.authz_verdicts.hit_count()
+    }
+
+    /// How many row-authorization verdicts had to be evaluated: a row load and a policy
+    /// evaluation each. Exposed for tests and diagnostics.
+    pub fn authz_cache_miss_count(&self) -> u64 {
+        self.authz_verdicts.miss_count()
     }
 
     /// How many times the authorization schema has been replaced. Each bump
@@ -973,7 +999,7 @@ impl QueryManager {
         self.select_policy_deps.clear();
         self.policy_read_tables = None;
         self.authz_schema_generation += 1;
-        self.authorization_context_cache.clear();
+        self.forget_authorization_contexts();
         self.row_policy_mode = RowPolicyMode::Enforcing;
         self.authorization_schema_required = true;
         self.mark_subscriptions_for_recompile();
@@ -982,7 +1008,7 @@ impl QueryManager {
     pub fn require_authorization_schema(&mut self) {
         self.row_policy_mode = RowPolicyMode::Enforcing;
         self.authorization_schema_required = true;
-        self.authorization_context_cache.clear();
+        self.forget_authorization_contexts();
     }
 
     /// Add a live schema (one we can read from but don't write to).
@@ -1017,7 +1043,7 @@ impl QueryManager {
 
         // A cached authorization context predating this activation stays
         // blind to the new generation and denies its rows (defect 23).
-        self.authorization_context_cache.clear();
+        self.forget_authorization_contexts();
 
         // Mark subscriptions for recompile to pick up new branch
         self.mark_subscriptions_for_recompile();
@@ -1028,7 +1054,7 @@ impl QueryManager {
     /// Also attempts to activate any pending schemas that may now be reachable.
     pub fn register_lens(&mut self, lens: super::super::schema_manager::lens::Lens) {
         self.schema_context.register_lens(lens);
-        self.authorization_context_cache.clear();
+        self.forget_authorization_contexts();
 
         // Try to activate pending schemas
         let activated = self.schema_context.try_activate_pending();
@@ -1928,6 +1954,10 @@ impl QueryManager {
         // A panic inside the settle loop that a binding catches and survives leaves this set
         // until here, and a retire before then trips the debug assertion.
         self.in_settle_loop = false;
+        // The same panic leaves the verdicts' pass open, and what this call reaches before
+        // its own pass would be kept as that one's: over storage this call is about to
+        // write.
+        self.authz_verdicts.end_pass();
 
         if let Err(error) = self.ensure_known_schemas_catalogued(storage) {
             tracing::warn!(%error, "failed to persist known schemas to catalogue storage");
@@ -2049,6 +2079,10 @@ impl QueryManager {
         let storage_ref: &dyn Storage = storage;
         let subscription_ids: Vec<_> = self.subscriptions.keys().copied().collect();
 
+        // From here to the end of the pass storage is only read, so a verdict reached
+        // for one subscription holds for the next.
+        self.authz_verdicts.begin_pass();
+        let mut authorization_context = None;
         self.in_settle_loop = true;
         for sub_id in subscription_ids {
             let Some(subscription) = self.subscriptions.get_mut(&sub_id) else {
@@ -2224,15 +2258,21 @@ impl QueryManager {
             }
 
             let mut visible_tuples = if subscription.uses_explicit_authorization_filtering {
-                let auth_schema_context = self.schema_context.clone();
-                let auth_branch_schema_map = self.branch_schema_map.clone();
+                // Neither changes while the pass runs: copied once for it, not once for
+                // each subscription it settles.
+                let (auth_schema_context, auth_branch_schema_map) = authorization_context
+                    .get_or_insert_with(|| {
+                        (self.schema_context.clone(), self.branch_schema_map.clone())
+                    });
+                let (auth_schema_context, auth_branch_schema_map) =
+                    (&*auth_schema_context, &*auth_branch_schema_map);
                 let mut settlement_eval_cache = SettlementEvalCache::default();
                 Cow::Owned(self.authorized_tuples_from_graph_with_cache(
                     storage_ref,
                     &mut settlement_eval_cache,
                     &subscription.graph,
-                    &auth_schema_context,
-                    &auth_branch_schema_map,
+                    auth_schema_context,
+                    auth_branch_schema_map,
                     subscription.session.as_ref(),
                 ))
             } else {
@@ -2379,6 +2419,11 @@ impl QueryManager {
 
         // 8. Settle server-side subscriptions and update scopes
         self.settle_server_subscriptions(storage_ref);
+        self.authz_verdicts.end_pass();
+        // A runtime that reads no verdict — no subscription with a session, a permissive
+        // mode — is still told of every row a rejection withdraws: what it was told in
+        // this call does not wait for a read that may never come.
+        self.forget_verdicts_of_withdrawn_rows();
     }
 
     pub(super) fn handle_row_update_with_origin(
@@ -3113,6 +3158,28 @@ impl QueryManager {
                 server_sub.graph.mark_rows_updated(table, ids);
             }
         }
+    }
+
+    /// A rejected batch can take a row out of sight without leaving a version to show
+    /// in its place, and such a change is not a visibility change anyone is told about:
+    /// there is no row to tell them. Its kept verdict must still go — a row that is
+    /// gone is denied to everyone, and the verdict says it is allowed.
+    ///
+    /// Called where a verdict is about to be read, so none is read with a withdrawal
+    /// pending, wherever the rejection happened and whichever walk asks.
+    pub(super) fn forget_verdicts_of_withdrawn_rows(&mut self) {
+        let withdrawn = self.sync_manager.take_pending_row_withdrawals();
+        if !withdrawn.is_empty() {
+            self.authz_verdicts
+                .invalidate(std::iter::empty(), withdrawn);
+        }
+    }
+
+    /// A patch went over every row of a batch, whichever rows those were and whatever
+    /// table name the authorization schema gives them: nothing kept is known to describe
+    /// what is stored now.
+    pub(crate) fn forget_every_kept_verdict(&mut self) {
+        self.authz_verdicts.forget_everything();
     }
 
     pub(crate) fn mark_local_row_updated_in_subscriptions(&mut self, table: &str, id: ObjectId) {
