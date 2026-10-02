@@ -462,6 +462,7 @@ mod cross_generation_oracle;
 mod cross_generation_visible_split;
 mod delivered_row_reseal;
 mod dropped_payload;
+mod elided_copy_of_a_held_batch;
 mod forwarding_recursion;
 mod frontier_pruning;
 // The whole module runs on `SqliteStorage`: `MemoryStorage` overrides the visible-row

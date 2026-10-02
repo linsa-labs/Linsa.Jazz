@@ -235,7 +235,7 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
     let ApplyRowBatchWithContext {
         object_id,
         branch_name,
-        row,
+        mut row,
         index_mutations,
         row_locator,
         table,
@@ -291,6 +291,23 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
         let existing_row = io
             .load_history_row_batch(&table, branch_name.as_str(), object_id, batch_id)
             .map_err(RowHistoryError::StorageError)?;
+        // What a batch descends from is fixed when it is written, and so is the metadata it
+        // was written with. A copy delivered for a query scope carries neither: the sender
+        // clears the parents (`sync_logic::scope_delivery_row`) and reads the row from its
+        // visible region, which stores no metadata. That says nothing about them, so where
+        // this store already holds the batch, what it holds stands. Taking the copy's
+        // word cut the batch off its own history — its parent, named by nobody any more,
+        // became a tip again, and the next local write merged two states that were never
+        // concurrent — and cost a rebuild of the visible entry from the row's whole
+        // history each time.
+        if let Some(existing) = existing_row.as_ref() {
+            if row.parents.is_empty() && !existing.parents.is_empty() {
+                row.parents = existing.parents.clone();
+            }
+            if row.metadata.is_empty() && !existing.metadata.is_empty() {
+                row.metadata = existing.metadata.clone();
+            }
+        }
         if existing_row.as_ref() == Some(&row) {
             return Ok(ApplyRowBatchResult {
                 batch_id,
