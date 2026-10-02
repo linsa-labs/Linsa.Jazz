@@ -4,12 +4,17 @@
 //! B-tree, WAL mode. Writes are batched into a lazy explicit transaction that
 //! stays open across multiple calls and is committed on `flush()` / `close()`.
 //! Per-operation SAVEPOINTs nested inside that transaction provide rollback
-//! semantics for individual operations. Targets React Native / mobile.
+//! semantics for operations of more than one statement. Targets React Native / mobile.
+//!
+//! The engine writes on the thread that calls it — on a phone, the thread the UI runs
+//! on. `flush_wal()` therefore commits and syncs the log, and leaves moving the log into
+//! the database file to a thread of its own (see [`Checkpointer`]).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::OptionalExtension;
@@ -38,6 +43,165 @@ const MAX_MEMOIZED_PREFIX_KEY_BYTES: usize = 4 * 1024 * 1024;
 /// Prefixes the memo holds an answer for, whatever the answer weighs. The byte bound above
 /// counts keys; a prefix remembered as empty, wide or merely non-empty holds none.
 const MAX_MEMOIZED_PREFIXES: usize = 16_384;
+
+/// Frames the log may hold before a writer that keeps adding to it checkpoints it on its
+/// own thread, when a [`Checkpointer`] is running.
+///
+/// The checkpointer is passive: it moves what is committed when it starts, and the log is
+/// only rewound by a write that begins with all of it moved. A writer that never pauses
+/// begins every transaction with frames the checkpointer has not reached, so the log is
+/// never rewound and grows for as long as the writing lasts — measured, 2.1 GB for 14 000
+/// messages written back to back. So a commit that was added to a log already holding
+/// this many frames moves the log on the writer's thread, as every flush did before
+/// there was a checkpointer; the next write rewinds it.
+///
+/// "Was added to", not "left": one commit may be larger than the bound by itself — the
+/// 1 500 messages a search brings into a 100k-message chat commit some 16 000 frames,
+/// nearly every leaf of the chat's trigram index — and that one is exactly the commit
+/// whose checkpoint must not come back to the thread it was taken off. What a commit
+/// was added to is what the log holds after it less what the commit wrote
+/// ([`log_pages_written`]); a log rewound under the commit comes out as
+/// none, however large the commit and whatever the log held before.
+///
+/// So the log is bounded by this plus the commit that crossed it plus the one that
+/// found it crossed — with two searches back to back, three times this for a moment.
+///
+/// What a commit wrote is counted in pages written to the log, and a page can be written
+/// twice for one frame: a transaction larger than the page cache writes pages out before
+/// it commits, and writes them again if it changes them again — or gives them up, if a
+/// savepoint is rolled back. Such a commit counts for more than the frames it added, and
+/// can find a log just past the bound not yet past it. The next commit does: the count
+/// is of one commit, and does not grow with the log.
+///
+/// 64 MB of 4 KiB pages.
+const WAL_VALVE_FRAMES: u32 = 16_384;
+/// A frame is a page and its header. The log file is cut back to the valve's size when
+/// it is rewound (`journal_size_limit`); without that it keeps the size of the largest
+/// burst it ever held.
+const WAL_FRAME_BYTES: i64 = 4096 + 24;
+/// `SQLITE_DBSTATUS_CACHE_WRITE` is reported in 31 bits.
+const LOG_PAGES_WRITTEN_MASK: u32 = 0x7fff_ffff;
+
+thread_local! {
+    /// Frames in the log after the last commit made on this thread that wrote any, as
+    /// SQLite reports it to the committing connection's log hook. Taken by the commit
+    /// that caused it, before anything else can run on the thread.
+    static LOG_FRAMES_AFTER_COMMIT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn note_log_frames(_: &rusqlite::hooks::Wal, frames: std::ffi::c_int) -> rusqlite::Result<()> {
+    LOG_FRAMES_AFTER_COMMIT.with(|slot| slot.set(u32::try_from(frames).ok()));
+    Ok(())
+}
+
+/// Pages `conn` has written to the log since it was opened: every frame it appended, and
+/// every frame it wrote over again within one transaction — a page spilled from the cache
+/// and changed again. Never fewer than the frames appended, so "what the log holds less
+/// what the commit wrote" never reads a rewound log as one that was added to. Zero if
+/// SQLite will not say, which reads every log as added to: the bound then applies to the
+/// log as a whole.
+fn log_pages_written(conn: &rusqlite::Connection) -> u32 {
+    use rusqlite::ffi;
+    let mut written: std::ffi::c_int = 0;
+    let mut highest: std::ffi::c_int = 0;
+    // SAFETY: the connection is open and borrowed for the call, which reads two counters
+    // of the connection's pagers into the two integers.
+    let status = unsafe {
+        ffi::sqlite3_db_status(
+            conn.handle(),
+            ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+            &raw mut written,
+            &raw mut highest,
+            0,
+        )
+    };
+    if status == ffi::SQLITE_OK {
+        u32::try_from(written).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// How much of the database file is read through when the store opens.
+///
+/// The cost this takes off the engine's thread is the first touch of a page. Storing a
+/// message touches a page of its trigram index for nearly every trigram in it, at random
+/// over the index, and a store just opened has none of them in memory: on the app the
+/// 1 500 messages a search brings read some 12 000 pages one by one, a third of a second
+/// of the tick that stores them (2026-10-01, 100k-message store), and on a device each
+/// of those reads goes to flash. Read once in file order, on the [`Checkpointer`]'s
+/// thread, the same pages are in the operating system's cache when the engine asks.
+///
+/// Bounded: what is read stays in that cache until the system wants the memory back,
+/// and a store larger than this is not the one a phone opens.
+const READ_THROUGH_BYTES: i64 = 256 * 1024 * 1024;
+/// SQLite itself never reads more than 64 KiB at once, and its debug build asserts it.
+const READ_THROUGH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Reads the head of `conn`'s database file once, in file order, and discards it,
+/// calling `between_reads` after each read. Returns the reads it issued.
+///
+/// Through SQLite's own handle to the file, not a descriptor opened here: closing a
+/// second descriptor would release every lock this process holds on the file — POSIX
+/// locks belong to the process, not to the descriptor — and the engine's connection
+/// would go on believing it holds its own. Not through the pager either: nothing is
+/// put in a page cache and no read transaction is held, so the log is not kept from
+/// being rewound while this runs.
+fn read_through(
+    conn: &rusqlite::Connection,
+    stopping: &AtomicBool,
+    mut between_reads: impl FnMut(),
+) -> u64 {
+    use rusqlite::ffi;
+
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: `conn` is an open connection used by this thread alone. The call writes
+    // the connection's own handle to its main database file, which lives as long as
+    // the connection does; `conn` is borrowed until this function returns.
+    let found = unsafe {
+        ffi::sqlite3_file_control(
+            conn.handle(),
+            std::ptr::null(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&raw mut file).cast(),
+        )
+    };
+    if found != ffi::SQLITE_OK || file.is_null() {
+        return 0;
+    }
+    // SAFETY: `file` is the handle just returned. Its method table is null only for a
+    // file that was never opened, and is otherwise static.
+    let Some(read) = (unsafe { (*file).pMethods.as_ref() }).and_then(|methods| methods.xRead)
+    else {
+        return 0;
+    };
+    let mut chunk = vec![0u8; READ_THROUGH_CHUNK_BYTES];
+    let mut reads = 0;
+    let mut offset = 0;
+    while offset < READ_THROUGH_BYTES && !stopping.load(Ordering::Relaxed) {
+        // SAFETY: `chunk` is `READ_THROUGH_CHUNK_BYTES` long and outlives the call. A
+        // read is the one file method SQLite itself calls without holding a lock, as it
+        // does for the header of a database it is opening; what is read is discarded.
+        let done = unsafe {
+            read(
+                file,
+                chunk.as_mut_ptr().cast(),
+                READ_THROUGH_CHUNK_BYTES as std::ffi::c_int,
+                offset,
+            )
+        };
+        reads += 1;
+        // Anything else is the end of the file, or a failure the engine will meet on
+        // its own read of the same page.
+        if done != ffi::SQLITE_OK {
+            break;
+        }
+        offset += READ_THROUGH_CHUNK_BYTES as i64;
+        between_reads();
+    }
+    reads
+}
 
 /// What is known about the keys under one storage-key prefix.
 enum PrefixKeys {
@@ -293,7 +457,253 @@ mod read_path_override {
 #[cfg(any(test, feature = "test"))]
 pub use read_path_override::{SqliteReadPathMode, force_sqlite_read_path};
 
+/// Moves the log into the database file on a thread of its own, over a connection of
+/// its own.
+///
+/// A flush has to leave the writes where they survive the process and the machine going
+/// down, and the commit does that once the log is synced: while a checkpointer runs the
+/// engine's connection commits with `synchronous = FULL`. Moving the log into the
+/// database file is housekeeping — it bounds the log and the reads that have to look
+/// through it — and it is the expensive half: every page the transaction touched is
+/// written a second time and the database file is synced. Done in `flush_wal()` it ran on
+/// the engine's thread at the end of every tick that wrote.
+///
+/// The thread only ever runs passive checkpoints, which wait for nobody and block
+/// nobody: a writer or reader in its way makes the checkpoint stop short, never the other
+/// way round. What it cannot do alone is covered by [`WAL_VALVE_FRAMES`].
+///
+/// Its connection is never the last one of the store to close. The last connection
+/// folds the log away and unlinks it by name; left to this thread, that could happen
+/// after the caller had been told the store was closed, deleted it and opened a new one
+/// at the same path. Everything that drops the engine's connection stops this first.
+struct Checkpointer {
+    /// One slot: a wake that finds it full is asking for a checkpoint already asked for.
+    /// `None` once the thread is known to be gone.
+    wake: Option<SyncSender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Set by [`Self::stop`]: the thread's read of the database file, if it is still at
+    /// it, ends at its next chunk.
+    stopping: Arc<AtomicBool>,
+    /// The thread's last checkpoint failed. The next flush runs the checkpoint itself,
+    /// where a failure is the flush's failure, as it was before there was a thread.
+    failed: Arc<AtomicBool>,
+    /// Set from the opening of a store over a log an earlier process left behind until
+    /// the thread has made the pass it was asked for there: see
+    /// [`Self::move_what_was_left`].
+    moving_what_was_left: Arc<AtomicBool>,
+    #[cfg(test)]
+    probe: Arc<CheckpointerProbe>,
+}
+
+/// What a test may see of, and hold up in, a [`Checkpointer`]'s thread.
+#[cfg(test)]
+#[derive(Default)]
+struct CheckpointerProbe {
+    /// Reads the thread issued as it read the database file through; zero until it has.
+    read_through: std::sync::atomic::AtomicU64,
+    /// Checkpoints the thread has run.
+    passes: std::sync::atomic::AtomicU64,
+    /// The thread is inside a checkpoint, or about to count one.
+    busy: AtomicBool,
+    /// While set, the thread waits before its next checkpoint.
+    stalled: AtomicBool,
+    /// While set, the thread waits between two reads of its read-through.
+    reading_held: AtomicBool,
+    /// Lets a thread that is held go on for one read; it is held again at the next.
+    reading_step: AtomicBool,
+    /// The thread is waiting at `reading_held`.
+    reading_parked: AtomicBool,
+    /// The thread has closed its connection and returned.
+    exited: AtomicBool,
+}
+
+impl Checkpointer {
+    /// `None` if the store has no log to move, or the thread or its connection could not
+    /// be had; the caller then checkpoints as it flushes.
+    fn start(conn: &rusqlite::Connection, path: &Path, reads_through: bool) -> Option<Self> {
+        Self::start_probed(
+            conn,
+            path,
+            reads_through,
+            #[cfg(test)]
+            Arc::new(CheckpointerProbe::default()),
+        )
+    }
+
+    fn start_probed(
+        conn: &rusqlite::Connection,
+        path: &Path,
+        reads_through: bool,
+        #[cfg(test)] probe: Arc<CheckpointerProbe>,
+    ) -> Option<Self> {
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .ok()?;
+        // An in-memory or temporary database has no file another connection could open,
+        // and no log either.
+        if !journal_mode.eq_ignore_ascii_case("wal") || conn.path().is_none_or(str::is_empty) {
+            return None;
+        }
+        // The engine's connection made the file; this one never should.
+        let checkpoints = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        // Only for the schema read a connection's first statement makes; the checkpoint
+        // itself never waits.
+        checkpoints
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .ok()?;
+        let (wake, woken) = sync_channel::<()>(1);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping);
+        let failed = Arc::new(AtomicBool::new(false));
+        let thread_failed = Arc::clone(&failed);
+        let moving_what_was_left = Arc::new(AtomicBool::new(false));
+        let thread_moving_what_was_left = Arc::clone(&moving_what_was_left);
+        #[cfg(test)]
+        let thread_probe = Arc::clone(&probe);
+        let thread = std::thread::Builder::new()
+            .name("jazz-sqlite-checkpoint".to_string())
+            .spawn(move || {
+                let checkpoint = || {
+                    #[cfg(test)]
+                    while thread_probe.stalled.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    #[cfg(test)]
+                    thread_probe.busy.store(true, Ordering::Relaxed);
+                    // A checkpoint stopped short by another connection is not an error:
+                    // what it could not move, the next one will.
+                    if checkpoints
+                        .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+                        .is_err()
+                    {
+                        thread_failed.store(true, Ordering::Relaxed);
+                    }
+                    thread_moving_what_was_left.store(false, Ordering::Relaxed);
+                    #[cfg(test)]
+                    {
+                        thread_probe.passes.fetch_add(1, Ordering::Relaxed);
+                        thread_probe.busy.store(false, Ordering::Relaxed);
+                    }
+                };
+                if reads_through {
+                    // A flush that comes while the file is being read is not kept
+                    // waiting for the end of it: the log it leaves is moved between two
+                    // reads, or a store that writes as it opens would find its log past
+                    // the bound with nobody moving it.
+                    let _reads = read_through(&checkpoints, &thread_stopping, || {
+                        #[cfg(test)]
+                        while thread_probe.reading_held.load(Ordering::Relaxed)
+                            && !thread_stopping.load(Ordering::Relaxed)
+                            && !thread_probe.reading_step.swap(false, Ordering::Relaxed)
+                        {
+                            thread_probe.reading_parked.store(true, Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // As below: once the store is closing, the log is its to fold.
+                        if !thread_stopping.load(Ordering::Relaxed) && woken.try_recv().is_ok() {
+                            checkpoint();
+                        }
+                    });
+                    #[cfg(test)]
+                    thread_probe.read_through.store(_reads, Ordering::Relaxed);
+                }
+                // A checkpoint asked for before the store was told to close is the
+                // closing connection's to make: it folds the log away as it closes.
+                while woken.recv().is_ok() && !thread_stopping.load(Ordering::Relaxed) {
+                    checkpoint();
+                }
+                drop(checkpoints);
+                // Before the thread counts as gone: a wake sent after that finds nobody.
+                drop(woken);
+                #[cfg(test)]
+                thread_probe.exited.store(true, Ordering::Relaxed);
+            })
+            .ok()?;
+        Some(Self {
+            wake: Some(wake),
+            thread: Some(thread),
+            stopping,
+            failed,
+            moving_what_was_left,
+            #[cfg(test)]
+            probe,
+        })
+    }
+
+    /// The store was opened over a log an earlier process left behind: one that died
+    /// without closing, as an app that is killed does. SQLite takes every frame of such
+    /// a log for unmoved, whatever had been moved, and the first commit is added to it —
+    /// which for a log past its bound is exactly what sends the checkpoint back to the
+    /// writer's thread ([`WAL_VALVE_FRAMES`]), all of it, on the first write after a
+    /// launch. So the thread is asked to move it now, and until that pass has ended the
+    /// log is not the writer's to move: [`Self::is_moving_what_was_left`].
+    fn move_what_was_left(&mut self) {
+        self.moving_what_was_left.store(true, Ordering::Relaxed);
+        if !self.wake() {
+            self.moving_what_was_left.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the pass asked for by [`Self::move_what_was_left`] is still to end. One
+    /// pass: after it the log is bounded as it always is, by the writer if need be.
+    fn is_moving_what_was_left(&self) -> bool {
+        self.moving_what_was_left.load(Ordering::Relaxed)
+    }
+
+    /// Asks for a checkpoint. `false` if the caller has to run it: there is no thread
+    /// left, or the thread's last one failed.
+    fn wake(&mut self) -> bool {
+        if self.failed.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        match self.wake.as_ref().map(|wake| wake.try_send(())) {
+            Some(Ok(()) | Err(TrySendError::Full(()))) => true,
+            Some(Err(TrySendError::Disconnected(()))) | None => {
+                self.stop();
+                false
+            }
+        }
+    }
+
+    /// Asks for a checkpoint on top of one the caller has just run itself. Nothing is
+    /// left to the thread here, so a pass of its own that failed does not stop the ask.
+    fn wake_as_well(&mut self) {
+        self.failed.store(false, Ordering::Relaxed);
+        if let Some(wake) = self.wake.as_ref() {
+            let _ = wake.try_send(());
+        }
+    }
+
+    /// Ends the thread and waits for it: when this returns its connection is closed.
+    fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.wake = None;
+        // A test that fails with the thread stalled unwinds through here.
+        #[cfg(test)]
+        self.probe.stalled.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 struct SqliteInner {
+    /// `None` when the store has no log, or no thread could be had for it. Declared
+    /// before `conn`: fields drop in order, and the checkpointer's connection has to be
+    /// closed before the engine's is.
+    checkpointer: Option<Checkpointer>,
     conn: rusqlite::Connection,
     #[allow(dead_code)]
     path: PathBuf,
@@ -312,6 +722,18 @@ struct SqliteInner {
     /// `total_changes()` when the open write transaction began: a transaction lost with
     /// the count unmoved changed nothing, so it took nothing with it.
     write_tx_changes_at_begin: u64,
+    /// See [`WAL_VALVE_FRAMES`]; a test cannot write 64 MB to reach the real one.
+    log_valve_frames: u32,
+    /// Frames in the log after the last commit that wrote any.
+    log_frames: u32,
+    /// [`log_pages_written`] as of that commit.
+    log_pages_written_at_commit: u32,
+    /// The last commit was added to a log already past its bound: the flush that made
+    /// the commit moves the log itself.
+    log_outgrew_its_bound: bool,
+    /// Checkpoints this connection has run, on its caller's thread.
+    #[cfg(test)]
+    checkpoints: std::cell::Cell<u64>,
     /// The namespace the caches above this storage are keyed by, shared with the
     /// `SqliteStorage` that owns this connection. Those caches also remember what was
     /// written — a raw-table header, a catalogued schema — and a write transaction lost
@@ -431,6 +853,7 @@ impl SqliteInner {
     fn commit_write_tx(&mut self) -> Result<(), StorageError> {
         self.reconcile_lost_transaction();
         if self.write_tx_open || self.read_scope_tx_open {
+            LOG_FRAMES_AFTER_COMMIT.with(|slot| slot.set(None));
             if let Err(error) = self.conn.execute_batch("COMMIT") {
                 // A failed commit can leave the transaction rolled back, which un-writes
                 // keys without passing through `set` / `delete`. If it is still open the
@@ -441,6 +864,18 @@ impl SqliteInner {
             }
             self.write_tx_open = false;
             self.read_scope_tx_open = false;
+            // Reported only where the hook is set (a checkpointer runs) and only by a
+            // commit that wrote: a commit of reads leaves what is known standing.
+            if let Some(frames) = LOG_FRAMES_AFTER_COMMIT.with(std::cell::Cell::take) {
+                let written_now = log_pages_written(&self.conn);
+                // The counter is 31 bits wide and wraps.
+                let written = written_now.wrapping_sub(self.log_pages_written_at_commit)
+                    & LOG_PAGES_WRITTEN_MASK;
+                self.log_pages_written_at_commit = written_now;
+                self.log_frames = frames;
+                self.log_outgrew_its_bound =
+                    frames.saturating_sub(written) >= self.log_valve_frames;
+            }
         }
         if self.lost_writes {
             return Err(StorageError::IoError(
@@ -450,6 +885,19 @@ impl SqliteInner {
             ));
         }
         Ok(())
+    }
+
+    /// Moves the log into the database file on this thread, as far as other connections
+    /// let it: a passive checkpoint waits for nobody.
+    fn checkpoint(&self) -> Result<(), StorageError> {
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_CHECKPOINTS,
+        );
+        #[cfg(test)]
+        self.checkpoints.set(self.checkpoints.get() + 1);
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+            .map_err(|e| StorageError::IoError(format!("sqlite wal checkpoint: {e}")))
     }
 
     /// A statement with no rows and no parameters, compiled once per connection. A read
@@ -567,9 +1015,50 @@ impl SqliteStorage {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let path = path.as_ref();
+        Self::open_with(path.as_ref(), WAL_VALVE_FRAMES, false)
+    }
+
+    /// [`Self::open`], and the database file is read through once in the background
+    /// ([`READ_THROUGH_BYTES`]) so that the first writes do not wait for its pages one
+    /// by one. For a store opened by an app someone is about to use; a server's store is
+    /// larger than what is read and is not waited on by a frame.
+    pub fn open_read_through(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with(path.as_ref(), WAL_VALVE_FRAMES, true)
+    }
+
+    /// [`Self::open`], with the bound on the log given: a test cannot write 64 MB to
+    /// reach the real one.
+    #[cfg(test)]
+    fn open_with_wal_valve(path: &Path, wal_valve_frames: u32) -> Result<Self, StorageError> {
+        Self::open_with(path, wal_valve_frames, false)
+    }
+
+    fn open_with(
+        path: &Path,
+        wal_valve_frames: u32,
+        reads_through: bool,
+    ) -> Result<Self, StorageError> {
+        Self::open_checkpointed(path, wal_valve_frames, |conn| {
+            Checkpointer::start(conn, path, reads_through)
+        })
+    }
+
+    /// [`Self::open_with`], with the checkpointer started by the caller: a test holds
+    /// its thread up from before it runs.
+    fn open_checkpointed(
+        path: &Path,
+        wal_valve_frames: u32,
+        start_checkpointer: impl FnOnce(&rusqlite::Connection) -> Option<Checkpointer>,
+    ) -> Result<Self, StorageError> {
         let conn = rusqlite::Connection::open(path)
             .map_err(|e| StorageError::IoError(format!("sqlite open: {e}")))?;
+        // A store that was closed leaves no log: the last connection folds it away. Asked
+        // before the first statement, which is what reads a log that was left; and of the
+        // name SQLite has for the file, which is not `path` when that is a link.
+        let log_left_behind = conn.path().is_some_and(|database| {
+            !database.is_empty()
+                && std::fs::metadata(format!("{database}-wal")).is_ok_and(|log| log.len() > 0)
+        });
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -577,19 +1066,45 @@ impl SqliteStorage {
              PRAGMA cache_size = -65536;
              PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = OFF;
+             PRAGMA temp_store = MEMORY;
              CREATE TABLE IF NOT EXISTS kv (
                  key   BLOB PRIMARY KEY,
                  value BLOB NOT NULL
              ) WITHOUT ROWID;",
         )
         .map_err(|e| StorageError::IoError(format!("sqlite init: {e}")))?;
+        // `temp_store` above: a savepoint's statement journal is a temporary file unless
+        // told otherwise, and the pages a savepoint copies into it were going through
+        // `write()` on every operation.
         Self::ensure_store_manifest(&conn)?;
+        let mut checkpointer = start_checkpointer(&conn);
+        if let Some(checkpointer) = checkpointer.as_mut().filter(|_| log_left_behind) {
+            checkpointer.move_what_was_left();
+        }
+        if checkpointer.is_some() {
+            // The flush no longer checkpoints, and the checkpoint is what synced the log:
+            // `FULL` syncs it at the commit instead, so what a flush reports stored is
+            // still on the device when the caller confirms it upstream.
+            conn.execute_batch(&format!(
+                "PRAGMA synchronous = FULL;
+                 PRAGMA journal_size_limit = {};",
+                i64::from(wal_valve_frames) * WAL_FRAME_BYTES
+            ))
+            .map_err(|e| StorageError::IoError(format!("sqlite init: {e}")))?;
+            // Takes the place of SQLite's own checkpoint-at-1000-frames, which shares
+            // the hook's slot: from here on the log is moved by the checkpointer, and by
+            // a flush only when the log outgrows its bound (`commit_write_tx`).
+            conn.wal_hook(Some(note_log_frames));
+        }
 
+        // What opening the store wrote is not part of the first commit made through it.
+        let log_pages_written_at_commit = log_pages_written(&conn);
         let cache_namespace = Arc::new(AtomicUsize::new(super::next_storage_cache_namespace()));
         Ok(Self {
             cache_namespace: Arc::clone(&cache_namespace),
             closed_with_lost_writes: AtomicBool::new(false),
             inner: Mutex::new(Some(SqliteInner {
+                checkpointer,
                 conn,
                 path: path.to_path_buf(),
                 write_tx_open: false,
@@ -598,6 +1113,12 @@ impl SqliteStorage {
                 seen_data_version: None,
                 lost_writes: false,
                 write_tx_changes_at_begin: 0,
+                log_valve_frames: wal_valve_frames,
+                log_frames: 0,
+                log_pages_written_at_commit,
+                log_outgrew_its_bound: false,
+                #[cfg(test)]
+                checkpoints: std::cell::Cell::new(0),
                 cache_namespace,
                 abandoned_cache_namespaces: Vec::new(),
                 ensured_raw_table_headers: HashSet::new(),
@@ -716,16 +1237,25 @@ impl SqliteStorage {
     /// Run `f` inside a SQLite SAVEPOINT. Releases on success, rolls back on error.
     /// Reads within `f` see uncommitted savepoint writes because all operations
     /// share the same connection.
+    ///
+    /// For operations of more than one statement. One statement is atomic by itself and
+    /// goes through [`Self::single_statement`]: a savepoint around it buys nothing and
+    /// costs two statements and a journalled copy of every page it touches.
     fn with_savepoint<T>(
         conn: &rusqlite::Connection,
         memo: &RefCell<ReadMemo>,
         f: impl FnOnce() -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        conn.execute("SAVEPOINT jazz_sp", [])
+        crate::query_manager::settle_cost::bump(
+            &crate::query_manager::settle_cost::STORAGE_SAVEPOINTS,
+        );
+        // Compiled once per connection: the pair runs around every multi-statement write.
+        let run = |sql: &str| conn.prepare_cached(sql)?.execute([]);
+        run("SAVEPOINT jazz_sp")
             .map_err(|e| StorageError::IoError(format!("savepoint start: {e}")))?;
         match f() {
             Ok(v) => {
-                if let Err(error) = conn.execute("RELEASE jazz_sp", []) {
+                if let Err(error) = run("RELEASE jazz_sp") {
                     memo.borrow_mut().clear();
                     return Err(StorageError::IoError(format!("savepoint release: {error}")));
                 }
@@ -739,6 +1269,17 @@ impl SqliteStorage {
                 Err(e)
             }
         }
+    }
+
+    /// Run an operation that is one SQL statement. SQLite undoes a statement that fails,
+    /// so nothing is half-written; the memo is dropped all the same, as after a
+    /// savepoint's rollback, because a statement can fail hard enough to take the whole
+    /// transaction with it.
+    fn single_statement<T>(
+        memo: &RefCell<ReadMemo>,
+        f: impl FnOnce() -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        f().inspect_err(|_| memo.borrow_mut().clear())
     }
 
     fn get(conn: &rusqlite::Connection, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
@@ -993,7 +1534,7 @@ impl Storage for SqliteStorage {
             || {
                 self.with_inner_mut(|inner| {
                     inner.ensure_write_tx()?;
-                    Self::with_savepoint(&inner.conn, &inner.memo, || {
+                    Self::single_statement(&inner.memo, || {
                         raw_table_put_core(table, key, value, |storage_key, bytes| {
                             Self::set(&inner.conn, &inner.memo, storage_key, bytes)
                         })
@@ -1009,7 +1550,7 @@ impl Storage for SqliteStorage {
             || {
                 self.with_inner_mut(|inner| {
                     inner.ensure_write_tx()?;
-                    Self::with_savepoint(&inner.conn, &inner.memo, || {
+                    Self::single_statement(&inner.memo, || {
                         raw_table_delete_core(table, key, |storage_key| {
                             Self::delete(&inner.conn, &inner.memo, storage_key)
                         })
@@ -1061,9 +1602,10 @@ impl Storage for SqliteStorage {
     }
 
     /// One savepoint for the whole batch, as `apply_encoded_row_mutation` writes a row's
-    /// entries. The trait's default writes entry by entry, and on SQLite every
-    /// `raw_table_put` opens its own savepoint, whose first touch of each b-tree page
-    /// copies that page to the statement journal.
+    /// entries, and none for a batch of one: an entry is one statement. A row that
+    /// arrives over sync is indexed entry by entry
+    /// (`update_indices_for_insert_on_branch`) — some seventy batches of one for a chat
+    /// message, each of which used to open a savepoint of its own.
     fn apply_index_mutations(
         &mut self,
         mutations: &[IndexMutation<'_>],
@@ -1073,9 +1615,12 @@ impl Storage for SqliteStorage {
             || {
                 self.with_inner_mut(|inner| {
                     inner.ensure_write_tx()?;
-                    Self::with_savepoint(&inner.conn, &inner.memo, || {
-                        Self::write_index_mutations(&inner.conn, &inner.memo, mutations)
-                    })
+                    let write = || Self::write_index_mutations(&inner.conn, &inner.memo, mutations);
+                    if mutations.len() == 1 {
+                        Self::single_statement(&inner.memo, write)
+                    } else {
+                        Self::with_savepoint(&inner.conn, &inner.memo, write)
+                    }
                 })
             },
         )
@@ -1725,18 +2270,32 @@ impl Storage for SqliteStorage {
         )
     }
 
+    /// Commits. What was written is then in the log, synced; moving the log into the
+    /// database file is left to the [`Checkpointer`], off this thread. A store without
+    /// one checkpoints here, as [`Self::flush`] does, and so does a flush whose commit
+    /// found the log outgrowing its bound ([`WAL_VALVE_FRAMES`]).
     fn flush_wal(&self) -> Result<(), StorageError> {
         let mut inner = self.lock_inner()?;
         if let Some(inner) = inner.as_mut() {
-            // Commit the open write transaction so writes land in the WAL
-            // and survive a process crash.
             inner.commit_write_tx()?;
-            // PASSIVE checkpoint: moves WAL pages into the main db file without
-            // blocking concurrent readers.
-            inner
-                .conn
-                .execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
-                .map_err(|e| StorageError::IoError(format!("sqlite wal checkpoint: {e}")))?;
+            // A log left behind by an earlier process is past its bound before this one
+            // has written anything, and the checkpointer is already at it.
+            let outgrew = std::mem::take(&mut inner.log_outgrew_its_bound)
+                && !inner
+                    .checkpointer
+                    .as_ref()
+                    .is_some_and(Checkpointer::is_moving_what_was_left);
+            let left_to_the_checkpointer =
+                !outgrew && inner.checkpointer.as_mut().is_some_and(Checkpointer::wake);
+            if !left_to_the_checkpointer {
+                inner.checkpoint()?;
+                // A passive checkpoint that finds the checkpointer in the middle of a
+                // pass moves nothing and says nothing. What it left is asked for again,
+                // or it would stay in the log until the next write.
+                if outgrew && let Some(checkpointer) = inner.checkpointer.as_mut() {
+                    checkpointer.wake_as_well();
+                }
+            }
         } else if self.closed_with_lost_writes.load(Ordering::Relaxed) {
             return Err(StorageError::IoError(
                 "sqlite storage was closed with writes that are not stored".to_string(),
@@ -1745,8 +2304,23 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    /// Commits, and moves the log into the database file on the caller's thread as far
+    /// as other connections let it: a checkpoint the [`Checkpointer`] is in the middle of
+    /// is not waited for, and moves what was committed when it began. What a flush
+    /// promises — the writes are where they survive the process and the machine — the
+    /// commit has already done.
     fn flush(&self) -> Result<(), StorageError> {
-        self.flush_wal()
+        let mut inner = self.lock_inner()?;
+        if let Some(inner) = inner.as_mut() {
+            inner.commit_write_tx()?;
+            inner.checkpoint()?;
+            inner.log_outgrew_its_bound = false;
+        } else if self.closed_with_lost_writes.load(Ordering::Relaxed) {
+            return Err(StorageError::IoError(
+                "sqlite storage was closed with writes that are not stored".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn close(&self) -> Result<(), StorageError> {
@@ -1761,6 +2335,10 @@ impl Storage for SqliteStorage {
                 Ok(())
             };
         };
+        // The checkpointer's connection is closed first, whatever happens next: once
+        // this returns nothing of the store is left open, and the connection SQLite
+        // sees close last — the one that folds the log away — is this one.
+        drop(inner.checkpointer.take());
         // Commit any pending writes before closing. The connection is dropped either
         // way, and what it could not commit goes with it: later flushes say so.
         if let Err(error) = inner.commit_write_tx() {
@@ -1773,6 +2351,10 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite_write_path_tests.rs"]
+mod write_path_tests;
 
 #[cfg(test)]
 mod tests {

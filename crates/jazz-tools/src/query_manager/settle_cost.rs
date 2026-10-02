@@ -232,6 +232,13 @@ pub static STORAGE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_READ_SCOPES: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_WRITE_MICROS: AtomicU64 = AtomicU64::new(0);
 pub static STORAGE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Savepoints the store opened around its writes. The first touch of each b-tree page
+/// inside one copies that page to the statement journal, so a write path that opens one
+/// per index entry pays a page copy per entry.
+pub static STORAGE_SAVEPOINTS: AtomicU64 = AtomicU64::new(0);
+/// Checkpoints of the store's log run on the caller's own thread: the wall time of moving
+/// the log into the database file, and of its sync, spent where the caller waits.
+pub static STORAGE_CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 
 /// Run `f`, adding its wall time to `counter`.
 #[inline]
@@ -435,6 +442,8 @@ pub struct SettleCounts {
     pub storage_read_scopes: u64,
     pub storage_write_micros: u64,
     pub storage_write_bytes: u64,
+    pub storage_savepoints: u64,
+    pub storage_checkpoints: u64,
     pub pending_local_row_batches: u64,
     pub undelivered_payloads: u64,
     pub undelivered_clients: u64,
@@ -481,6 +490,8 @@ impl SettleCounts {
             storage_read_scopes: STORAGE_READ_SCOPES.load(Ordering::Relaxed),
             storage_write_micros: STORAGE_WRITE_MICROS.load(Ordering::Relaxed),
             storage_write_bytes: STORAGE_WRITE_BYTES.load(Ordering::Relaxed),
+            storage_savepoints: STORAGE_SAVEPOINTS.load(Ordering::Relaxed),
+            storage_checkpoints: STORAGE_CHECKPOINTS.load(Ordering::Relaxed),
             pending_local_row_batches: PENDING_LOCAL_ROW_BATCHES.load(Ordering::Relaxed),
             undelivered_payloads: UNDELIVERED_PAYLOADS.load(Ordering::Relaxed),
             undelivered_clients: UNDELIVERED_CLIENTS.load(Ordering::Relaxed),
@@ -549,6 +560,12 @@ impl SettleCounts {
             storage_write_bytes: self
                 .storage_write_bytes
                 .saturating_sub(base.storage_write_bytes),
+            storage_savepoints: self
+                .storage_savepoints
+                .saturating_sub(base.storage_savepoints),
+            storage_checkpoints: self
+                .storage_checkpoints
+                .saturating_sub(base.storage_checkpoints),
             pending_local_row_batches: self.pending_local_row_batches,
             undelivered_payloads: self.undelivered_payloads,
             undelivered_clients: self.undelivered_clients,
@@ -645,6 +662,8 @@ impl Drop for SettlePass {
             storage_read_scopes = cost.storage_read_scopes,
             storage_write_micros = cost.storage_write_micros,
             storage_write_bytes = cost.storage_write_bytes,
+            storage_savepoints = cost.storage_savepoints,
+            storage_checkpoints = cost.storage_checkpoints,
             pending_local_row_batches = cost.pending_local_row_batches,
             pending_id_retain_scans = cost.pending_id_retain_scans,
             undelivered_payloads = cost.undelivered_payloads,
