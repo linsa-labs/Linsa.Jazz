@@ -32,7 +32,7 @@ use crate::sync_manager::DurabilityTier;
 
 use super::codecs::{flat_user_values, malformed, tier_satisfies};
 use super::types::SnapshotDominator;
-use super::types::{BatchId, ComputedVisiblePreview, StoredRowBatch, VisibleRowEntry};
+use super::types::{BatchId, ComputedVisiblePreview, MergeBase, StoredRowBatch, VisibleRowEntry};
 
 pub(super) fn visible_rows_for_tier(
     history_rows: &[StoredRowBatch],
@@ -408,6 +408,7 @@ pub(super) fn build_computed_visible_preview(
         return Ok(Some(ComputedVisiblePreview {
             row: latest_tip.clone(),
             winner_batch_ids: None,
+            merge_base: None,
         }));
     }
 
@@ -417,6 +418,25 @@ pub(super) fn build_computed_visible_preview(
         .map(|row| (row.batch_id(), row))
         .collect::<HashMap<_, _>>();
     let ancestor = latest_common_ancestor(&frontier, &row_by_batch_id);
+
+    merge_frontier_preview(user_descriptor, &frontier, ancestor).map(Some)
+}
+
+/// The row readers see when a history has more than one tip: the tips merged column by
+/// column over `ancestor`, the latest version every tip descends from.
+///
+/// `frontier` is every tip, ordered by `(updated_at, batch_id)`. Nothing else of the
+/// history is read: the tips and their common ancestor decide the merge, which is what
+/// lets [`super::fastpath::try_forked_fastpath_entry`] reach the same row without the
+/// history.
+pub(super) fn merge_frontier_preview(
+    user_descriptor: &RowDescriptor,
+    frontier: &[&StoredRowBatch],
+    ancestor: Option<&StoredRowBatch>,
+) -> Result<ComputedVisiblePreview, EncodingError> {
+    let latest_tip = *frontier
+        .last()
+        .expect("a merged frontier has at least two tips");
 
     let ancestor_values = ancestor
         .map(|row| flat_user_values(user_descriptor, &row.data))
@@ -470,7 +490,7 @@ pub(super) fn build_computed_visible_preview(
         contributing_rows.push(winner_row);
     }
 
-    let delete_winner = delete_winner(&frontier);
+    let delete_winner = delete_winner(frontier);
     let metadata_row = delete_winner.unwrap_or_else(|| {
         contributing_rows
             .iter()
@@ -531,10 +551,13 @@ pub(super) fn build_computed_visible_preview(
         Some(winner_batch_ids)
     };
 
-    Ok(Some(ComputedVisiblePreview {
+    Ok(ComputedVisiblePreview {
         row,
         winner_batch_ids,
-    }))
+        merge_base: Some(MergeBase {
+            ancestor: ancestor.map(StoredRowBatch::batch_id),
+        }),
+    })
 }
 
 pub(crate) fn visible_row_preview_from_history_rows(

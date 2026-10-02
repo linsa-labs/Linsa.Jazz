@@ -32,10 +32,12 @@ pub use codecs::{
     encode_flat_history_row, encode_flat_visible_row_entry, history_row_physical_descriptor,
     visible_row_physical_descriptor,
 };
+#[cfg(test)]
+pub(crate) use fastpath::FORKED_FASTPATH_ARMS_ON_THREAD;
 pub use fastpath::{
-    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, PATCH_FASTPATH_FALLBACKS,
-    PATCH_FASTPATH_HITS, QUERY_PROVENANCE_HISTORY_SCANS, QUERY_TIER_READ_HISTORY_SCANS,
-    history_fastpath_enabled,
+    FORKED_FASTPATH_HITS, HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS,
+    PATCH_FASTPATH_FALLBACKS, PATCH_FASTPATH_HITS, QUERY_PROVENANCE_HISTORY_SCANS,
+    QUERY_TIER_READ_HISTORY_SCANS, history_fastpath_enabled,
 };
 #[cfg(any(test, feature = "test"))]
 pub use fastpath::{HistoryFastpathMode, force_history_fastpath};
@@ -58,7 +60,9 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::fastpath::{try_in_place_tip_update_entry, try_serial_fastpath_entry};
+    use super::fastpath::{
+        try_forked_fastpath_entry, try_in_place_tip_update_entry, try_serial_fastpath_entry,
+    };
     use super::*;
     use crate::metadata::{DeleteKind, MetadataKey, RowProvenance};
     use crate::object::{BranchName, ObjectId};
@@ -1560,6 +1564,605 @@ mod tests {
             None,
         );
         assert_eq!(try_serial_fastpath_entry(None, &fresh), None);
+    }
+
+    /// A row two writers wrote over the same version, with a counter column so that a
+    /// merge is more than picking the newer tip: `base`, then `left` and `right` over it.
+    fn forked_history(
+        descriptor: &RowDescriptor,
+        tier: Option<DurabilityTier>,
+    ) -> (StoredRowBatch, StoredRowBatch, StoredRowBatch) {
+        let base = root_batch(
+            descriptor,
+            &[Value::Text("task".into()), Value::Integer(5)],
+            10,
+            tier,
+        );
+        let left = serial_batch(
+            &base,
+            descriptor,
+            &[Value::Text("left".into()), Value::Integer(7)],
+            20,
+            tier,
+        );
+        let right = serial_batch(
+            &base,
+            descriptor,
+            &[Value::Text("task".into()), Value::Integer(4)],
+            21,
+            tier,
+        );
+        (base, left, right)
+    }
+
+    fn write_over(
+        row_like: &StoredRowBatch,
+        descriptor: &RowDescriptor,
+        parents: Vec<BatchId>,
+        values: &[Value],
+        updated_at: u64,
+    ) -> StoredRowBatch {
+        StoredRowBatch::new(
+            row_like.row_id,
+            "main",
+            parents,
+            encode_row(descriptor, values).expect("encode row"),
+            RowProvenance::for_update(&row_like.row_provenance(), "carol".to_string(), updated_at),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        )
+    }
+
+    fn forked_entry(
+        descriptor: &RowDescriptor,
+        previous: &VisibleRowEntry,
+        history: &[StoredRowBatch],
+        row: &StoredRowBatch,
+    ) -> Option<VisibleRowEntry> {
+        try_forked_fastpath_entry(descriptor, Some(previous), row, &|batch_id| {
+            history
+                .iter()
+                .find(|stored| stored.batch_id() == batch_id)
+                .cloned()
+        })
+    }
+
+    #[test]
+    fn a_write_over_one_of_two_tips_is_built_from_the_tips_as_the_history_builds_it() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let (base, left, right) = forked_history(&descriptor, None);
+        let mut history = vec![base.clone(), left.clone(), right.clone()];
+        let mut previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier.len(), 2);
+        assert!(
+            previous.merge_artifacts.is_some(),
+            "a row with two tips records the version they both descend from"
+        );
+
+        // Ten writes over the right tip, the left one never named: the shape a restored
+        // device leaves a server in. The second also names what its tip was written
+        // over, as a device that held both as tips does.
+        let mut tip = right.clone();
+        for step in 0..10u64 {
+            let mut parents = vec![tip.batch_id()];
+            if step == 1 {
+                parents.extend(tip.parents.iter().copied());
+            }
+            let next = write_over(
+                &base,
+                &descriptor,
+                parents,
+                &[
+                    Value::Text(format!("t{step}")),
+                    Value::Integer(4 + step as i32),
+                ],
+                30 + step,
+            );
+            let built = forked_entry(&descriptor, &previous, &history, &next)
+                .unwrap_or_else(|| panic!("write {step} over one of two tips was declined"));
+            history.push(next.clone());
+            assert_eq!(
+                built,
+                rebuilt_entry(&descriptor, &history),
+                "write {step}: the entry built from the tips is not the entry the history builds"
+            );
+            assert_eq!(built.branch_frontier.len(), 2);
+            previous = built;
+            tip = next;
+        }
+
+        // And one write over both tips and a version they descend from: one tip again.
+        let merge = write_over(
+            &base,
+            &descriptor,
+            vec![left.batch_id(), base.batch_id(), tip.batch_id()],
+            &[Value::Text("merged".into()), Value::Integer(20)],
+            90,
+        );
+        let built = forked_entry(&descriptor, &previous, &history, &merge)
+            .expect("a write over every tip was declined");
+        history.push(merge.clone());
+        assert_eq!(built, rebuilt_entry(&descriptor, &history));
+        assert_eq!(built.branch_frontier, vec![merge.batch_id()]);
+        assert_eq!(built.merge_artifacts, None);
+        // From here the row has one tip and no trace of the fork: the serial path takes it.
+        let after = write_over(
+            &base,
+            &descriptor,
+            vec![merge.batch_id()],
+            &[Value::Text("after".into()), Value::Integer(21)],
+            100,
+        );
+        let serial = try_serial_fastpath_entry(Some(&built), &after)
+            .expect("a healed row is a serial row again");
+        history.push(after);
+        assert_eq!(serial, rebuilt_entry(&descriptor, &history));
+    }
+
+    /// The order the tips are merged in is part of the answer. A counter column no tip
+    /// has a value for, in a row whose tips share no ancestor, is credited to the newest
+    /// tip — and the newest is by the versions' own clocks, not by which was written to
+    /// this store last. The write below is older than the tip it leaves standing; the one
+    /// after it is newer.
+    #[test]
+    fn the_tips_are_merged_in_the_order_of_their_clocks() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = RowDescriptor::new(vec![
+            ColumnDescriptor::new("title", ColumnType::Text),
+            ColumnDescriptor::new("count", ColumnType::Integer)
+                .nullable()
+                .merge_strategy(ColumnMergeStrategy::Counter),
+        ]);
+        // Two creations of one row that never heard of each other: no common ancestor.
+        let first = root_batch(
+            &descriptor,
+            &[Value::Text("first".into()), Value::Null],
+            10,
+            None,
+        );
+        let mut second = root_batch(
+            &descriptor,
+            &[Value::Text("second".into()), Value::Null],
+            40,
+            None,
+        );
+        second.row_id = first.row_id;
+        let mut history = vec![first.clone(), second.clone()];
+        let mut previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier.len(), 2);
+        assert_eq!(
+            types::MergeBase::decode(
+                previous
+                    .merge_artifacts
+                    .as_deref()
+                    .expect("a recorded base")
+            ),
+            Some(types::MergeBase { ancestor: None })
+        );
+
+        let mut tip = first.clone();
+        for (step, at) in [(0, 30u64), (1, 50)] {
+            let next = write_over(
+                &first,
+                &descriptor,
+                vec![tip.batch_id()],
+                &[Value::Text(format!("t{step}")), Value::Null],
+                at,
+            );
+            let built = forked_entry(&descriptor, &previous, &history, &next)
+                .unwrap_or_else(|| panic!("write {step} over one of two tips was declined"));
+            history.push(next.clone());
+            assert_eq!(
+                built,
+                rebuilt_entry(&descriptor, &history),
+                "write {step} at {at}: the tips were merged in another order than the \
+                 history merges them in"
+            );
+            previous = built;
+            tip = next;
+        }
+    }
+
+    #[test]
+    fn a_write_the_tips_alone_cannot_resolve_is_left_to_the_history() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let (base, left, right) = forked_history(&descriptor, None);
+        let third = write_over(
+            &base,
+            &descriptor,
+            vec![base.batch_id()],
+            &[Value::Text("third".into()), Value::Integer(9)],
+            22,
+        );
+        let history = vec![base.clone(), left.clone(), right.clone(), third.clone()];
+        let previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier.len(), 3);
+        let values = [Value::Text("next".into()), Value::Integer(1)];
+        let over = |parents: Vec<BatchId>| write_over(&base, &descriptor, parents, &values, 40);
+        let declined = |row: &StoredRowBatch, why: &str| {
+            assert_eq!(
+                forked_entry(&descriptor, &previous, &history, row),
+                None,
+                "{why}"
+            );
+        };
+
+        declined(
+            &over(vec![left.batch_id(), right.batch_id()]),
+            "two tips of three: the version the remaining tips have in common may move",
+        );
+        declined(
+            &over(vec![base.batch_id()]),
+            "no tip named: a new tip, and a common version the entry does not know",
+        );
+        // `other` is a version `right` does not descend from: it brings its own ancestry.
+        let other = write_over(
+            &base,
+            &descriptor,
+            vec![left.batch_id()],
+            &[Value::Text("other".into()), Value::Integer(3)],
+            23,
+        );
+        let mut wider = history.clone();
+        wider.push(other.clone());
+        let wider_previous = rebuilt_entry(&descriptor, &wider);
+        assert_eq!(
+            forked_entry(
+                &descriptor,
+                &wider_previous,
+                &wider,
+                &over(vec![right.batch_id(), left.batch_id()])
+            ),
+            None,
+            "a second parent the named tip does not descend from"
+        );
+
+        let mut delete = over(vec![right.batch_id()]);
+        delete.delete_kind = Some(DeleteKind::Soft);
+        delete.is_deleted = true;
+        declined(&delete, "a delete");
+        let mut confirmed = over(vec![right.batch_id()]);
+        confirmed.confirmed_tier = Some(DurabilityTier::Local);
+        declined(&confirmed, "a version that carries a tier");
+        let mut staged = over(vec![right.batch_id()]);
+        staged.state = RowState::StagingPending;
+        declined(&staged, "a staged version");
+
+        // An entry stored before the common version was recorded.
+        let mut unrecorded = previous.clone();
+        unrecorded.merge_artifacts = None;
+        assert_eq!(
+            forked_entry(
+                &descriptor,
+                &unrecorded,
+                &history,
+                &over(vec![right.batch_id()])
+            ),
+            None,
+            "an entry that does not say which version its tips have in common"
+        );
+
+        // An entry that points at a tier's own version of the row, though neither the row
+        // readers see nor the incoming one carries a tier.
+        for point in [
+            |entry: &mut VisibleRowEntry, at| entry.worker_batch_id = Some(at),
+            |entry: &mut VisibleRowEntry, at| entry.edge_batch_id = Some(at),
+            |entry: &mut VisibleRowEntry, at| entry.global_batch_id = Some(at),
+        ] {
+            let mut pointed = previous.clone();
+            point(&mut pointed, left.batch_id());
+            assert_eq!(
+                forked_entry(
+                    &descriptor,
+                    &pointed,
+                    &history,
+                    &over(vec![right.batch_id()])
+                ),
+                None,
+                "an entry that points at a tier's version"
+            );
+        }
+
+        // What the path reads by id must be there and be visible: a tip that is staged
+        // or rejected by now, a recorded common version that is, or either one gone.
+        let with = |change: &dyn Fn(&mut Vec<StoredRowBatch>)| {
+            let mut changed = history.clone();
+            change(&mut changed);
+            forked_entry(
+                &descriptor,
+                &previous,
+                &changed,
+                &over(vec![right.batch_id()]),
+            )
+        };
+        assert!(
+            with(&|_| ()).is_some(),
+            "the write these cases vary is itself taken"
+        );
+        assert_eq!(
+            with(&|history| history[1].state = RowState::Rejected),
+            None,
+            "another tip that is no longer visible"
+        );
+        assert_eq!(
+            with(&|history| {
+                history.remove(1);
+            }),
+            None,
+            "another tip the store does not hold"
+        );
+        assert_eq!(
+            with(&|history| history[2].state = RowState::Rejected),
+            None,
+            "the tip the write replaces is no longer visible"
+        );
+        assert_eq!(
+            with(&|history| {
+                history.remove(2);
+            }),
+            None,
+            "the tip the write replaces is one the store does not hold"
+        );
+        assert_eq!(
+            with(&|history| history[0].state = RowState::Rejected),
+            None,
+            "a recorded common version that is no longer visible"
+        );
+        assert_eq!(
+            with(&|history| {
+                history.remove(0);
+            }),
+            None,
+            "a recorded common version the store does not hold"
+        );
+
+        // Bytes this build cannot read where the common version is recorded: whatever
+        // they say, neither a write over one tip nor a write over every tip is built
+        // without the history — and a row with one tip is no different.
+        let mut unknown = previous.clone();
+        unknown.merge_artifacts = Some(vec![9, 9, 9]);
+        for parents in [
+            vec![right.batch_id()],
+            vec![left.batch_id(), right.batch_id(), third.batch_id()],
+        ] {
+            let named = parents.len();
+            assert_eq!(
+                forked_entry(&descriptor, &unknown, &history, &over(parents)),
+                None,
+                "a write over {named} of three tips of an entry with bytes nobody can read"
+            );
+        }
+        // A row some tier has a view of: that view is not carried by this path.
+        let (tier_base, tier_left, tier_right) =
+            forked_history(&descriptor, Some(DurabilityTier::EdgeServer));
+        let tiered = vec![tier_base.clone(), tier_left, tier_right.clone()];
+        let tiered_previous = rebuilt_entry(&descriptor, &tiered);
+        assert_eq!(
+            forked_entry(
+                &descriptor,
+                &tiered_previous,
+                &tiered,
+                &write_over(
+                    &tier_base,
+                    &descriptor,
+                    vec![tier_right.batch_id()],
+                    &values,
+                    40
+                )
+            ),
+            None,
+            "a row a tier has its own view of"
+        );
+    }
+
+    /// The path for forked rows takes only an entry with several tips that records what
+    /// they descend from, and a row with one tip is never built by it.
+    #[test]
+    fn a_row_with_one_tip_is_never_built_from_its_tips() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let (base, left, right) = forked_history(&descriptor, None);
+        let history = vec![base.clone(), left.clone(), right.clone()];
+        let previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier.len(), 2);
+        let values = [Value::Text("next".into()), Value::Integer(1)];
+        let over = |parents: Vec<BatchId>| write_over(&base, &descriptor, parents, &values, 40);
+        assert!(
+            forked_entry(
+                &descriptor,
+                &previous,
+                &history,
+                &over(vec![left.batch_id(), right.batch_id(), base.batch_id()])
+            )
+            .is_some(),
+            "a write over every tip and more, of an entry that records its ancestor, is taken"
+        );
+
+        // A row with one tip is never built here, whatever the write names besides the
+        // tip. Its entry can stand for a history that has more tips — a delivered snapshot
+        // taken over a tip that had parents leaves exactly this entry — and a write naming
+        // the tip and other versions is where reading the history finds them again.
+        let line = vec![base.clone(), left.clone()];
+        let one_tip = rebuilt_entry(&descriptor, &line);
+        assert_eq!(one_tip.branch_frontier, vec![left.batch_id()]);
+        assert_eq!(
+            forked_entry(
+                &descriptor,
+                &one_tip,
+                &line,
+                &over(vec![left.batch_id(), base.batch_id()])
+            ),
+            None,
+            "a write over the only tip and a version under it"
+        );
+        // And a write over exactly that tip, the serial path's own, is not built by either
+        // path from an entry with bytes nobody can read.
+        let serial_write = over(vec![left.batch_id()]);
+        assert!(
+            try_serial_fastpath_entry(Some(&one_tip), &serial_write).is_some(),
+            "the write this case varies is itself taken"
+        );
+        let mut unknown_line = one_tip.clone();
+        unknown_line.merge_artifacts = Some(vec![9, 9, 9]);
+        assert_eq!(
+            try_serial_fastpath_entry(Some(&unknown_line), &serial_write)
+                .or_else(|| { forked_entry(&descriptor, &unknown_line, &line, &serial_write) }),
+            None,
+            "a write over a row with one tip and bytes nobody can read"
+        );
+    }
+
+    /// An entry with no tip names nothing a write could be over — and "every tip of
+    /// none" is not a reason to take it.
+    #[test]
+    fn an_entry_with_no_tip_is_left_to_the_history() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let (base, left, right) = forked_history(&descriptor, None);
+        let history = vec![base.clone(), left, right.clone()];
+        let mut tipless = rebuilt_entry(&descriptor, &history);
+        assert!(tipless.records_merge_base());
+        tipless.branch_frontier.clear();
+        let write = write_over(
+            &base,
+            &descriptor,
+            vec![right.batch_id()],
+            &[Value::Text("next".into()), Value::Integer(1)],
+            40,
+        );
+        assert_eq!(
+            forked_entry(&descriptor, &tipless, &history, &write),
+            None,
+            "an entry with no tip"
+        );
+    }
+
+    /// A row with two tips whose newest won every column keeps no merged preview: its
+    /// entry says only which version the tips descend from. A write naming exactly those
+    /// tips has always been a serial write, tier state and all, and recording that version
+    /// must not turn it into a read of the row's history.
+    #[test]
+    fn a_write_over_exactly_the_tips_of_a_tiered_row_is_still_a_serial_write() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = user_descriptor();
+        let tier = Some(DurabilityTier::EdgeServer);
+        let base = root_batch(
+            &descriptor,
+            &[Value::Text("task".into()), Value::Boolean(false)],
+            10,
+            tier,
+        );
+        let left = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("left".into()), Value::Boolean(false)],
+            20,
+            tier,
+        );
+        let right = serial_batch(
+            &base,
+            &descriptor,
+            &[Value::Text("right".into()), Value::Boolean(true)],
+            21,
+            tier,
+        );
+        let mut history = vec![base.clone(), left.clone(), right.clone()];
+        let previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier.len(), 2);
+        assert!(
+            previous.winner_batch_pool.is_empty() && previous.current_winner_ordinals.is_none(),
+            "the newest tip won every column: this case needs an entry with nothing merged"
+        );
+        assert!(previous.merge_artifacts.is_some());
+
+        let merge = StoredRowBatch::new(
+            base.row_id,
+            "main",
+            vec![left.batch_id(), right.batch_id()],
+            encode_row(
+                &descriptor,
+                &[Value::Text("merged".into()), Value::Boolean(true)],
+            )
+            .expect("encode row"),
+            RowProvenance::for_update(&base.row_provenance(), "carol".to_string(), 30),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            tier,
+        );
+        assert_eq!(
+            forked_entry(&descriptor, &previous, &history, &merge),
+            None,
+            "the path for forked rows carries no tier: only the serial path can take this"
+        );
+        let built = try_serial_fastpath_entry(Some(&previous), &merge)
+            .expect("a write over exactly the tips of a tiered row was declined");
+        history.push(merge);
+        assert_eq!(built, rebuilt_entry(&descriptor, &history));
+
+        // Bytes this build cannot read are not a merge base: the history decides.
+        let mut unknown = previous.clone();
+        unknown.merge_artifacts = Some(vec![9, 9, 9]);
+        assert_eq!(try_serial_fastpath_entry(Some(&unknown), &history[3]), None);
+    }
+
+    /// OPEN DEFECT, older than the forked path and not touched by it (found 2026-10-02 by
+    /// the storage differential once its streams were widened).
+    ///
+    /// A delivered snapshot supersedes the parentless versions of its lineage
+    /// (`resolution::superseded_by_snapshot`), and each tier's view applies that rule
+    /// over the versions the tier can see. A snapshot the tier cannot see supersedes
+    /// nothing there, so a creation it hid from readers is still a tip of the tier's
+    /// view. `fastpath::carried_tier_pointer` assumes the opposite — that a write over
+    /// the whole frontier descends from every visible version — and carries no pointer.
+    /// The rebuild merges the creation with the write in that tier's view, and with a
+    /// counter column the merge is not the write: the creation's count is added again.
+    ///
+    /// Which of the two is the intended row is itself undecided: the tier view resurrects
+    /// a version every reader stopped seeing.
+    #[test]
+    #[ignore = "open defect: a tier's view keeps a creation that a delivered snapshot superseded"]
+    fn a_tier_view_keeps_a_creation_a_delivered_snapshot_superseded() {
+        let _mode = force_history_fastpath(true);
+        let descriptor = counter_descriptor();
+        let creation = root_batch(
+            &descriptor,
+            &[Value::Text("created".into()), Value::Integer(5)],
+            10,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let snapshot = StoredRowBatch::new(
+            creation.row_id,
+            "main",
+            Vec::new(),
+            encode_row(
+                &descriptor,
+                &[Value::Text("delivered".into()), Value::Integer(5)],
+            )
+            .expect("encode snapshot"),
+            RowProvenance::for_update(&creation.row_provenance(), "bob".to_string(), 20),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        let history = vec![creation.clone(), snapshot.clone()];
+        let previous = rebuilt_entry(&descriptor, &history);
+        assert_eq!(previous.branch_frontier, vec![snapshot.batch_id()]);
+
+        let write = serial_batch(
+            &snapshot,
+            &descriptor,
+            &[Value::Text("written".into()), Value::Integer(7)],
+            30,
+            Some(DurabilityTier::GlobalServer),
+        );
+        let carried = try_serial_fastpath_entry(Some(&previous), &write)
+            .expect("a write over the only tip is a serial write");
+        let mut extended = history;
+        extended.push(write);
+        assert_eq!(carried, rebuilt_entry(&descriptor, &extended));
     }
 
     #[test]

@@ -1669,6 +1669,10 @@ pub trait Storage {
         )
         .map_err(|err| StorageError::IoError(format!("rebuild visible entry: {err}")))?
         .into_iter()
+        // What was read above is not the branch's history (see
+        // `VisibleRowEntry::recorded_merge_base`): the entry may not say what its tips
+        // descend from.
+        .map(VisibleRowEntry::without_merge_base)
         .collect::<Vec<_>>();
         let encoded_history_rows = vec![encode_history_row_bytes_with_context(
             &context,

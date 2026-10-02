@@ -436,6 +436,18 @@ impl SyncManager {
         table: &str,
         row: &StoredRowBatch,
     ) -> Option<StoredRowBatch> {
+        self.pre_batch_visible_row_read(storage, table, row, true)
+    }
+
+    /// [`Self::pre_batch_visible_row`], with the read from the parents themselves
+    /// (`from_tips`) switched off for the tests that hold it to the walk's answer.
+    pub(super) fn pre_batch_visible_row_read<H: Storage>(
+        &self,
+        storage: &H,
+        table: &str,
+        row: &StoredRowBatch,
+        from_tips: bool,
+    ) -> Option<StoredRowBatch> {
         let row_locator = storage.load_row_locator(row.row_id).ok().flatten();
         if row.parents.is_empty() && row_locator.is_none() {
             return None;
@@ -495,6 +507,16 @@ impl SyncManager {
         // decision that is made. Nothing is read twice to learn it.
         let declared_parents: HashSet<crate::row_histories::BatchId> =
             row.parents.iter().copied().collect();
+
+        // `JAZZ_HISTORY_FASTPATH=0` switches this off with the rest: the walk alone
+        // decides, as it did before the read from the parents existed.
+        if from_tips
+            && crate::row_histories::history_fastpath_enabled()
+            && let Some(answer) =
+                Self::pre_batch_visible_row_from_tips(storage, &history_table, row)
+        {
+            return answer;
+        }
 
         let mut ancestors = Vec::new();
         let mut seen = HashSet::new();
@@ -604,6 +626,101 @@ impl SyncManager {
         )
         .ok()
         .flatten()
+    }
+
+    /// What a write naming several parents was written over, read from the parents
+    /// themselves instead of from everything they descend from.
+    ///
+    /// The walk in [`Self::pre_batch_visible_row`] collects every visible version the
+    /// declared parents descend from and merges that set's tips. A device holding two
+    /// tips of a row names both in its next write, so on a row presence heartbeats have
+    /// grown to 20 000 versions the walk reads 20 000 versions to learn what two of them
+    /// already say. Three shapes are decided without it; `None` leaves the walk to decide.
+    ///
+    /// - **One parent stands above the rest**: every other declared parent is a parent of
+    ///   a declared parent, so all of them but one are written over inside the set. The
+    ///   set has one tip and the row before the write is that parent.
+    /// - **The row has several tips and the parents include every one**: then the set the
+    ///   walk collects is the row's visible history short of what a delivered snapshot
+    ///   already superseded, its tips are the row's tips, and the row before the write is
+    ///   the one this store shows — which it keeps, merged, in the visible entry. Only an
+    ///   entry that records what its tips descend from is asked
+    ///   ([`VisibleRowEntry::records_merge_base`]): a one-tip entry can have been written
+    ///   without a look at the history, and the walk does not depend on it.
+    ///
+    /// - **A declared parent is not held, and the write is not a delete**: the write will
+    ///   be refused for that parent, and there is no row to judge it against. The walk says
+    ///   so too, but only when it comes to that parent — after reading everything the
+    ///   parents named after it descend from, an order the writer chooses.
+    ///
+    /// A delete naming a parent that is not held, and a parent this store holds but does
+    /// not show, are left to the walk: it has rules for both.
+    pub(super) fn pre_batch_visible_row_from_tips<H: Storage>(
+        storage: &H,
+        history_table: &str,
+        row: &StoredRowBatch,
+    ) -> Option<Option<StoredRowBatch>> {
+        if row.parents.len() < 2 {
+            return None;
+        }
+        let mut parents = Vec::with_capacity(row.parents.len());
+        let mut absent = false;
+        for parent in &row.parents {
+            match storage
+                .load_history_row_batch(history_table, row.branch.as_str(), row.row_id, *parent)
+                .ok()
+                .flatten()
+            {
+                Some(parent) => parents.push(parent),
+                None => absent = true,
+            }
+        }
+        if absent {
+            // The walk answers `None` the moment it loads a declared parent this store
+            // does not hold, for every write but a delete — and it reaches that parent
+            // only after everything the parents named after it descend from.
+            if row.is_deleted {
+                return None;
+            }
+            #[cfg(test)]
+            note_pre_write_row_from_tips(2);
+            return Some(None);
+        }
+        if parents
+            .iter()
+            .any(|parent| !parent.state.is_visible() || parent.batch_id == row.batch_id)
+        {
+            return None;
+        }
+
+        let mut tops = parents.iter().filter(|candidate| {
+            !parents
+                .iter()
+                .any(|other| other.parents.contains(&candidate.batch_id()))
+        });
+        if let (Some(top), None) = (tops.next(), tops.next()) {
+            #[cfg(test)]
+            note_pre_write_row_from_tips(0);
+            return Some(Some(top.clone()));
+        }
+
+        let entry = storage
+            .load_visible_region_entry(history_table, row.branch.as_str(), row.row_id)
+            .ok()
+            .flatten()?;
+        // The entry is taken at its word only where it was built from the row's history.
+        if !entry.records_merge_base() {
+            return None;
+        }
+        entry
+            .branch_frontier
+            .iter()
+            .all(|tip| row.parents.contains(tip))
+            .then(|| {
+                #[cfg(test)]
+                note_pre_write_row_from_tips(1);
+                Some(entry.current_row)
+            })
     }
 
     pub(super) fn history_rows_visible_before_batch(
@@ -3080,4 +3197,21 @@ impl SyncManager {
             _ => {}
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Answers `pre_batch_visible_row_from_tips` gave on this thread, by the shape that
+    /// answered: `[one parent above the rest, every tip named, a parent not held]`.
+    pub(super) static PRE_WRITE_ROW_FROM_TIPS_ON_THREAD: std::cell::Cell<[u64; 3]> =
+        const { std::cell::Cell::new([0, 0, 0]) };
+}
+
+#[cfg(test)]
+fn note_pre_write_row_from_tips(shape: usize) {
+    PRE_WRITE_ROW_FROM_TIPS_ON_THREAD.with(|answers| {
+        let mut counted = answers.get();
+        counted[shape] += 1;
+        answers.set(counted);
+    });
 }

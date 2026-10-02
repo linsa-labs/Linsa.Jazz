@@ -22,8 +22,9 @@ use crate::storage::{IndexMutation, PreparedRowWriteContext, RowLocator, Storage
 use crate::sync_manager::DurabilityTier;
 
 use super::fastpath::{
-    HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS, PATCH_FASTPATH_FALLBACKS,
-    PATCH_FASTPATH_HITS, try_in_place_tip_update_entry, try_serial_fastpath_entry,
+    FORKED_FASTPATH_HITS, HISTORY_FASTPATH_FALLBACKS, HISTORY_FASTPATH_HITS,
+    PATCH_FASTPATH_FALLBACKS, PATCH_FASTPATH_HITS, try_forked_fastpath_entry,
+    try_in_place_tip_update_entry, try_serial_fastpath_entry,
 };
 use super::resolution::visible_entry_from_history_rows;
 use super::types::{
@@ -317,8 +318,28 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
         }
 
         let fast_entry = match existing_row.as_ref() {
-            // Brand-new batch: the serial-append fast path.
-            None => try_serial_fastpath_entry(previous_entry.as_ref(), &row),
+            // Brand-new batch: the serial-append fast path, and for a row with more
+            // than one tip the construction from its tips.
+            None => try_serial_fastpath_entry(previous_entry.as_ref(), &row).or_else(|| {
+                let entry = try_forked_fastpath_entry(
+                    context.user_descriptor().as_ref(),
+                    previous_entry.as_ref(),
+                    &row,
+                    &|batch_id| {
+                        io.load_history_row_batch(&table, branch_name.as_str(), object_id, batch_id)
+                            .ok()
+                            .flatten()
+                    },
+                )?;
+                FORKED_FASTPATH_HITS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                super::fastpath::FORKED_FASTPATH_ARMS_ON_THREAD.with(|arms| {
+                    let mut taken = arms.get();
+                    taken[usize::from(entry.branch_frontier.len() > 1)] += 1;
+                    arms.set(taken);
+                });
+                Some(entry)
+            }),
             // Same batch id with different content — an in-place replace.
             // Two provable re-apply shapes get a fast path; everything else
             // takes the full path.

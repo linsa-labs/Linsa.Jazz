@@ -1,8 +1,10 @@
 //! History fast paths for [`apply_row_batch`](super::apply_row_batch) and
 //! [`patch_row_batch_state`](super::patch_row_batch_state).
 //!
-//! Two O(1) constructions of the next [`VisibleRowEntry`], both bypassing
-//! `load_branch_history` / full `visible_entry_from_history_rows` rebuilds:
+//! Three constructions of the next [`VisibleRowEntry`] that bypass
+//! `load_branch_history` / full `visible_entry_from_history_rows` rebuilds — two of
+//! them O(1), the third reading the row's tips and the one version they have in
+//! common:
 //!
 //! - [`try_serial_fastpath_entry`] — a visible batch whose parent set equals
 //!   the entire previous branch frontier dominates every old tip: after
@@ -15,6 +17,10 @@
 //!   `state`/`confirmed_tier` changed while it is the sole frontier tip
 //!   (tier confirmations): `current_row` swaps in place, the frontier is
 //!   unchanged.
+//! - [`try_forked_fastpath_entry`] — a write to a row with more than one tip,
+//!   which the serial path declines: over every tip, or over one of them. The
+//!   entry is merged from the tips, read by their ids, over the version the
+//!   previous entry recorded as common to them.
 //!
 //! Visible→non-visible flips (`→ Rejected`/`→ Superseded`) NEVER get a fast
 //! path: removing a batch from the visible set can expose a previously
@@ -24,8 +30,30 @@
 //! The bar is byte-exactness: the constructed entry must equal the full
 //! rebuild bit for bit (enforced after every op by the randomized differential
 //! oracle in `storage::conformance_differential`). Every eligibility guard
-//! below exists to keep that provable from O(1) state; any miss falls back to
-//! the full path, which is always correct.
+//! below exists to keep that provable from the entry and the tips; any miss
+//! falls back to the full path, which is always correct.
+//!
+//! What every construction proves is a step: IF the previous entry is the one
+//! the history builds, so is the next. None of them looks under the entry, so
+//! none repairs an entry that is not. Entries that are not are known:
+//!
+//! - [`snapshot_dominates_frontier`] asks whether the tip it replaces has
+//!   parents, and a store that keeps entries in the flat visible encoding reads
+//!   every tip back without them — a delivered snapshot then takes the place of
+//!   a tip the history keeps beside it. A rebuild puts that tip back; a write
+//!   taken by the serial path leaves it out;
+//! - a delete restored after its rejection is written as a one-tip entry
+//!   without a look at the history;
+//! - the cleanup of a batch this store itself rejected rebuilds the entry from
+//!   the versions stored under one schema version;
+//! - the offline graft (`storage::graft`) adds versions to a history and leaves
+//!   the entry built from the history without them; it takes the recorded merge
+//!   base off first.
+//!
+//! The first two leave an entry with one tip and the other two leave it without
+//! a merge base, so [`try_forked_fastpath_entry`] takes none of them. The serial
+//! path does, and the in-place path a one-tip entry, as they always have: they
+//! trust an entry's tips, not what the tips descend from.
 //!
 //! Why the per-tier carry-forward is subtle: the rebuild computes each tier
 //! preview over the *tier-filtered* row set. Since v13-2 the tier frontier
@@ -46,8 +74,13 @@ use smallvec::SmallVec;
 
 use crate::sync_manager::DurabilityTier;
 
+use std::collections::HashMap;
+
+use crate::query_manager::types::RowDescriptor;
+
 use super::codecs::tier_satisfies;
-use super::types::{BatchId, StoredRowBatch, VisibleRowEntry};
+use super::resolution::{assign_winner_ordinals, merge_frontier_preview};
+use super::types::{BatchId, MergeBase, StoredRowBatch, VisibleRowEntry};
 
 /// Applies that constructed the visible entry without a history rebuild.
 /// Population: previous entry present, incoming row visible — covering fresh
@@ -67,6 +100,21 @@ pub static HISTORY_FASTPATH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 pub static PATCH_FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
 /// Patches in the same population that still took the full-history rebuild.
 pub static PATCH_FASTPATH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Applies to a row with more than one tip that constructed the visible entry from its
+/// tips and their recorded common version ([`try_forked_fastpath_entry`]).
+/// Counted in [`HISTORY_FASTPATH_HITS`] as well.
+pub static FORKED_FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// [`FORKED_FASTPATH_HITS`] as this thread alone raised it, by what the entry was built
+    /// from: `[a write over every tip, a write over one tip of several]`. A test that
+    /// needs to know each was exercised counts here — the process-wide counter is raised
+    /// by every test running at the same moment and does not tell the two apart.
+    pub(crate) static FORKED_FASTPATH_ARMS_ON_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
+}
 
 /// Hot-path scan tripwire: tier-gated query reads
 /// (`load_visible_region_row_for_tier`) that fell into the full
@@ -223,7 +271,7 @@ pub(super) fn try_serial_fastpath_entry(
         || previous.worker_winner_ordinals.is_some()
         || previous.edge_winner_ordinals.is_some()
         || previous.global_winner_ordinals.is_some()
-        || previous.merge_artifacts.is_some()
+        || records_more_than_a_merge_base(previous)
     {
         return None;
     }
@@ -248,10 +296,6 @@ pub(super) fn try_serial_fastpath_entry(
         previous.global_batch_id,
     )?;
 
-    debug_assert!(
-        previous.merge_artifacts.is_none(),
-        "never-forked guard admits only entries without merge artifacts"
-    );
     Some(VisibleRowEntry {
         current_row: row.clone(),
         branch_frontier: vec![row.batch_id()],
@@ -265,6 +309,21 @@ pub(super) fn try_serial_fastpath_entry(
         global_winner_ordinals: None,
         merge_artifacts: None,
     })
+}
+
+/// Whether the entry's `merge_artifacts` say anything besides which version its tips
+/// descend from.
+///
+/// A rebuild records that version ([`MergeBase`]) for every entry with more than one tip,
+/// and it is no evidence of a live merged preview: an entry whose newest tip won every
+/// column has an empty pool and no ordinals, and a write naming exactly its tips has always
+/// been taken here. Bytes this build cannot read are evidence of something it does not
+/// know, and decline.
+fn records_more_than_a_merge_base(previous: &VisibleRowEntry) -> bool {
+    previous
+        .merge_artifacts
+        .as_deref()
+        .is_some_and(|bytes| MergeBase::decode(bytes).is_none())
 }
 
 /// The second admission arm: a delivered snapshot dominating a frontier that is itself one
@@ -307,6 +366,159 @@ fn snapshot_dominates_frontier(row: &StoredRowBatch, previous: &VisibleRowEntry)
     let dominator = super::resolution::elided_snapshot_dominator([row, old_tip].into_iter());
     dominator.is_some_and(|winner| winner.batch_id == row.batch_id())
         && super::resolution::superseded_by_snapshot(old_tip, dominator)
+}
+
+/// Attempt the construction of the next [`VisibleRowEntry`] of a row that has more than one
+/// tip, from its tips and the version they have in common. `load` reads one version of the
+/// row by its id.
+///
+/// A row keeps more than one tip for as long as nobody writes over all of them at once,
+/// and nobody may ever do: a device shown the row under its newest tip's id writes over
+/// that one, and the others stay. [`try_serial_fastpath_entry`] declines every write to
+/// such a row, and the full path reads the row's whole history for it — measured at
+/// 215 ms a write on a `users` row with 20 000 versions and one such tip.
+///
+/// Two shapes are admitted. In both the incoming row is new to the history, visible, not
+/// a delete, names at least one parent, and neither it nor the entry carries a tier
+/// (see [`carries_no_tier`]) — which is how every directly written row is stored. In both
+/// the entry has several tips and records the version they descend from
+/// ([`VisibleRowEntry::recorded_merge_base`]).
+///
+/// - **It names every tip.** Whatever else it names is a version already written over,
+///   so afterwards it is the only tip and the row readers see is the incoming row.
+/// - **It names one tip, and besides it only that tip's own parents.** The other tips
+///   stay. The row readers see is the merge of the new set of tips over their common
+///   ancestor, and that ancestor is the one the entry recorded (`MergeBase`): the
+///   incoming row descends from what the tip it replaces descended from and from nothing
+///   else, so the versions common to all tips are the same set as before.
+///
+/// Anything else — a write naming two tips of three, a write naming no tip, a delete, a
+/// row with tier state, an entry with one tip or one that recorded no base — returns
+/// `None`, and the caller reads the history, which is always right.
+pub(super) fn try_forked_fastpath_entry(
+    user_descriptor: &RowDescriptor,
+    previous_entry: Option<&VisibleRowEntry>,
+    row: &StoredRowBatch,
+    load: &dyn Fn(BatchId) -> Option<StoredRowBatch>,
+) -> Option<VisibleRowEntry> {
+    if !history_fastpath_enabled() {
+        return None;
+    }
+    if !row.state.is_visible() || row.delete_kind.is_some() || row.parents.is_empty() {
+        return None;
+    }
+    let previous = previous_entry?;
+    if previous.current_row.branch != row.branch || !carries_no_tier(previous, row) {
+        return None;
+    }
+    // Only an entry that has several tips and says what they descend from is taken at
+    // its word: a rebuild wrote it, or this path did from one a rebuild wrote. An entry
+    // with one tip can stand for a history that has more (see the module's note on
+    // delivered snapshots), and a write naming that tip and other versions is where a
+    // rebuild finds them again.
+    let base = previous.recorded_merge_base()?;
+    let frontier = &previous.branch_frontier;
+    let named: SmallVec<[BatchId; 2]> = frontier
+        .iter()
+        .copied()
+        .filter(|tip| row.parents.contains(tip))
+        .collect();
+
+    if named.len() == frontier.len() {
+        // Every tip is named: one tip from here on, and nothing to merge.
+        return Some(VisibleRowEntry::new(row.clone()));
+    }
+    let [named] = named.as_slice() else {
+        return None;
+    };
+
+    // The tip the row replaces is one this store shows, like every other version the
+    // entry is trusted about below. What the row names besides it must be something the
+    // tip itself descends from, or the row brings ancestors of its own and the common
+    // ancestor may move.
+    let replaced = load(*named)?;
+    if !replaced.state.is_visible()
+        || row
+            .parents
+            .iter()
+            .any(|parent| parent != named && !replaced.parents.contains(parent))
+    {
+        return None;
+    }
+
+    let mut tips: Vec<StoredRowBatch> = Vec::with_capacity(frontier.len());
+    for tip in frontier {
+        if tip == named {
+            continue;
+        }
+        let tip = load(*tip)?;
+        if !tip.state.is_visible() {
+            return None;
+        }
+        tips.push(tip);
+    }
+    tips.push(row.clone());
+    let ancestor = match base.ancestor {
+        Some(ancestor) => {
+            let ancestor = load(ancestor)?;
+            if !ancestor.state.is_visible() {
+                return None;
+            }
+            Some(ancestor)
+        }
+        None => None,
+    };
+
+    let mut ordered: Vec<&StoredRowBatch> = tips.iter().collect();
+    ordered.sort_by_key(|tip| (tip.updated_at, tip.batch_id()));
+    let preview = merge_frontier_preview(user_descriptor, &ordered, ancestor.as_ref()).ok()?;
+    // A merged row carries the lowest tier among the rows it took a column from, and
+    // none of them has one.
+    if preview.row.confirmed_tier.is_some() {
+        return None;
+    }
+
+    let mut branch_frontier: Vec<BatchId> = tips.iter().map(StoredRowBatch::batch_id).collect();
+    branch_frontier.sort();
+    let mut winner_batch_pool = Vec::new();
+    let current_winner_ordinals = assign_winner_ordinals(
+        preview.winner_batch_ids.as_deref(),
+        &mut winner_batch_pool,
+        &mut HashMap::new(),
+    )
+    .ok()?;
+
+    Some(VisibleRowEntry {
+        current_row: preview.row,
+        branch_frontier,
+        worker_batch_id: None,
+        edge_batch_id: None,
+        global_batch_id: None,
+        winner_batch_pool,
+        current_winner_ordinals,
+        worker_winner_ordinals: None,
+        edge_winner_ordinals: None,
+        global_winner_ordinals: None,
+        merge_artifacts: Some(base.encode()),
+    })
+}
+
+/// No version of the row satisfies any tier, before the incoming row or with it.
+///
+/// A tier's view of a row is computed over the versions confirmed at that tier, and the
+/// entry holds a pointer to it wherever it differs from the row readers see. With every
+/// pointer empty and the row readers see itself unconfirmed, no tier has a view at all:
+/// a tier whose view exists and equals the current row would have confirmed the current
+/// row. An incoming row with no tier adds nothing to any of them.
+fn carries_no_tier(previous: &VisibleRowEntry, row: &StoredRowBatch) -> bool {
+    row.confirmed_tier.is_none()
+        && previous.current_row.confirmed_tier.is_none()
+        && previous.worker_batch_id.is_none()
+        && previous.edge_batch_id.is_none()
+        && previous.global_batch_id.is_none()
+        && previous.worker_winner_ordinals.is_none()
+        && previous.edge_winner_ordinals.is_none()
+        && previous.global_winner_ordinals.is_none()
 }
 
 fn parents_cover_frontier_exactly(parents: &[BatchId], frontier: &[BatchId]) -> bool {

@@ -425,9 +425,88 @@ pub(crate) struct SnapshotDominator {
 pub(super) struct ComputedVisiblePreview {
     pub(super) row: StoredRowBatch,
     pub(super) winner_batch_ids: Option<Vec<BatchId>>,
+    /// What the tips were merged over, when there was more than one tip.
+    pub(super) merge_base: Option<MergeBase>,
+}
+
+/// What a row with more than one tip is merged over: the latest version every tip descends
+/// from, or none when the tips share no version.
+///
+/// Kept with the row's visible entry (`VisibleRowEntry::merge_artifacts`), because it is
+/// the one input of the merge that cannot be read off the tips, and it does not move while
+/// a tip is written over: the new tip descends from everything the old one did, and from
+/// nothing the other tips descend from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MergeBase {
+    pub(super) ancestor: Option<BatchId>,
+}
+
+impl MergeBase {
+    const VERSION: u8 = 1;
+
+    pub(super) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(18);
+        bytes.push(Self::VERSION);
+        match self.ancestor {
+            Some(ancestor) => {
+                bytes.push(1);
+                bytes.extend_from_slice(ancestor.as_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes
+    }
+
+    /// `None` for bytes this build did not write: the caller then knows nothing of the
+    /// base and takes the history.
+    pub(super) fn decode(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [Self::VERSION, 0] => Some(Self { ancestor: None }),
+            [Self::VERSION, 1, ancestor @ ..] => Some(Self {
+                ancestor: Some(BatchId(<[u8; 16]>::try_from(ancestor).ok()?)),
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl VisibleRowEntry {
+    /// The version this entry's tips descend from, if it has several tips and says so.
+    ///
+    /// Such an entry was built from its branch's history by a rebuild, or from an entry
+    /// that was, by a write over one of its tips. Everything else is `None`:
+    ///
+    /// - an entry with one tip. It can come from paths that never looked at the history:
+    ///   a delivered snapshot taken over a tip (`fastpath::snapshot_dominates_frontier`),
+    ///   a delete restored after its rejection;
+    /// - an entry written by the cleanup of a batch this store itself rejected
+    ///   (`patch_exact_row_batch_for_schema_hash`). It is rebuilt from the versions stored
+    ///   under one schema version — of every branch, and in memory of every schema version
+    ///   too — which is not the branch's history, so it is stored without a base
+    ///   ([`Self::without_merge_base`]);
+    /// - bytes this build did not write.
+    pub(super) fn recorded_merge_base(&self) -> Option<MergeBase> {
+        if self.branch_frontier.len() < 2 {
+            return None;
+        }
+        MergeBase::decode(self.merge_artifacts.as_deref()?)
+    }
+
+    /// Whether [`Self::recorded_merge_base`] has an answer.
+    pub(crate) fn records_merge_base(&self) -> bool {
+        self.recorded_merge_base().is_some()
+    }
+
+    /// This entry as a writer that did not read the branch's history must store it: it
+    /// says nothing about what its tips descend from, and a write over fewer than all of
+    /// them reads the history to find out. Its tips and the row it shows are still taken
+    /// as they are: by every query, and by a write naming exactly its tips wherever the
+    /// serial path takes such a write (an entry with no winner pool and no ordinals).
+    pub(crate) fn without_merge_base(mut self) -> Self {
+        self.merge_artifacts = None;
+        self
+    }
+
     pub fn new(current_row: StoredRowBatch) -> Self {
         Self {
             branch_frontier: vec![current_row.batch_id()],
@@ -471,6 +550,12 @@ impl VisibleRowEntry {
         }
     }
 
+    /// The entry `history_rows` build.
+    ///
+    /// For an entry with several tips this records the version they descend from, as
+    /// found among `history_rows` — which is the truth only if they are one branch's
+    /// whole history of the row. A caller that hands it anything else stores the result
+    /// [`Self::without_merge_base`].
     pub fn rebuild_with_descriptor(
         user_descriptor: &RowDescriptor,
         history_rows: &[StoredRowBatch],
@@ -535,7 +620,7 @@ impl VisibleRowEntry {
             worker_winner_ordinals,
             edge_winner_ordinals,
             global_winner_ordinals,
-            merge_artifacts: None,
+            merge_artifacts: current_preview.merge_base.map(MergeBase::encode),
         }))
     }
 

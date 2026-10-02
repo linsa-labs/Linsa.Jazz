@@ -205,6 +205,15 @@ pub static WINDOW_GROWTHS: AtomicU64 = AtomicU64::new(0);
 /// [`HISTORY_SCANS`] it gives the mean depth the pass paid for.
 pub static HISTORY_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// [`HISTORY_ENTRIES`] as this thread alone raised it. The process-wide counter is
+    /// raised by every test of the binary running at the same moment, so a unit test
+    /// that asserts a ceiling counts here.
+    pub(crate) static HISTORY_ENTRIES_ON_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Bytes of row payload decoded out of history. Separated from the entry count
 /// because the two failure modes are different: many small revisions (heartbeat
 /// depth) versus few enormous ones (blob rows), and they need different fixes.

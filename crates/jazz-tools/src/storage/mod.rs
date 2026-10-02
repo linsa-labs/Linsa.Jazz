@@ -3200,6 +3200,9 @@ fn decode_history_row_bytes_in_table(
     // Every history-decoding path funnels through here, so this is the one place
     // that can say what a settle actually spent on accumulated history.
     crate::query_manager::settle_cost::bump(&crate::query_manager::settle_cost::HISTORY_ENTRIES);
+    #[cfg(test)]
+    crate::query_manager::settle_cost::HISTORY_ENTRIES_ON_THREAD
+        .with(|count| count.set(count.get() + 1));
     crate::query_manager::settle_cost::add(
         &crate::query_manager::settle_cost::HISTORY_BYTES,
         bytes.len() as u64,
@@ -3850,6 +3853,10 @@ pub(crate) fn patch_exact_row_batch_with_storage<H: Storage + ?Sized>(
     )
     .map_err(|err| StorageError::IoError(format!("rebuild visible entry: {err}")))?
     .into_iter()
+    // What was read above is not the branch's history (see
+    // `VisibleRowEntry::recorded_merge_base`): the entry may not say what its tips
+    // descend from.
+    .map(VisibleRowEntry::without_merge_base)
     .collect::<Vec<_>>();
 
     storage.apply_row_mutation(table, std::slice::from_ref(&row), &visible_entries, &[])?;

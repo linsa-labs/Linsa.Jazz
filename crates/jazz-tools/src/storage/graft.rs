@@ -16,10 +16,26 @@
 //! - its authoritative batch fate, only where the target has none;
 //! - the row locator, only if the target lacks it.
 //!
-//! What it never writes: visible-region entries (visibility moves through the normal apply
-//! path when the next batch lands), secondary indexes (derived from visibility), sealed
-//! submissions (deleted after settlement; recovery would re-validate ancient ones against
-//! today's frontier), branch ords (store-local), local batch records (authoring-side).
+//! What it never writes: which version a row shows and which are its tips (they move
+//! through the normal apply path when a batch lands that does not name every tip — one
+//! that does is taken over the entry as it stands), secondary indexes (derived from
+//! visibility), sealed submissions (deleted after settlement; recovery would re-validate
+//! ancient ones against today's frontier), branch ords (store-local), local batch records
+//! (authoring-side).
+//!
+//! One thing it takes away, before it adds anything: what the visible entry records
+//! about the version its tips descend from (`VisibleRowEntry::recorded_merge_base`), on
+//! every branch the source has a version of that the target cannot reach — the branches
+//! a version may be added to, whether or not this run gets as far as adding it. That
+//! record was made from a history the graft is about to change, and a write over one of
+//! the tips would be merged on it without a look at the history; without it that write
+//! reads the history. First, so that a graft that stops part-way leaves none behind: a
+//! second run finds the versions the first one added and, with nothing left to add,
+//! leaves the entry alone. The entry is stored again in the raw table it was read from,
+//! under the descriptor it was read with, and is not placed anew by the row locator. A
+//! read that found it by neither locator, in the table of some schema version, leaves
+//! that table named by the entry's own locator on the way back: the same place, now
+//! found directly.
 //!
 //! Conflicts are judged by AUTHORSHIP — branch, data, timestamp, author — not by bytes
 //! (encoders drift), not by full struct equality (state and tier legitimately differ), and
@@ -28,16 +44,17 @@
 //! Parentless copies of non-root batches are skipped, never grafted: writing one would
 //! hollow out the very chain being repaired.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    Storage, StorageError, encode_history_row_bytes_with_context,
-    prepared_row_write_context_for_schema_hash,
+    OwnedVisibleRowBytes, Storage, StorageError, encode_history_row_bytes_with_context,
+    load_visible_region_row_bytes_with_storage, prepared_row_write_context_for_schema_hash,
 };
 use crate::object::ObjectId;
 use crate::row_histories::{RowState, StoredRowBatch};
 
-/// What one graft run did — and, run again, what it should report as all zeros.
+/// What one graft run did. Run again, it grafts nothing and copies no fate, and counts
+/// as present what the first run added.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GraftReport {
     pub batches_grafted: usize,
@@ -50,8 +67,12 @@ pub struct GraftReport {
 /// Copy the missing history links for `row_id` from `source` into `target`.
 ///
 /// Both stores must be offline copies — the RocksDB lock enforces it for that backend.
-/// Additive and idempotent: nothing existing is overwritten, and a second run reports
-/// zero grafts.
+/// Additive and idempotent: no version, fate or locator that exists is overwritten, and
+/// a second run grafts nothing, and writes nothing on a branch where every version of
+/// the source is within its reach. The one thing rewritten is the visible entry of a
+/// branch a version is missing from, less its recorded merge base (see the module doc);
+/// that, and a row locator the target lacked, are written before a refusal that comes
+/// later in the run.
 pub fn graft_row_history<T, S>(
     target: &mut T,
     source: &S,
@@ -89,6 +110,24 @@ where
         .into_iter()
         .map(|row| ((row.branch.to_string(), row.batch_id), row))
         .collect();
+
+    // Before anything is added (see the module doc): the branches the source has a
+    // version of that the target cannot reach. More than the branches this run adds to
+    // — it may skip such a version, or refuse one — and never fewer.
+    let mut branches: BTreeSet<&str> = BTreeSet::new();
+    for row in &source_batches {
+        let branch = row.branch.as_str();
+        if !branches.contains(branch)
+            && target
+                .load_history_row_batch(table, branch, row_id, row.batch_id)?
+                .is_none()
+        {
+            branches.insert(branch);
+        }
+    }
+    for branch in branches {
+        forget_recorded_merge_base(target, table, branch, row_id)?;
+    }
 
     let same_authorship = |a: &StoredRowBatch, b: &StoredRowBatch| {
         a.branch == b.branch
@@ -180,6 +219,39 @@ where
     }
 
     Ok(report)
+}
+
+/// Stores the visible entry of `(branch, row)` again without the version it records its
+/// tips as descending from, if it records one. Bytes this build cannot read stay: they
+/// keep the entry away from every path that does not read the history.
+fn forget_recorded_merge_base<T: Storage>(
+    target: &mut T,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+) -> Result<(), StorageError> {
+    let Some(entry) = target.load_visible_region_entry(table, branch, row_id)? else {
+        return Ok(());
+    };
+    if !entry.records_merge_base() {
+        return Ok(());
+    }
+    let entry = entry.without_merge_base();
+    let Some(stored) = load_visible_region_row_bytes_with_storage(target, table, branch, row_id)?
+    else {
+        // A backend that keeps its entries decoded (`MemoryStorage`): there is no raw
+        // table to put this one back into, and its reads follow no locator to one.
+        return target.upsert_visible_region_rows(table, &[entry]);
+    };
+    // Back where it was read from, under the descriptor it was read with. Placing it
+    // anew would ask the row locator, which may name another schema version than the
+    // one the entry lives under, and move it there.
+    let bytes = crate::row_histories::encode_flat_visible_row_entry(
+        stored.user_descriptor.as_ref(),
+        &entry,
+    )
+    .map_err(|err| StorageError::IoError(format!("encode flat visible row: {err}")))?;
+    target.apply_encoded_row_mutation(table, &[], &[OwnedVisibleRowBytes { bytes, ..stored }], &[])
 }
 
 #[cfg(test)]
@@ -328,6 +400,504 @@ mod tests {
         assert_eq!(again.batches_already_present, 3);
     }
 
+    /// A row the target holds without one link of its chain — c0, c2 and two versions over
+    /// c2, but not c1 — and a source that has all of it. The target's entry was built
+    /// from what the target holds, so it records an ancestor found without c1.
+    #[cfg(feature = "sqlite")]
+    struct MissingLink {
+        _dir: tempfile::TempDir,
+        source: crate::storage::SqliteStorage,
+        target: crate::storage::SqliteStorage,
+        row_id: ObjectId,
+        /// c0, c1, c2, left, right.
+        rows: Vec<StoredRowBatch>,
+        /// The schema version the target's entry was stored under.
+        entry_stored_under: SchemaHash,
+        /// The schema version the target's row locator names.
+        row_located_under: SchemaHash,
+    }
+
+    #[cfg(feature = "sqlite")]
+    impl MissingLink {
+        /// `entry_elsewhere`: the target's entry lives under another schema version than
+        /// its row locator names, with the same `users` — as a row does that was first
+        /// shown before a change of schema that left its table alone.
+        fn new(entry_elsewhere: bool) -> Self {
+            use crate::row_histories::VisibleRowEntry;
+            use crate::storage::SqliteStorage;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let row_id = ObjectId::new();
+            let schema = users_schema_v1();
+            // The same `users` beside a table the other version does not have.
+            let schema_beside = SchemaBuilder::new()
+                .table(
+                    TableSchema::builder("users")
+                        .column("id", ColumnType::Uuid)
+                        .column("name", ColumnType::Text),
+                )
+                .table(TableSchema::builder("notes").column("body", ColumnType::Text))
+                .build();
+            let locator = |hash| RowLocator {
+                table: "users".into(),
+                origin_schema_hash: Some(hash),
+            };
+            let users = &schema[&crate::query_manager::types::TableName::new("users")].columns;
+
+            // c0 <- c1 <- c2, and two versions over c2.
+            let mut rows = chain(row_id, &schema, 3);
+            for (name, at) in [("left", 2_000), ("right", 2_001)] {
+                let data = encode_row(users, &[Value::Uuid(row_id), Value::Text(name.to_string())])
+                    .expect("encode row");
+                rows.push(StoredRowBatch::new(
+                    row_id,
+                    "main",
+                    vec![rows[2].batch_id()],
+                    data,
+                    RowProvenance::for_insert("author", at),
+                    HashMap::new(),
+                    RowState::VisibleDirect,
+                    None,
+                ));
+            }
+
+            let mut source = SqliteStorage::open(dir.path().join("source.sqlite")).unwrap();
+            let v1 = persist_schema(&mut source, &schema);
+            source.put_row_locator(row_id, Some(&locator(v1))).unwrap();
+            source.append_history_region_rows("users", &rows).unwrap();
+
+            let mut target = SqliteStorage::open(dir.path().join("target.sqlite")).unwrap();
+            persist_schema(&mut target, &schema);
+            let beside = persist_schema(&mut target, &schema_beside);
+            let row_located_under = if entry_elsewhere { beside } else { v1 };
+            target
+                .put_row_locator(row_id, Some(&locator(row_located_under)))
+                .unwrap();
+            let held: Vec<StoredRowBatch> = rows
+                .iter()
+                .filter(|row| row.batch_id() != rows[1].batch_id())
+                .cloned()
+                .collect();
+            target.append_history_region_rows("users", &held).unwrap();
+            let built = VisibleRowEntry::rebuild_with_descriptor(users, &held)
+                .unwrap()
+                .expect("the row has a visible version");
+            let context =
+                prepared_row_write_context_for_schema_hash(&target, "users", v1, row_id).unwrap();
+            let encoded =
+                super::super::encode_visible_row_bytes_with_context(&context, &built).unwrap();
+            target
+                .apply_encoded_row_mutation("users", &[], &[encoded], &[])
+                .unwrap();
+
+            let fixture = Self {
+                _dir: dir,
+                source,
+                target,
+                row_id,
+                rows,
+                entry_stored_under: v1,
+                row_located_under,
+            };
+            let entry = fixture.entry();
+            // The two versions over c2, and c0: without c1 nothing the target holds stands
+            // on it.
+            assert_eq!(entry.branch_frontier.len(), 3);
+            assert!(
+                entry.records_merge_base(),
+                "the fixture's entry records no ancestor: the gate would prove nothing"
+            );
+            assert_eq!(
+                fixture.entry_lives_in(),
+                vec![fixture.visible_table(v1)],
+                "control: the entry is stored once, under the version it was written under"
+            );
+            fixture
+        }
+
+        fn entry(&self) -> crate::row_histories::VisibleRowEntry {
+            self.target
+                .load_visible_region_entry("users", "main", self.row_id)
+                .unwrap()
+                .expect("the row is visible")
+        }
+
+        fn visible_table(&self, hash: SchemaHash) -> String {
+            crate::storage::RowRawTableId::new(
+                crate::storage::RowRawTableKind::Visible,
+                "users",
+                hash,
+            )
+            .raw_table_name()
+            .to_string()
+        }
+
+        /// Every raw table that holds a visible entry of the row.
+        fn entry_lives_in(&self) -> Vec<String> {
+            super::super::visible_row_raw_tables_holding(&self.target, "users", "main", self.row_id)
+                .unwrap()
+        }
+
+        fn graft(&mut self) -> Result<GraftReport, StorageError> {
+            graft_row_history(&mut self.target, &self.source, "users", self.row_id)
+        }
+    }
+
+    /// A graft changes the history an entry with several tips was built from, and such an
+    /// entry records the version its tips descend from: after the graft the record is
+    /// gone and nothing else of the entry has changed, so the next write over one tip is
+    /// merged on the history — which now says the creation is no tip.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_graft_takes_the_recorded_ancestor_off_the_entry_it_grafted_under() {
+        let mut row = MissingLink::new(false);
+        let before = row.entry();
+
+        let report = row.graft().unwrap();
+        assert_eq!(report.batches_grafted, 1);
+        let after = row.entry();
+        assert!(
+            !after.records_merge_base(),
+            "the entry still records an ancestor found in the history as it was before the graft"
+        );
+        assert_eq!(
+            after,
+            before.clone().without_merge_base(),
+            "the graft changed more of the entry than what it records of its tips' ancestor"
+        );
+        assert_eq!(
+            row.entry_lives_in(),
+            vec![row.visible_table(row.entry_stored_under)],
+            "the entry is not where it was"
+        );
+
+        // A write over one of the tips: merged on the history as it is now.
+        let left = row.rows[3].batch_id();
+        let right = row.rows[4].batch_id();
+        let users =
+            &users_schema_v1()[&crate::query_manager::types::TableName::new("users")].columns;
+        let over_left = StoredRowBatch::new(
+            row.row_id,
+            "main",
+            vec![left],
+            encode_row(
+                users,
+                &[
+                    Value::Uuid(row.row_id),
+                    Value::Text("over left".to_string()),
+                ],
+            )
+            .expect("encode row"),
+            RowProvenance::for_insert("author", 3_000),
+            HashMap::new(),
+            RowState::VisibleDirect,
+            None,
+        );
+        crate::row_histories::apply_row_batch(
+            &mut row.target,
+            row.row_id,
+            &crate::object::BranchName::new("main"),
+            over_left.clone(),
+            &[],
+        )
+        .expect("the write applies");
+        let written = row.entry();
+        let mut tips = written.branch_frontier.clone();
+        tips.sort();
+        let mut expected = vec![right, over_left.batch_id()];
+        expected.sort();
+        assert_eq!(
+            tips, expected,
+            "the creation is still a tip: the write was merged on what the entry said before the graft"
+        );
+        assert!(written.records_merge_base());
+    }
+
+    /// The entry goes back where it was read from. A row whose entry lives under another
+    /// schema version than its row locator names — the read finds it by its own locator —
+    /// is not moved to the version the row locator names, and both locators read as they
+    /// did. (An entry found by neither locator is not built here: its way back leaves
+    /// its own locator naming the table it was found in.)
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_graft_leaves_the_entry_under_the_schema_version_it_lives_under() {
+        let mut row = MissingLink::new(true);
+        assert_ne!(row.entry_stored_under, row.row_located_under);
+        let before = row.entry();
+        let located = |row: &MissingLink| {
+            (
+                row.target.load_row_locator(row.row_id).unwrap(),
+                row.target
+                    .load_visible_row_table_locator("main", row.row_id)
+                    .unwrap()
+                    .map(|locator| locator.schema_hash),
+            )
+        };
+        let located_before = located(&row);
+        assert_eq!(
+            located_before.1,
+            Some(row.entry_stored_under),
+            "control: the entry is found by a locator of its own"
+        );
+
+        let report = row.graft().unwrap();
+        assert_eq!(report.batches_grafted, 1);
+        assert_eq!(
+            row.entry_lives_in(),
+            vec![row.visible_table(row.entry_stored_under)],
+            "the graft moved the entry to another schema version"
+        );
+        assert_eq!(located(&row), located_before, "the graft changed a locator");
+        assert_eq!(row.entry(), before.without_merge_base());
+    }
+
+    /// The recorded ancestor is taken off before anything is added: a graft that stops —
+    /// here refused, at a version of the source that has not settled — may have added
+    /// versions already, and a second run that finds them present adds nothing and would
+    /// have no reason to come back for the entry.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_graft_that_stops_has_taken_the_recorded_ancestor_off_first() {
+        let mut row = MissingLink::new(false);
+        let users =
+            &users_schema_v1()[&crate::query_manager::types::TableName::new("users")].columns;
+        let unsettled = StoredRowBatch::new(
+            row.row_id,
+            "main",
+            vec![row.rows[2].batch_id()],
+            encode_row(
+                users,
+                &[
+                    Value::Uuid(row.row_id),
+                    Value::Text("unsettled".to_string()),
+                ],
+            )
+            .expect("encode row"),
+            RowProvenance::for_insert("author", 2_500),
+            HashMap::new(),
+            RowState::StagingPending,
+            None,
+        );
+        row.source
+            .append_history_region_rows("users", &[unsettled])
+            .unwrap();
+
+        row.graft()
+            .expect_err("a source with an unsettled version is refused");
+        assert!(
+            !row.entry().records_merge_base(),
+            "the graft stopped and left the entry recording an ancestor"
+        );
+    }
+
+    /// A run that finds every version of the source within reach on a branch leaves that
+    /// branch's entry alone, whatever it records: it changes no history there.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_graft_with_nothing_to_add_leaves_the_entry_as_it_is() {
+        let mut row = MissingLink::new(false);
+        let recording = row.entry();
+        assert_eq!(row.graft().unwrap().batches_grafted, 1);
+        // An entry that records an ancestor — the one from before the first run, put
+        // back; which ancestor it records is beside the point here.
+        row.target
+            .upsert_visible_region_rows("users", std::slice::from_ref(&recording))
+            .unwrap();
+        assert!(row.entry().records_merge_base());
+
+        let again = row.graft().unwrap();
+        assert_eq!(again.batches_grafted, 0);
+        assert_eq!(again.batches_already_present, 5);
+        assert_eq!(
+            row.entry(),
+            recording,
+            "a graft that added nothing rewrote the entry"
+        );
+    }
+
+    /// The strip is per branch. A row with versions on three branches, two of which the
+    /// target misses a link of and one it holds whole: after the graft the two have lost
+    /// what their entries recorded of an ancestor, and the third has kept it. In memory:
+    /// the branches are chosen by the same code on every backend, from what its point
+    /// lookup reaches; how an entry goes back into a raw table, and that it goes before
+    /// anything is added, is held by the gates above.
+    #[test]
+    fn a_graft_takes_the_recorded_ancestor_off_each_branch_missing_a_version_and_off_no_whole_one()
+    {
+        use crate::row_histories::VisibleRowEntry;
+
+        let row_id = ObjectId::new();
+        let schema = users_schema_v1();
+        let users = &schema[&crate::query_manager::types::TableName::new("users")].columns;
+        let locator = |hash| RowLocator {
+            table: "users".into(),
+            origin_schema_hash: Some(hash),
+        };
+        // c0 <- c1 <- c2 and two versions over c2, all on one branch.
+        let forked = |branch: &str, at: u64| {
+            let version = |name: String, parents: Vec<BatchId>, at: u64| {
+                StoredRowBatch::new(
+                    row_id,
+                    branch,
+                    parents,
+                    encode_row(users, &[Value::Uuid(row_id), Value::Text(name)])
+                        .expect("encode row"),
+                    RowProvenance::for_insert("author", at),
+                    HashMap::new(),
+                    RowState::VisibleDirect,
+                    None,
+                )
+            };
+            let mut rows: Vec<StoredRowBatch> = Vec::new();
+            for level in 0..3 {
+                let parents = rows.last().map(|row| row.batch_id()).into_iter().collect();
+                rows.push(version(format!("{branch} v{level}"), parents, at + level));
+            }
+            for (name, later) in [("left", 10), ("right", 11)] {
+                rows.push(version(
+                    format!("{branch} {name}"),
+                    vec![rows[2].batch_id()],
+                    at + later,
+                ));
+            }
+            rows
+        };
+
+        let mut source = MemoryStorage::new();
+        let v1 = persist_schema(&mut source, &schema);
+        source.put_row_locator(row_id, Some(&locator(v1))).unwrap();
+        let mut target = MemoryStorage::new();
+        persist_schema(&mut target, &schema);
+        target.put_row_locator(row_id, Some(&locator(v1))).unwrap();
+        let mut entries = Vec::new();
+        for (branch, at, misses_a_link) in [
+            ("main", 1_000, true),
+            ("draft", 2_000, true),
+            ("whole", 3_000, false),
+        ] {
+            let rows = forked(branch, at);
+            source.append_history_region_rows("users", &rows).unwrap();
+            let held: Vec<StoredRowBatch> = rows
+                .iter()
+                .filter(|row| !misses_a_link || row.batch_id() != rows[1].batch_id())
+                .cloned()
+                .collect();
+            target.append_history_region_rows("users", &held).unwrap();
+            let built = VisibleRowEntry::rebuild_with_descriptor(users, &held)
+                .unwrap()
+                .expect("the row has a visible version");
+            assert!(
+                built.records_merge_base(),
+                "branch {branch}: the fixture's entry records no ancestor"
+            );
+            target
+                .upsert_visible_region_rows("users", std::slice::from_ref(&built))
+                .unwrap();
+            entries.push((branch, misses_a_link, built));
+        }
+
+        let report = graft_row_history(&mut target, &source, "users", row_id).unwrap();
+        assert_eq!(report.batches_grafted, 2);
+        for (branch, missed_a_link, built) in entries {
+            let after = target
+                .load_visible_region_entry("users", branch, row_id)
+                .unwrap()
+                .expect("the row is visible");
+            if missed_a_link {
+                assert_eq!(
+                    after,
+                    built.without_merge_base(),
+                    "branch {branch}: a version was added under an entry that still records an ancestor"
+                );
+            } else {
+                assert_eq!(
+                    after, built,
+                    "branch {branch}: nothing was added to it, and its entry was rewritten"
+                );
+            }
+        }
+    }
+
+    /// Only what this build wrote is taken off. Bytes it cannot read keep the entry away
+    /// from every path that does not read the history, and they stay.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_graft_leaves_what_it_cannot_read_on_the_entry() {
+        let mut row = MissingLink::new(false);
+        let mut entry = row.entry();
+        entry.merge_artifacts = Some(vec![0xff, 0xff, 0xff]);
+        assert!(!entry.records_merge_base());
+        row.target
+            .upsert_visible_region_rows("users", &[entry.clone()])
+            .unwrap();
+
+        row.graft().unwrap();
+        assert_eq!(
+            row.entry().merge_artifacts,
+            entry.merge_artifacts,
+            "the graft took bytes it cannot read off the entry"
+        );
+    }
+
+    /// The same on a backend that keeps its visible entries decoded, where there is no raw
+    /// table to put the entry back into.
+    #[test]
+    fn a_graft_takes_the_recorded_ancestor_off_an_entry_kept_decoded() {
+        use crate::row_histories::VisibleRowEntry;
+
+        let row_id = ObjectId::new();
+        let schema = users_schema_v1();
+        let users = &schema[&crate::query_manager::types::TableName::new("users")].columns;
+        let locator = |hash| RowLocator {
+            table: "users".into(),
+            origin_schema_hash: Some(hash),
+        };
+        let mut rows = chain(row_id, &schema, 3);
+        for (name, at) in [("left", 2_000), ("right", 2_001)] {
+            let data = encode_row(users, &[Value::Uuid(row_id), Value::Text(name.to_string())])
+                .expect("encode row");
+            rows.push(StoredRowBatch::new(
+                row_id,
+                "main",
+                vec![rows[2].batch_id()],
+                data,
+                RowProvenance::for_insert("author", at),
+                HashMap::new(),
+                RowState::VisibleDirect,
+                None,
+            ));
+        }
+        let mut source = MemoryStorage::new();
+        let v1 = persist_schema(&mut source, &schema);
+        source.put_row_locator(row_id, Some(&locator(v1))).unwrap();
+        source.append_history_region_rows("users", &rows).unwrap();
+
+        let mut target = MemoryStorage::new();
+        persist_schema(&mut target, &schema);
+        target.put_row_locator(row_id, Some(&locator(v1))).unwrap();
+        let held: Vec<StoredRowBatch> = rows
+            .iter()
+            .filter(|row| row.batch_id() != rows[1].batch_id())
+            .cloned()
+            .collect();
+        target.append_history_region_rows("users", &held).unwrap();
+        let built = VisibleRowEntry::rebuild_with_descriptor(users, &held)
+            .unwrap()
+            .expect("the row has a visible version");
+        assert!(built.records_merge_base());
+        target
+            .upsert_visible_region_rows("users", std::slice::from_ref(&built))
+            .unwrap();
+
+        let report = graft_row_history(&mut target, &source, "users", row_id).unwrap();
+        assert_eq!(report.batches_grafted, 1);
+        let after = target
+            .load_visible_region_entry("users", "main", row_id)
+            .unwrap()
+            .expect("the row is visible");
+        assert_eq!(after, built.without_merge_base());
+    }
+
     /// The decisive backend for the decisive scenario: on the raw-table backends the point
     /// lookup resolves through the row locator's origin hash FIRST and the per-batch exact
     /// locator second. MemoryStorage overrides the lookup with a plain map read, so only
@@ -388,8 +958,7 @@ mod tests {
         assert_eq!(again.batches_grafted, 0, "a second run must write nothing");
     }
 
-    /// Same batch id with different content is divergence, and the graft must refuse it
-    /// without writing anything.
+    /// Same batch id with different content is divergence, and the graft must refuse it.
     #[test]
     fn a_content_conflict_aborts_the_graft() {
         let row_id = ObjectId::new();

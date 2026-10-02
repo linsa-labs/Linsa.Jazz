@@ -25,7 +25,9 @@
 //!   rejects such histories today. Hence: hard deletes name every current tip
 //!   as parent, carry no confirmed tier (keeps them out of tier-filtered row
 //!   sets), are excluded from tier bumps, and once a row hard-deletes, forks
-//!   are disabled for it and previously staged batches are never published.
+//!   are disabled for it, previously staged batches are never published, and nothing is
+//!   rejected any more: rejecting a version the delete descends from through others
+//!   hands its parent back as a tip beside the delete, which is that same shape.
 //! - `RowVisibilityChange` events are not compared, only the persisted entry.
 //! - No storage restarts mid-stream (persistence is covered by the
 //!   close/reopen conformance tests).
@@ -41,6 +43,7 @@ use crate::query_manager::types::{
     TableSchema, Value,
 };
 use crate::row_format::encode_row;
+use crate::row_histories::FORKED_FASTPATH_ARMS_ON_THREAD;
 use crate::row_histories::{
     BatchId, HISTORY_FASTPATH_HITS, HistoryScan, PATCH_FASTPATH_HITS, RowState, StoredRowBatch,
     VisibleRowEntry, apply_row_batch, decode_flat_visible_row_entry, encode_flat_visible_row_entry,
@@ -51,6 +54,13 @@ use crate::sync_manager::DurabilityTier;
 use crate::test_support::persist_test_schema;
 
 const BRANCH: &str = "main";
+/// Entries each stream must have built by each arm of the path for forked rows: by a
+/// write over every tip of a row with several, and by a write over one of them. The run
+/// is the same on every backend and every time (fixed seeds): 73 and 237 for the first
+/// tierless stream, 63 and 279 for the one with skewed clocks. The floors sit just under
+/// the smaller of each, so that a change which takes fewer writes has to say so here.
+const OVER_EVERY_TIP_FLOOR: u64 = 60;
+const OVER_ONE_TIP_FLOOR: u64 = 230;
 const TABLES: [&str; 2] = ["diff_docs", "diff_notes"];
 const ROWS_PER_TABLE: usize = 2;
 const OPS_PER_SEED: usize = 200;
@@ -72,6 +82,42 @@ const TIERS: [DurabilityTier; 3] = [
     DurabilityTier::GlobalServer,
 ];
 
+/// What a seed's op stream is made of, besides the ops every stream has.
+///
+/// One stream cannot stand for every store. A version taken as a direct write carries no
+/// tier — the tier lives with the batch's fate — so a store that only ever takes direct
+/// writes holds rows no tier has a view of, and the rules for such rows are their own
+/// (`fastpath::try_forked_fastpath_entry` admits nothing else). A stream where every
+/// second version has a tier almost never reaches them. And writers' clocks disagree:
+/// a version may be older, by its own timestamp, than the version it was written over,
+/// and the merge of two tips picks their common ancestor by timestamp.
+#[derive(Clone, Copy, Debug)]
+struct Stream {
+    /// No version carries a tier, and no tier is ever raised.
+    tierless: bool,
+    /// One write in four is stamped earlier than the write before it.
+    skewed: bool,
+}
+
+/// Tiers with disagreeing clocks is not a stream yet: it runs into an open defect of the
+/// serial path that is older than the streams (seed `0xd1ff000000000008`, op 34, with
+/// that stream; `row_histories::tests::
+/// a_tier_view_keeps_a_creation_a_delivered_snapshot_superseded`).
+const STREAMS: [Stream; 3] = [
+    Stream {
+        tierless: false,
+        skewed: false,
+    },
+    Stream {
+        tierless: true,
+        skewed: false,
+    },
+    Stream {
+        tierless: true,
+        skewed: true,
+    },
+];
+
 /// Entry point invoked by `storage_conformance_tests!` for every backend.
 ///
 /// Dual run: the invariant must hold with the serial-write fast path enabled
@@ -86,8 +132,27 @@ pub fn test_visible_entry_differential_random_ops(factory: &dyn Fn() -> Box<dyn 
         let _mode = force_history_fastpath(fastpath_enabled);
         let apply_hits_before = HISTORY_FASTPATH_HITS.load(Ordering::Relaxed);
         let patch_hits_before = PATCH_FASTPATH_HITS.load(Ordering::Relaxed);
-        for seed in SEEDS {
-            SeedRun::new(factory(), seed).run();
+        for stream in STREAMS {
+            let forked_before = FORKED_FASTPATH_ARMS_ON_THREAD.get();
+            for seed in SEEDS {
+                SeedRun::new(factory(), seed, stream).run();
+            }
+            let forked = FORKED_FASTPATH_ARMS_ON_THREAD.get();
+            let [over_every_tip, over_one_tip] =
+                [forked[0] - forked_before[0], forked[1] - forked_before[1]];
+            println!(
+                "{stream:?}: entries built from a row's tips: {over_every_tip} by a write \
+                 over every tip, {over_one_tip} by a write over one of several"
+            );
+            if fastpath_enabled && stream.tierless {
+                assert!(
+                    over_every_tip > OVER_EVERY_TIP_FLOOR && over_one_tip > OVER_ONE_TIP_FLOOR,
+                    "{stream:?}: the run barely built an entry from a row's tips \
+                     ({over_every_tip} by a write over every tip, {over_one_tip} by a write \
+                     over one of several) — the equivalence check would prove nothing \
+                     about that path"
+                );
+            }
         }
         if fastpath_enabled {
             assert!(
@@ -150,24 +215,30 @@ enum OpKind {
     SerialAppend,
     Fork,
     MergeCommit,
+    SupersetMerge,
+    StepParentAppend,
     StagingApply,
     StagingPublish,
     Reject,
     TierBumpReapply,
     TierBumpPatch,
+    StrippedCopy,
     SoftDelete,
     HardDelete,
 }
 
-const OP_WEIGHTS: [(OpKind, u32); 10] = [
+const OP_WEIGHTS: [(OpKind, u32); 13] = [
     (OpKind::SerialAppend, 30),
     (OpKind::Fork, 12),
     (OpKind::MergeCommit, 8),
+    (OpKind::SupersetMerge, 5),
+    (OpKind::StepParentAppend, 8),
     (OpKind::StagingApply, 10),
     (OpKind::StagingPublish, 10),
     (OpKind::Reject, 8),
     (OpKind::TierBumpReapply, 10),
     (OpKind::TierBumpPatch, 6),
+    (OpKind::StrippedCopy, 8),
     (OpKind::SoftDelete, 4),
     (OpKind::HardDelete, 2),
 ];
@@ -238,6 +309,8 @@ struct RowHarness {
     frontier: Vec<BatchId>,
     /// Every batch id present in this row's history, in application order.
     all_batches: Vec<BatchId>,
+    /// What each batch was written over.
+    parents: HashMap<BatchId, Vec<BatchId>>,
     /// The generator's view of each batch's current state.
     batch_states: HashMap<BatchId, RowState>,
     /// StagingPending batches still eligible for publishing.
@@ -258,10 +331,11 @@ struct SeedRun {
     mint: IdMint,
     rows: Vec<RowHarness>,
     seed: u64,
+    stream: Stream,
 }
 
 impl SeedRun {
-    fn new(mut storage: Box<dyn Storage>, seed: u64) -> Self {
+    fn new(mut storage: Box<dyn Storage>, seed: u64, stream: Stream) -> Self {
         let schema = differential_schema();
         let schema_hash = persist_test_schema(storage.as_mut(), &schema);
         let mut mint = IdMint { seed, counter: 0 };
@@ -285,6 +359,7 @@ impl SeedRun {
                     descriptor: descriptor.clone(),
                     frontier: Vec::new(),
                     all_batches: Vec::new(),
+                    parents: HashMap::new(),
                     batch_states: HashMap::new(),
                     staging: Vec::new(),
                     hard_delete_batches: HashSet::new(),
@@ -301,6 +376,7 @@ impl SeedRun {
             mint,
             rows,
             seed,
+            stream,
         }
     }
 
@@ -310,8 +386,9 @@ impl SeedRun {
             let op = pick_op(&mut self.prng);
             let desc = self.execute(op, row_index);
             let context = format!(
-                "seed {seed:#x} op #{op_index} [{desc}] row {row} table {table}",
+                "seed {seed:#x} {stream:?} op #{op_index} [{desc}] row {row} table {table}",
                 seed = self.seed,
+                stream = self.stream,
                 row = self.rows[row_index].row_id,
                 table = self.rows[row_index].table,
             );
@@ -325,11 +402,14 @@ impl SeedRun {
             OpKind::SerialAppend => self.serial_append(row_index),
             OpKind::Fork => self.fork(row_index),
             OpKind::MergeCommit => self.merge_commit(row_index),
+            OpKind::SupersetMerge => self.superset_merge(row_index),
+            OpKind::StepParentAppend => self.step_parent_append(row_index),
             OpKind::StagingApply => self.staging_apply(row_index),
             OpKind::StagingPublish => self.staging_publish(row_index),
             OpKind::Reject => self.reject(row_index),
             OpKind::TierBumpReapply => self.tier_bump_reapply(row_index),
             OpKind::TierBumpPatch => self.tier_bump_patch(row_index),
+            OpKind::StrippedCopy => self.stripped_copy(row_index),
             OpKind::SoftDelete => self.delete(row_index, DeleteKind::Soft),
             OpKind::HardDelete => self.delete(row_index, DeleteKind::Hard),
         }
@@ -374,6 +454,63 @@ impl SeedRun {
         "merge-commit".to_string()
     }
 
+    /// New batch naming every current tip and one more version of the row: a device that
+    /// holds, as a tip, a version this store has already seen written over.
+    fn superset_merge(&mut self, row_index: usize) -> String {
+        let row = &self.rows[row_index];
+        let others: Vec<BatchId> = row
+            .all_batches
+            .iter()
+            .copied()
+            .filter(|batch_id| !row.frontier.contains(batch_id))
+            .collect();
+        if row.hard_deleted || row.frontier.is_empty() || others.is_empty() {
+            return format!("{} (superset fallback)", self.serial_append(row_index));
+        }
+        let mut parents = row.frontier.clone();
+        let extra = others[self.prng.below(others.len())];
+        parents.insert(self.prng.below(parents.len() + 1), extra);
+        let tier = self.random_tier();
+        self.apply_new_batch(row_index, parents, RowState::VisibleDirect, tier, None);
+        "superset-merge".to_string()
+    }
+
+    /// New batch over one tip that also names what that tip was written over: the write
+    /// of a device that held both as tips.
+    fn step_parent_append(&mut self, row_index: usize) -> String {
+        let row = &self.rows[row_index];
+        if row.hard_deleted || row.frontier.is_empty() {
+            return format!("{} (step-parent fallback)", self.serial_append(row_index));
+        }
+        let tip = row.frontier[self.prng.below(row.frontier.len())];
+        let grandparents = row.parents.get(&tip).cloned().unwrap_or_default();
+        if grandparents.is_empty() {
+            return format!("{} (step-parent fallback)", self.serial_append(row_index));
+        }
+        let mut parents = vec![tip];
+        // One time in three the second parent is any version at all: a version the tip
+        // does not descend from brings its own ancestry into the write, and with it,
+        // possibly, a later version all the tips have in common.
+        if self.prng.below(3) == 0 {
+            let any = self.rows[row_index].all_batches
+                [self.prng.below(self.rows[row_index].all_batches.len())];
+            if any != tip {
+                parents.push(any);
+            }
+            let tier = self.random_tier();
+            self.apply_new_batch(row_index, parents, RowState::VisibleDirect, tier, None);
+            return "tip-and-any-append".to_string();
+        }
+        for grandparent in grandparents {
+            if parents.len() == 1 || self.prng.coin() {
+                parents.insert(self.prng.below(parents.len() + 1), grandparent);
+            }
+        }
+        let tier = self.random_tier();
+        self.apply_new_batch(row_index, parents, RowState::VisibleDirect, tier, None);
+        "step-parent-append".to_string()
+    }
+
     fn staging_apply(&mut self, row_index: usize) -> String {
         let parents = {
             let frontier = &self.rows[row_index].frontier;
@@ -403,7 +540,7 @@ impl SeedRun {
     }
 
     fn reject(&mut self, row_index: usize) -> String {
-        if self.rows[row_index].all_batches.is_empty() {
+        if self.rows[row_index].hard_deleted || self.rows[row_index].all_batches.is_empty() {
             return format!("{} (reject fallback)", self.serial_append(row_index));
         }
         let pick = self.prng.below(self.rows[row_index].all_batches.len());
@@ -419,6 +556,9 @@ impl SeedRun {
     /// existing visible row through `apply_row_batch` with a raised confirmed
     /// tier via `accepted_transaction_output`.
     fn tier_bump_reapply(&mut self, row_index: usize) -> String {
+        if self.stream.tierless {
+            return format!("{} (tierless)", self.serial_append(row_index));
+        }
         let candidates: Vec<BatchId> = self.rows[row_index]
             .all_batches
             .iter()
@@ -454,10 +594,103 @@ impl SeedRun {
         "tier-bump-reapply".to_string()
     }
 
+    /// Mirrors a query-scope delivery of a batch this store already holds: the sender
+    /// clears the parents (`sync_logic::scope_delivery_row`), reads the row from a visible
+    /// region that stores no metadata, and the inbox clears the tier. Half the time the
+    /// content differs as well, as it does when the sender's row has several tips and what
+    /// it delivers is their merge under the newest tip's id.
+    ///
+    /// Beyond the entry matching its rebuild, the model here is that a copy says nothing
+    /// about where the batch stands: its parents, its metadata and the row's tips stay.
+    fn stripped_copy(&mut self, row_index: usize) -> String {
+        let candidates: Vec<BatchId> = self.rows[row_index]
+            .all_batches
+            .iter()
+            .copied()
+            .filter(|batch_id| {
+                let row = &self.rows[row_index];
+                !row.hard_delete_batches.contains(batch_id)
+                    && row
+                        .batch_states
+                        .get(batch_id)
+                        .is_some_and(|state| state.is_visible())
+            })
+            .collect();
+        if candidates.is_empty() {
+            return format!("{} (stripped-copy fallback)", self.serial_append(row_index));
+        }
+        let batch_id = candidates[self.prng.below(candidates.len())];
+        let row_id = self.rows[row_index].row_id;
+        let table = self.rows[row_index].table;
+        let existing = self
+            .storage
+            .load_history_row_batch(table, BRANCH, row_id, batch_id)
+            .expect("history row lookup should succeed")
+            .expect("picked batch should exist in history");
+        let tips_before = self
+            .storage
+            .load_visible_region_entry(table, BRANCH, row_id)
+            .expect("visible entry lookup should succeed")
+            .map(|entry| entry.branch_frontier);
+
+        let mut copy = existing.clone();
+        copy.parents.clear();
+        copy.metadata = Default::default();
+        copy.confirmed_tier = None;
+        let other_content = existing.delete_kind.is_none() && self.prng.coin();
+        if other_content {
+            let values = random_values(&mut self.prng);
+            copy.data = encode_row(&self.rows[row_index].descriptor, &values)
+                .expect("row values should encode")
+                .into();
+        }
+        apply_row_batch(&mut self.storage, row_id, &self.branch, copy.clone(), &[])
+            .unwrap_or_else(|err| panic!("seed {:#x}: stripped copy failed: {err:?}", self.seed));
+
+        let after = self
+            .storage
+            .load_history_row_batch(table, BRANCH, row_id, batch_id)
+            .expect("history row lookup should succeed")
+            .expect("the batch is still stored");
+        assert_eq!(
+            after.parents, existing.parents,
+            "seed {:#x}: a stripped copy of {batch_id:?} changed what the batch descends from",
+            self.seed
+        );
+        assert_eq!(
+            after.metadata, existing.metadata,
+            "seed {:#x}: a stripped copy of {batch_id:?} dropped the batch's metadata",
+            self.seed
+        );
+        assert_eq!(
+            after.data, copy.data,
+            "seed {:#x}: the copy's content was not stored",
+            self.seed
+        );
+        let tips_after = self
+            .storage
+            .load_visible_region_entry(table, BRANCH, row_id)
+            .expect("visible entry lookup should succeed")
+            .map(|entry| entry.branch_frontier);
+        assert_eq!(
+            tips_after, tips_before,
+            "seed {:#x}: a stripped copy of {batch_id:?} changed the row's tips",
+            self.seed
+        );
+        if other_content {
+            "stripped-copy-other-content".to_string()
+        } else {
+            "stripped-copy".to_string()
+        }
+    }
+
     /// Direct `patch_row_batch_state(state: None, confirmed_tier: Some(..))` —
     /// no production caller today, but the API allows it and Fix B will touch
     /// it. The patch maxes tiers internally, so any tier is a valid input.
     fn tier_bump_patch(&mut self, row_index: usize) -> String {
+        if self.stream.tierless {
+            return format!("{} (tierless)", self.serial_append(row_index));
+        }
         let candidates: Vec<BatchId> = self.rows[row_index]
             .all_batches
             .iter()
@@ -512,8 +745,18 @@ impl SeedRun {
         let batch_id = BatchId::from_uuid(self.mint.next_uuid());
         let author = AUTHORS[self.prng.below(AUTHORS.len())];
         let values = random_values(&mut self.prng);
+        // A writer whose clock is behind stamps its write earlier than the version it
+        // writes over. Never the row's first version: its stamp names the lineage.
+        let behind = if self.stream.skewed
+            && self.rows[row_index].created.is_some()
+            && self.prng.below(4) == 0
+        {
+            5 + 10 * self.prng.below(3) as u64
+        } else {
+            0
+        };
         let row = &mut self.rows[row_index];
-        let ts = row.next_ts;
+        let ts = row.next_ts.saturating_sub(behind);
         row.next_ts += 10;
         let provenance = match &row.created {
             None => RowProvenance::for_insert(author.to_string(), ts),
@@ -540,6 +783,7 @@ impl SeedRun {
                 HashMap::from([(MetadataKey::Delete.to_string(), "hard".to_string())])
             }
         };
+        row.parents.insert(batch_id, parents.clone());
         let batch = StoredRowBatch::new_with_batch_id(
             batch_id,
             row.row_id,
@@ -580,13 +824,16 @@ impl SeedRun {
         )
         .unwrap_or_else(|err| {
             panic!(
-                "seed {:#x}: patch_row_batch_state({batch_id}) failed: {err:?}",
-                self.seed
+                "seed {:#x} {:?}: patch_row_batch_state({batch_id}) failed: {err:?}",
+                self.seed, self.stream
             )
         });
     }
 
     fn random_tier(&mut self) -> Option<DurabilityTier> {
+        if self.stream.tierless {
+            return None;
+        }
         match self.prng.below(TIERS.len() + 1) {
             0 => None,
             other => Some(TIERS[other - 1]),
