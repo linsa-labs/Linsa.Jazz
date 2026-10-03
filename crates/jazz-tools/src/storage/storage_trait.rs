@@ -342,6 +342,13 @@ pub trait Storage {
         Ok(keys)
     }
 
+    /// Whether `raw_table_scan_range_keys_limited` costs its limit rather than its
+    /// range. A reader that takes a long range a piece at a time asks first: on a store
+    /// that answers no, every piece costs what is left of the range.
+    fn limited_range_scans_are_bounded(&self) -> bool {
+        false
+    }
+
     /// Keys of every raw table whose NAME starts with `name_prefix`, as one sequence in
     /// flat key order: each is what follows `name_prefix` in the flat key,
     /// `{rest of the table name}:{key}`, strictly after `after`, at most `limit` of them.
@@ -2217,6 +2224,10 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         limit: usize,
     ) -> Result<RawTableKeys, StorageError> {
         (**self).raw_table_scan_range_keys_limited(table, start, end, reverse, limit)
+    }
+
+    fn limited_range_scans_are_bounded(&self) -> bool {
+        (**self).limited_range_scans_are_bounded()
     }
 
     fn raw_table_family_keys(

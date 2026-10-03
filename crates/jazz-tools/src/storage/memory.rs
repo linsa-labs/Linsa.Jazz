@@ -710,6 +710,10 @@ impl Storage for MemoryStorage {
         })
     }
 
+    fn limited_range_scans_are_bounded(&self) -> bool {
+        true
+    }
+
     /// The flat order of the family's keys, as a flat key-value backend walks it:
     /// `{rest of the table name}:{key}` compared as strings, which is not the order of
     /// (table name, key) — a table name that extends another sorts by its next byte

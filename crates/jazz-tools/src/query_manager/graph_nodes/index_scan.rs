@@ -59,6 +59,91 @@ pub struct IndexScanNode {
     ready_incarnation: Option<u64>,
 }
 
+/// Keys of a posting list a trigram search reads in its first round.
+const TRIGRAM_FIRST_ROUND_KEYS: usize = 512;
+/// Each round takes what is read of a list to this many times what it was.
+const TRIGRAM_ROUND_GROWTH: usize = 4;
+/// What the seek that starts a read of a walk costs, in keys read in sequence: 4–5 µs
+/// against 0.15 µs a key on SQLite and on RocksDB (`stand_walk_against_whole_lists`).
+const TRIGRAM_WALK_SEEK_KEYS: usize = 32;
+/// The fewest keys a read of a walk asks for: among candidates far apart in a list every
+/// read decides one, and what it reads past it is wasted.
+const TRIGRAM_WALK_REACH: usize = 8;
+/// What a read of the fewest keys costs, in keys: its seek and its keys. Candidates
+/// closer together than this are cheaper read through than sought one by one, and a
+/// read is worth its keys when it decided candidates such reads would have cost as much.
+const TRIGRAM_WALK_SHORT_READ_COST: usize = TRIGRAM_WALK_SEEK_KEYS + TRIGRAM_WALK_REACH;
+/// Of the reads in a row that decide a single candidate, one in this many — and the
+/// first of a walk — asks for as many keys as a short read costs: a read of fewer cannot
+/// tell candidates past its reach but cheaper to read through from candidates far apart.
+const TRIGRAM_WALK_PROBE_EVERY: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Index keys the trigram searches of this thread have read.
+    pub(crate) static TRIGRAM_KEYS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Reads of a posting list the trigram searches of this thread have made.
+    pub(crate) static TRIGRAM_LIST_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Reads the trigram searches of this thread have made walking a list's candidates.
+    pub(crate) static TRIGRAM_WALK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The walk reads of this thread that fail: from the first of the pair up to, not
+    /// including, the second, counted as `TRIGRAM_WALK_READS` counts them.
+    pub(crate) static TRIGRAM_WALK_READS_THAT_FAIL: std::cell::Cell<Option<(u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+    /// Whether the walk reads of this thread are answered from the start of the list,
+    /// as by a store that ignores where a range read starts.
+    pub(crate) static TRIGRAM_WALK_READS_IGNORE_START: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The list read of this thread that fails, counted from when it was armed.
+    pub(crate) static TRIGRAM_LIST_READ_THAT_FAILS: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// A test's own first-round bound — a key at the least, nought is taken for one — so
+    /// that a handful of rows takes a search through every round and every way a list is
+    /// decided.
+    pub(crate) static TRIGRAM_FIRST_ROUND_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Counts a list read of this thread, and says whether it is the one armed to fail.
+#[cfg(test)]
+fn trigram_list_read_fails() -> bool {
+    TRIGRAM_LIST_READS.with(|reads| reads.set(reads.get() + 1));
+    TRIGRAM_LIST_READ_THAT_FAILS.with(|armed| match armed.get() {
+        Some(0) => {
+            armed.set(None);
+            true
+        }
+        Some(left) => {
+            armed.set(Some(left - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// Counts a read of a walk of this thread, and says whether it is armed to fail.
+#[cfg(test)]
+fn trigram_walk_read_fails() -> bool {
+    let read = TRIGRAM_WALK_READS.with(|count| {
+        count.set(count.get() + 1);
+        count.get() - 1
+    });
+    TRIGRAM_WALK_READS_THAT_FAIL.with(|armed| {
+        armed
+            .get()
+            .is_some_and(|(from, to)| (from..to).contains(&read))
+    })
+}
+
+/// The first round's bound, in keys.
+fn trigram_first_round() -> usize {
+    #[cfg(test)]
+    if let Some(keys) = TRIGRAM_FIRST_ROUND_FOR_TEST.with(|keys| keys.get()) {
+        return keys.max(1);
+    }
+    TRIGRAM_FIRST_ROUND_KEYS
+}
+
 /// The rows of one scope value whose case-folded text may hold a needle: the
 /// intersection of the needle's trigram posting lists in a trigram index
 /// (`query_manager::trigram_index`). A superset of the matches — the filter after
@@ -569,47 +654,260 @@ impl IndexScanNode {
             .collect()
     }
 
-    /// The candidates of a trigram search: the posting lists intersected, smallest
-    /// first.
-    fn trigram_scan_ids(&self, ctx: &SourceContext) -> AHashSet<ObjectId> {
-        let Some(trigram) = self.trigram.as_ref() else {
-            return AHashSet::new();
+    /// The candidates of a trigram search: the needle's posting lists intersected.
+    ///
+    /// A posting list is as long as its trigram is common in the scope, and a needle's
+    /// common trigrams rule out next to nothing its rare ones have not: reading every
+    /// list whole made a search cost the scope, whatever it found. So the lists are read
+    /// in rounds, each list from where the round before left it and up to a bound that
+    /// grows from round to round, until one ends: the lists that end are intersected,
+    /// and from then on a list still open is no longer read on.
+    ///
+    /// A list is in row id order. What an open one has read, from its start to its last
+    /// key, has decided every candidate at or before that key. The candidates past it
+    /// are walked in id order: the list is read from the first of them, which decides
+    /// every candidate up to the last key that read returns, and then from the next one
+    /// still undecided. A read asks for twice as many keys as the read before while
+    /// the keys read stay cheaper than seeks to the candidates they decide, and for a
+    /// few keys otherwise: far apart in the list, candidates cost a seek each; close
+    /// together, the keys between them; and the list never its length. Either way that
+    /// is within a small factor of the cheaper of seeking to every candidate and reading
+    /// the list through them.
+    ///
+    /// What comes back is the intersection reading every list whole would give — a
+    /// superset of the matches, which the filter after the load narrows, as it did. A
+    /// read the store fails rules nothing out, and `None` comes back when no list could
+    /// be read: nothing is known of the scope's rows then.
+    fn trigram_scan_ids(&self, ctx: &SourceContext) -> Option<AHashSet<ObjectId>> {
+        let trigram = self.trigram.as_ref()?;
+        /// A posting list not read to its end yet.
+        struct Open<'a> {
+            segment: &'a str,
+            ids: AHashSet<ObjectId>,
+            /// The last key read, once a round has read any.
+            last: Option<String>,
+            /// Keys read of it so far.
+            read: usize,
+        }
+        let first_round = trigram_first_round();
+        // A store that reads a whole range to hand back its first keys reads every list
+        // whole in one round: a round there costs the list, however few keys it asks for.
+        let first_round = if ctx.storage.limited_range_scans_are_bounded() {
+            first_round
+        } else {
+            usize::MAX
         };
-        let mut lists: Vec<AHashSet<ObjectId>> = Vec::with_capacity(trigram.segments.len());
-        for segment in &trigram.segments {
-            crate::query_manager::settle_cost::bump(
-                &crate::query_manager::settle_cost::INDEX_READS,
-            );
-            let keys = ctx
-                .storage
-                .index_window_keys(
+
+        let mut candidates: Option<AHashSet<ObjectId>> = None;
+        let mut open: Vec<Open<'_>> = trigram
+            .segments
+            .iter()
+            .map(|segment| Open {
+                segment,
+                ids: AHashSet::new(),
+                last: None,
+                read: 0,
+            })
+            .collect();
+        while !open.is_empty() {
+            let mut ended: Vec<AHashSet<ObjectId>> = Vec::new();
+            let mut still_open = Vec::with_capacity(open.len());
+            for mut list in open {
+                let round_keys = if list.read == 0 {
+                    first_round
+                } else {
+                    list.read.saturating_mul(TRIGRAM_ROUND_GROWTH - 1)
+                };
+                if let Some(candidates) = candidates.as_mut() {
+                    // What the list has read is decided (below); the candidates past
+                    // its last key are not, and the list is read from each of them in
+                    // turn rather than on from where it stands.
+                    let last = list
+                        .last
+                        .as_deref()
+                        .and_then(crate::query_manager::composite_index::entry_row_id);
+                    let mut undecided: Vec<ObjectId> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|id| last.is_none_or(|last| *id > last))
+                        .collect();
+                    undecided.sort_unstable();
+                    let end = format!("{};", list.segment);
+                    let mut reach = TRIGRAM_WALK_SHORT_READ_COST;
+                    // Reads in a row that were not worth their keys.
+                    let mut alone = 0usize;
+                    let mut at = 0;
+                    while at < undecided.len() {
+                        let start = format!(
+                            "{}:{}",
+                            list.segment,
+                            crate::query_manager::composite_index::hex(
+                                undecided[at].uuid().as_bytes()
+                            )
+                        );
+                        #[cfg(test)]
+                        let start = if TRIGRAM_WALK_READS_IGNORE_START.with(|armed| armed.get()) {
+                            format!("{}:", list.segment)
+                        } else {
+                            start
+                        };
+                        crate::query_manager::settle_cost::bump(
+                            &crate::query_manager::settle_cost::INDEX_READS,
+                        );
+                        let keys = ctx.storage.index_window_keys(
+                            self.table.as_str(),
+                            self.column.as_str(),
+                            &self.branch,
+                            &start,
+                            &end,
+                            false,
+                            Some(reach),
+                        );
+                        #[cfg(test)]
+                        let keys = if trigram_walk_read_fails() {
+                            Err(crate::storage::StorageError::IoError(
+                                "a walk read armed to fail".to_string(),
+                            ))
+                        } else {
+                            keys
+                        };
+                        // A read that fails rules nothing out: the candidates from here
+                        // on stay.
+                        let Ok(keys) = keys else {
+                            break;
+                        };
+                        #[cfg(test)]
+                        TRIGRAM_KEYS_READ.with(|read| read.set(read.get() + keys.len() as u64));
+                        let held: Vec<ObjectId> = keys
+                            .iter()
+                            .filter_map(|key| {
+                                crate::query_manager::composite_index::entry_row_id(key)
+                            })
+                            .collect();
+                        // Fewer keys than asked for is the end of the list: it has
+                        // decided every candidate left. Otherwise the read has decided
+                        // the candidates up to its last key — and nothing, when that
+                        // key is before the one it was asked to start from: the walk
+                        // stops rather than ask again.
+                        let through = if keys.len() < reach {
+                            None
+                        } else {
+                            match held.last() {
+                                Some(through) if *through >= undecided[at] => Some(*through),
+                                _ => break,
+                            }
+                        };
+                        let from = at;
+                        let mut held_at = 0;
+                        while at < undecided.len()
+                            && through.is_none_or(|through| undecided[at] <= through)
+                        {
+                            while held_at < held.len() && held[held_at] < undecided[at] {
+                                held_at += 1;
+                            }
+                            if held.get(held_at) != Some(&undecided[at]) {
+                                candidates.remove(&undecided[at]);
+                            }
+                            at += 1;
+                        }
+                        // A read whose keys cost no more than short reads to the
+                        // candidates it decided would have is the cheaper way through
+                        // this part of the list: the next read reaches twice as far.
+                        // After one that was not, the candidates are taken to be far
+                        // apart, and the reads short — but for one in a few, which asks
+                        // again whether they are.
+                        let decided = at - from;
+                        reach = if decided >= 2
+                            && decided.saturating_mul(TRIGRAM_WALK_SHORT_READ_COST) >= reach
+                        {
+                            // Two candidates in a read of fewer keys than a short read
+                            // costs are no sign yet that the ones after them stand
+                            // close: only a read worth its seek starts the count over.
+                            if reach >= TRIGRAM_WALK_SHORT_READ_COST {
+                                alone = 0;
+                            }
+                            reach.saturating_mul(2)
+                        } else {
+                            alone += 1;
+                            if alone.is_multiple_of(TRIGRAM_WALK_PROBE_EVERY) {
+                                TRIGRAM_WALK_SHORT_READ_COST
+                            } else {
+                                TRIGRAM_WALK_REACH
+                            }
+                        };
+                    }
+                    continue;
+                }
+                // A key followed by a NUL byte is the least key greater than it.
+                let start = match list.last.as_deref() {
+                    Some(last) => format!("{last}\0"),
+                    None => format!("{}:", list.segment),
+                };
+                crate::query_manager::settle_cost::bump(
+                    &crate::query_manager::settle_cost::INDEX_READS,
+                );
+                let keys = ctx.storage.index_window_keys(
                     self.table.as_str(),
                     self.column.as_str(),
                     &self.branch,
-                    &format!("{segment}:"),
-                    &format!("{segment};"),
+                    &start,
+                    &format!("{};", list.segment),
                     false,
-                    None,
-                )
-                .unwrap_or_default();
-            let list: AHashSet<ObjectId> = keys
-                .iter()
-                .filter_map(|key| crate::query_manager::composite_index::entry_row_id(key))
-                .collect();
-            if list.is_empty() {
-                return AHashSet::new();
+                    Some(round_keys),
+                );
+                #[cfg(test)]
+                let keys = if trigram_list_read_fails() {
+                    Err(crate::storage::StorageError::IoError(
+                        "a list read armed to fail".to_string(),
+                    ))
+                } else {
+                    keys
+                };
+                // A list that cannot be read rules nothing out, and what was read of it
+                // is not the list: it is left out.
+                let Ok(mut keys) = keys else {
+                    continue;
+                };
+                #[cfg(test)]
+                TRIGRAM_KEYS_READ.with(|read| read.set(read.get() + keys.len() as u64));
+                list.ids
+                    .extend(keys.iter().filter_map(|key| {
+                        crate::query_manager::composite_index::entry_row_id(key)
+                    }));
+                if keys.len() >= round_keys {
+                    // As many as were asked for: there may be more.
+                    list.read = list.read.saturating_add(keys.len());
+                    list.last = keys.pop();
+                    still_open.push(list);
+                } else if list.ids.is_empty() {
+                    // No row of the scope holds this trigram.
+                    return Some(AHashSet::new());
+                } else {
+                    ended.push(list.ids);
+                }
             }
-            lists.push(list);
-        }
-        lists.sort_by_key(|list| list.len());
-        let mut lists = lists.into_iter();
-        let Some(mut candidates) = lists.next() else {
-            return AHashSet::new();
-        };
-        for list in lists {
-            candidates.retain(|id| list.contains(id));
-            if candidates.is_empty() {
-                break;
+            open = still_open;
+            ended.sort_by_key(|list| list.len());
+            for list in ended {
+                match candidates.as_mut() {
+                    Some(candidates) => candidates.retain(|id| list.contains(id)),
+                    None => candidates = Some(list),
+                }
+            }
+            // A list is in row id order and an open one was read from its start to its
+            // last key: a candidate at or before that key and not among what was read is
+            // not in the list, whatever the rest of it holds.
+            if let Some(candidates) = candidates.as_mut() {
+                for list in &open {
+                    let Some(last) = list
+                        .last
+                        .as_deref()
+                        .and_then(crate::query_manager::composite_index::entry_row_id)
+                    else {
+                        continue;
+                    };
+                    candidates.retain(|id| *id > last || list.ids.contains(id));
+                }
             }
         }
         candidates
@@ -933,7 +1231,11 @@ impl SourceNode for IndexScanNode {
             } else if self.window.is_some() {
                 self.window_scan_ids(ctx)
             } else {
-                self.trigram_scan_ids(ctx)
+                match self.trigram_scan_ids(ctx) {
+                    Some(ids) => ids,
+                    // No list could be read: the scope's rows, for the filter to narrow.
+                    None => self.undeclared_scan_ids(ctx),
+                }
             };
             self.apply_local_overlay_rows(ctx, &mut ids);
             ids

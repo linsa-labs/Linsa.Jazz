@@ -722,6 +722,10 @@ impl Storage for RocksDBStorage {
         })
     }
 
+    fn limited_range_scans_are_bounded(&self) -> bool {
+        true
+    }
+
     fn raw_table_family_keys(
         &self,
         name_prefix: &str,
