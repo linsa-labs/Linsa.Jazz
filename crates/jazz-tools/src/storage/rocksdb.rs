@@ -27,6 +27,52 @@ use crate::object::ObjectId;
 use crate::row_histories::{HistoryScan, RowState, StoredRowBatch};
 use crate::sync_manager::DurabilityTier;
 
+/// A write transaction of one store, and the only way a key of an open store is written
+/// (the manifest is put while the store opens): the puts and deletes go through it, so a
+/// transaction that wrote a raw-table header moves the store's `header_epoch` here and
+/// nowhere else.
+struct StoreTxn<'a> {
+    txn: Transaction<'a, TransactionDB>,
+    header_epoch: &'a std::cell::Cell<u64>,
+    wrote_header: std::cell::Cell<bool>,
+}
+
+impl StoreTxn<'_> {
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.note_header_write(key);
+        self.txn
+            .put(key.as_bytes(), value)
+            .map_err(|e| StorageError::IoError(format!("rocksdb txn put: {e}")))
+    }
+
+    fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.note_header_write(key);
+        self.txn
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::IoError(format!("rocksdb txn delete: {e}")))
+    }
+
+    /// A header written here is readable once this commits, and not before: the epoch
+    /// moves here, so that nothing read before — the write or the commit — is served
+    /// after.
+    fn commit(self) -> Result<(), StorageError> {
+        let committed = self
+            .txn
+            .commit()
+            .map_err(|e| StorageError::IoError(format!("rocksdb txn commit: {e}")));
+        if self.wrote_header.get() {
+            self.header_epoch.set(self.header_epoch.get() + 1);
+        }
+        committed
+    }
+
+    fn note_header_write(&self, storage_key: &str) {
+        if key_codec::strip_raw_table_key(super::RAW_TABLE_HEADER_TABLE, storage_key).is_some() {
+            self.wrote_header.set(true);
+        }
+    }
+}
+
 struct RocksDBInner {
     db: TransactionDB,
     ensured_raw_table_headers: HashSet<String>,
@@ -36,6 +82,14 @@ struct RocksDBInner {
 pub struct RocksDBStorage {
     cache_namespace: usize,
     inner: RefCell<Option<RocksDBInner>>,
+    /// Moved by every transaction that wrote a raw-table header of this store
+    /// (`StoreTxn`). A header is written when a table gets a new raw table — a first
+    /// write, a new schema generation — so this hardly ever moves.
+    header_epoch: std::cell::Cell<u64>,
+    /// `row_raw_table_ids_for_table` by header prefix, and the `header_epoch` it was
+    /// read under. Without it every row load scans the header table for the raw tables
+    /// of its table.
+    row_raw_table_ids: RefCell<(u64, HashMap<String, Vec<super::RowRawTableId>>)>,
     /// Prefix scans issued against the store. A whole-history read is one of
     /// these; the existence probe that replaced it is a seek. A gate can pin
     /// that the probe's cost does not track how deep the history is.
@@ -123,6 +177,8 @@ impl RocksDBStorage {
 
         Ok(Self {
             cache_namespace: super::next_storage_cache_namespace(),
+            header_epoch: std::cell::Cell::new(0),
+            row_raw_table_ids: RefCell::new((0, HashMap::new())),
             #[cfg(test)]
             prefix_scans: std::cell::Cell::new(0),
             inner: RefCell::new(Some(RocksDBInner {
@@ -371,45 +427,16 @@ impl RocksDBStorage {
 
     // ---- transaction helpers ----
 
-    fn put_on_txn<'a>(
-        txn: &Transaction<'a, TransactionDB>,
-        key: &str,
-        value: &[u8],
-    ) -> Result<(), StorageError> {
-        txn.put(key.as_bytes(), value)
-            .map_err(|e| StorageError::IoError(format!("rocksdb txn put: {e}")))
+    fn begin<'a>(&'a self, db: &'a TransactionDB) -> StoreTxn<'a> {
+        StoreTxn {
+            txn: db.transaction(),
+            header_epoch: &self.header_epoch,
+            wrote_header: std::cell::Cell::new(false),
+        }
     }
 
-    fn put_on_txn_cell<'a>(
-        txn: &RefCell<Transaction<'a, TransactionDB>>,
-        key: &str,
-        value: &[u8],
-    ) -> Result<(), StorageError> {
-        Self::put_on_txn(&txn.borrow(), key, value)
-    }
-
-    fn delete_on_txn<'a>(
-        txn: &Transaction<'a, TransactionDB>,
-        key: &str,
-    ) -> Result<(), StorageError> {
-        txn.delete(key.as_bytes())
-            .map_err(|e| StorageError::IoError(format!("rocksdb txn delete: {e}")))
-    }
-
-    fn delete_on_txn_cell<'a>(
-        txn: &RefCell<Transaction<'a, TransactionDB>>,
-        key: &str,
-    ) -> Result<(), StorageError> {
-        Self::delete_on_txn(&txn.borrow(), key)
-    }
-
-    fn commit_txn(txn: Transaction<'_, TransactionDB>) -> Result<(), StorageError> {
-        txn.commit()
-            .map_err(|e| StorageError::IoError(format!("rocksdb txn commit: {e}")))
-    }
-
-    fn apply_index_mutations_on_txn<'a>(
-        txn: &RefCell<Transaction<'a, TransactionDB>>,
+    fn apply_index_mutations_on_txn(
+        txn: &StoreTxn<'_>,
         mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
         for mutation in mutations {
@@ -424,7 +451,7 @@ impl RocksDBStorage {
                     let raw_table = key_codec::index_raw_table(table, column, branch);
                     let key = key_codec::index_entry_key(table, column, branch, value, *row_id)?;
                     raw_table_put_core(&raw_table, &key, &[0x01], |storage_key, bytes| {
-                        Self::put_on_txn_cell(txn, storage_key, bytes)
+                        txn.put(storage_key, bytes)
                     })?;
                 }
                 IndexMutation::Remove {
@@ -441,9 +468,7 @@ impl RocksDBStorage {
                             Err(error) => return Err(error),
                         };
                     let raw_table = key_codec::index_raw_table(table, column, branch);
-                    raw_table_delete_core(&raw_table, &key, |storage_key| {
-                        Self::delete_on_txn_cell(txn, storage_key)
-                    })?;
+                    raw_table_delete_core(&raw_table, &key, |storage_key| txn.delete(storage_key))?;
                 }
             }
         }
@@ -456,23 +481,69 @@ impl Storage for RocksDBStorage {
         self.cache_namespace
     }
 
+    fn memoized_row_raw_table_ids(&self, header_prefix: &str) -> Option<Vec<super::RowRawTableId>> {
+        let memo = self.row_raw_table_ids.borrow();
+        if memo.0 != self.header_epoch.get() {
+            return None;
+        }
+        let ids = memo.1.get(header_prefix).cloned();
+        // Parity harness: the ids are the header keys under the prefix.
+        #[cfg(debug_assertions)]
+        if let Some(ids) = &ids {
+            let stored = self.with_inner(|inner| {
+                Self::scan_prefix_keys_from_db(
+                    &inner.db,
+                    &key_codec::raw_table_scan_prefix(super::RAW_TABLE_HEADER_TABLE, header_prefix),
+                )
+            });
+            if let Ok(stored) = stored {
+                let mut stored: Vec<String> = stored
+                    .iter()
+                    .filter_map(|key| {
+                        key_codec::strip_raw_table_key(super::RAW_TABLE_HEADER_TABLE, key)
+                            .map(str::to_string)
+                    })
+                    .collect();
+                stored.sort();
+                let mut memoized: Vec<String> = ids
+                    .iter()
+                    .map(|id| id.raw_table_name().to_string())
+                    .collect();
+                memoized.sort();
+                debug_assert_eq!(
+                    stored, memoized,
+                    "the memo diverged from the raw-table headers under {header_prefix:?}"
+                );
+            }
+        }
+        ids
+    }
+
+    fn memoize_row_raw_table_ids(&self, header_prefix: &str, ids: &[super::RowRawTableId]) {
+        let epoch = self.header_epoch.get();
+        let mut memo = self.row_raw_table_ids.borrow_mut();
+        if memo.0 != epoch {
+            memo.1.clear();
+            memo.0 = epoch;
+        }
+        memo.1.insert(header_prefix.to_string(), ids.to_vec());
+    }
+
     fn raw_table_put(&mut self, table: &str, key: &str, value: &[u8]) -> Result<(), StorageError> {
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
+            let txn = self.begin(&inner.db);
             raw_table_put_core(table, key, value, |storage_key, bytes| {
-                Self::put_on_txn_cell(&txn, storage_key, bytes)
+                txn.put(storage_key, bytes)
             })?;
-            Self::commit_txn(txn.into_inner())
+            txn.commit()
         })
     }
 
     fn raw_table_delete(&mut self, table: &str, key: &str) -> Result<(), StorageError> {
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
-            raw_table_delete_core(table, key, |storage_key| {
-                Self::delete_on_txn_cell(&txn, storage_key)
-            })?;
-            Self::commit_txn(txn.into_inner())
+            let txn = self.begin(&inner.db);
+            raw_table_delete_core(table, key, |storage_key| txn.delete(storage_key))?;
+            txn.commit()
         })
     }
 
@@ -481,22 +552,20 @@ impl Storage for RocksDBStorage {
         mutations: &[RawTableMutation<'_>],
     ) -> Result<(), StorageError> {
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
+            let txn = self.begin(&inner.db);
             for mutation in mutations {
                 match mutation {
                     RawTableMutation::Put { table, key, value } => {
                         raw_table_put_core(table, key, value, |storage_key, bytes| {
-                            Self::put_on_txn_cell(&txn, storage_key, bytes)
+                            txn.put(storage_key, bytes)
                         })?;
                     }
                     RawTableMutation::Delete { table, key } => {
-                        raw_table_delete_core(table, key, |storage_key| {
-                            Self::delete_on_txn_cell(&txn, storage_key)
-                        })?;
+                        raw_table_delete_core(table, key, |storage_key| txn.delete(storage_key))?;
                     }
                 }
             }
-            Self::commit_txn(txn.into_inner())
+            txn.commit()
         })
     }
 
@@ -517,9 +586,9 @@ impl Storage for RocksDBStorage {
         }
 
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
+            let txn = self.begin(&inner.db);
             Self::apply_index_mutations_on_txn(&txn, mutations)?;
-            Self::commit_txn(txn.into_inner())
+            txn.commit()
         })
     }
 
@@ -689,9 +758,9 @@ impl Storage for RocksDBStorage {
             store_format_version: version,
         })?;
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
-            Self::put_on_txn_cell(&txn, super::STORE_MANIFEST_KEY, &bytes)?;
-            Self::commit_txn(txn.into_inner())
+            let txn = self.begin(&inner.db);
+            txn.put(super::STORE_MANIFEST_KEY, &bytes)?;
+            txn.commit()
         })
     }
 
@@ -701,11 +770,9 @@ impl Storage for RocksDBStorage {
         rows: &[HistoryRowBytes<'_>],
     ) -> Result<(), StorageError> {
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
-            append_history_region_row_bytes_core(table, rows, |key, bytes| {
-                Self::put_on_txn_cell(&txn, key, bytes)
-            })?;
-            Self::commit_txn(txn.into_inner())
+            let txn = self.begin(&inner.db);
+            append_history_region_row_bytes_core(table, rows, |key, bytes| txn.put(key, bytes))?;
+            txn.commit()
         })
     }
 
@@ -715,11 +782,9 @@ impl Storage for RocksDBStorage {
         rows: &[VisibleRowBytes<'_>],
     ) -> Result<(), StorageError> {
         self.with_inner(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
-            upsert_visible_region_row_bytes_core(table, rows, |key, bytes| {
-                Self::put_on_txn_cell(&txn, key, bytes)
-            })?;
-            Self::commit_txn(txn.into_inner())
+            let txn = self.begin(&inner.db);
+            upsert_visible_region_row_bytes_core(table, rows, |key, bytes| txn.put(key, bytes))?;
+            txn.commit()
         })
     }
 
@@ -757,19 +822,19 @@ impl Storage for RocksDBStorage {
         super::retire_index_entries_for_extra_visible_heads(self, table, branch, row_id)?;
         let raw_tables = super::visible_row_raw_tables_holding(self, table, branch, row_id)?;
         self.with_inner_mut(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
+            let txn = self.begin(&inner.db);
             let key = super::key_codec::visible_row_raw_table_key(branch, row_id);
             for raw_table in &raw_tables {
                 raw_table_delete_core(raw_table.as_str(), &key, |storage_key| {
-                    Self::delete_on_txn_cell(&txn, storage_key)
+                    txn.delete(storage_key)
                 })?;
             }
             raw_table_delete_core(
                 super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
                 &super::visible_row_table_locator_key(branch, row_id),
-                |storage_key| Self::delete_on_txn_cell(&txn, storage_key),
+                |storage_key| txn.delete(storage_key),
             )?;
-            Self::commit_txn(txn.into_inner())
+            txn.commit()
         })
     }
 
@@ -781,7 +846,7 @@ impl Storage for RocksDBStorage {
         index_mutations: &[IndexMutation<'_>],
     ) -> Result<(), StorageError> {
         self.with_inner_mut(|inner| {
-            let txn = RefCell::new(inner.db.transaction());
+            let txn = self.begin(&inner.db);
             let mut seen_row_raw_tables = std::collections::HashSet::new();
             for row in encoded_history_rows {
                 if seen_row_raw_tables.insert(row.row_raw_table.clone())
@@ -797,7 +862,7 @@ impl Storage for RocksDBStorage {
                         super::RAW_TABLE_HEADER_TABLE,
                         row.row_raw_table.as_str(),
                         &header,
-                        |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                        |storage_key, bytes| txn.put(storage_key, bytes),
                     )?;
                 }
             }
@@ -815,7 +880,7 @@ impl Storage for RocksDBStorage {
                         super::RAW_TABLE_HEADER_TABLE,
                         row.row_raw_table.as_str(),
                         &header,
-                        |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                        |storage_key, bytes| txn.put(storage_key, bytes),
                     )?;
                 }
             }
@@ -834,7 +899,7 @@ impl Storage for RocksDBStorage {
                     super::RAW_TABLE_HEADER_TABLE,
                     super::HISTORY_ROW_BATCH_TABLE_LOCATOR_TABLE,
                     &header,
-                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                    |storage_key, bytes| txn.put(storage_key, bytes),
                 )?;
             }
             if encoded_visible_rows
@@ -852,7 +917,7 @@ impl Storage for RocksDBStorage {
                     super::RAW_TABLE_HEADER_TABLE,
                     super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
                     &header,
-                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                    |storage_key, bytes| txn.put(storage_key, bytes),
                 )?;
             }
             let borrowed_history_rows = encoded_history_rows
@@ -866,7 +931,7 @@ impl Storage for RocksDBStorage {
                 })
                 .collect::<Vec<_>>();
             append_history_region_row_bytes_core(table, &borrowed_history_rows, |key, bytes| {
-                Self::put_on_txn_cell(&txn, key, bytes)
+                txn.put(key, bytes)
             })?;
             for row in encoded_history_rows {
                 if !row.needs_exact_locator {
@@ -886,7 +951,7 @@ impl Storage for RocksDBStorage {
                         row.batch_id,
                     ),
                     &locator,
-                    |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                    |storage_key, bytes| txn.put(storage_key, bytes),
                 )?;
             }
             let borrowed_visible_rows = encoded_visible_rows
@@ -899,7 +964,7 @@ impl Storage for RocksDBStorage {
                 })
                 .collect::<Vec<_>>();
             upsert_visible_region_row_bytes_core(table, &borrowed_visible_rows, |key, bytes| {
-                Self::put_on_txn_cell(&txn, key, bytes)
+                txn.put(key, bytes)
             })?;
             for row in encoded_visible_rows {
                 if !row.needs_exact_locator {
@@ -917,13 +982,13 @@ impl Storage for RocksDBStorage {
                         super::VISIBLE_ROW_TABLE_LOCATOR_TABLE,
                         &super::visible_row_table_locator_key(row.branch.as_str(), row.row_id),
                         &locator_bytes,
-                        |storage_key, bytes| Self::put_on_txn_cell(&txn, storage_key, bytes),
+                        |storage_key, bytes| txn.put(storage_key, bytes),
                     )?;
                     inner.visible_row_table_locators.insert(cache_key, locator);
                 }
             }
             Self::apply_index_mutations_on_txn(&txn, index_mutations)?;
-            Self::commit_txn(txn.into_inner())
+            txn.commit()
         })
     }
 
@@ -1035,6 +1100,8 @@ impl Storage for RocksDBStorage {
             return Ok(());
         };
         drop(inner);
+        // A closed store answers nothing, from memory either.
+        self.row_raw_table_ids.borrow_mut().1.clear();
         Ok(())
     }
 }
@@ -1042,6 +1109,288 @@ impl Storage for RocksDBStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_manager::types::{
+        ColumnDescriptor, ColumnType, RowDescriptor, SchemaHash, Value,
+    };
+    use crate::storage::{RowRawTableId, RowRawTableKind};
+
+    fn temp_store() -> (tempfile::TempDir, RocksDBStorage) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage =
+            RocksDBStorage::open(temp_dir.path().join("test.rocksdb"), 8 * 1024 * 1024).unwrap();
+        (temp_dir, storage)
+    }
+
+    fn visible_table(table: &str, generation: u8) -> (RowRawTableId, Vec<u8>) {
+        let id = RowRawTableId::new(
+            RowRawTableKind::Visible,
+            table,
+            SchemaHash::from_bytes([generation; 32]),
+        );
+        let descriptor = RowDescriptor::new(vec![ColumnDescriptor::new("title", ColumnType::Text)]);
+        let header = super::super::encode_raw_table_header(&super::super::row_raw_table_header(
+            &id,
+            &descriptor,
+        ))
+        .unwrap();
+        (id, header)
+    }
+
+    fn put_header(storage: &mut RocksDBStorage, table: &str, generation: u8) -> RowRawTableId {
+        let (id, header) = visible_table(table, generation);
+        storage
+            .raw_table_put(
+                super::super::RAW_TABLE_HEADER_TABLE,
+                id.raw_table_name(),
+                &header,
+            )
+            .unwrap();
+        id
+    }
+
+    fn raw_tables_of(storage: &RocksDBStorage, table: &str) -> Vec<String> {
+        super::super::row_raw_table_ids_for_table(storage, RowRawTableKind::Visible, table)
+            .unwrap()
+            .iter()
+            .map(|id| id.raw_table_name().to_string())
+            .collect()
+    }
+
+    /// A row load asks which raw tables its table has. That was a scan of the header
+    /// table per row; it is one per table until a header is written.
+    #[test]
+    fn the_raw_tables_of_a_table_are_read_from_the_headers_once() {
+        let (_dir, mut storage) = temp_store();
+        let first = put_header(&mut storage, "notes", 0x11);
+        let second = put_header(&mut storage, "notes", 0x22);
+        put_header(&mut storage, "tasks", 0x11);
+
+        let before = storage.prefix_scans.get();
+        for _ in 0..50 {
+            assert_eq!(
+                raw_tables_of(&storage, "notes"),
+                vec![
+                    first.raw_table_name().to_string(),
+                    second.raw_table_name().to_string()
+                ]
+            );
+        }
+        assert_eq!(
+            storage.prefix_scans.get() - before,
+            1,
+            "fifty reads of one table's raw tables"
+        );
+        assert_eq!(raw_tables_of(&storage, "tasks").len(), 1);
+        assert_eq!(raw_tables_of(&storage, "tasks").len(), 1);
+        assert_eq!(
+            storage.prefix_scans.get() - before,
+            2,
+            "another table is another read, once"
+        );
+    }
+
+    /// A table gets a raw table when a row of a new schema generation is written, and
+    /// loses one when a header is deleted: what was read before is not served after,
+    /// whichever way the header was written.
+    #[test]
+    fn a_header_written_or_deleted_after_the_raw_tables_were_read_is_seen() {
+        let (_dir, mut storage) = temp_store();
+        let first = put_header(&mut storage, "notes", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+
+        let second = put_header(&mut storage, "notes", 0x22);
+        assert_eq!(
+            raw_tables_of(&storage, "notes"),
+            vec![
+                first.raw_table_name().to_string(),
+                second.raw_table_name().to_string()
+            ],
+            "a header put on its own"
+        );
+
+        let (third, header) = visible_table("notes", 0x33);
+        storage
+            .apply_raw_table_mutations(&[RawTableMutation::Put {
+                table: super::super::RAW_TABLE_HEADER_TABLE,
+                key: third.raw_table_name(),
+                value: &header,
+            }])
+            .unwrap();
+        assert_eq!(
+            raw_tables_of(&storage, "notes").len(),
+            3,
+            "a header put among other mutations"
+        );
+
+        storage
+            .raw_table_delete(
+                super::super::RAW_TABLE_HEADER_TABLE,
+                second.raw_table_name(),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_tables_of(&storage, "notes"),
+            vec![
+                first.raw_table_name().to_string(),
+                third.raw_table_name().to_string()
+            ],
+            "a header deleted"
+        );
+    }
+
+    /// A header put on a transaction is not readable until the transaction commits: a
+    /// read in between finds the table without it, and must not be what a read after
+    /// the commit is served.
+    #[test]
+    fn what_is_read_before_a_header_is_committed_does_not_outlive_the_commit() {
+        let (_dir, mut storage) = temp_store();
+        put_header(&mut storage, "notes", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+
+        let (second, header) = visible_table("notes", 0x22);
+        let storage_key = key_codec::raw_table_entry_key(
+            super::super::RAW_TABLE_HEADER_TABLE,
+            second.raw_table_name(),
+        );
+        storage
+            .with_inner(|inner| {
+                let txn = storage.begin(&inner.db);
+                txn.put(&storage_key, &header)?;
+                assert_eq!(
+                    raw_tables_of(&storage, "notes").len(),
+                    1,
+                    "the header is not committed yet"
+                );
+                txn.commit()
+            })
+            .unwrap();
+        assert_eq!(
+            raw_tables_of(&storage, "notes").len(),
+            2,
+            "the header is committed"
+        );
+    }
+
+    /// A transaction that put a header and was dropped — an error between the put and
+    /// the commit — wrote nothing: the table has the raw tables it had, before and after
+    /// the next write that does commit.
+    #[test]
+    fn a_header_put_that_never_commits_is_not_remembered() {
+        let (_dir, mut storage) = temp_store();
+        put_header(&mut storage, "notes", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+
+        let (second, header) = visible_table("notes", 0x22);
+        let storage_key = key_codec::raw_table_entry_key(
+            super::super::RAW_TABLE_HEADER_TABLE,
+            second.raw_table_name(),
+        );
+        storage
+            .with_inner(|inner| {
+                let txn = storage.begin(&inner.db);
+                txn.put(&storage_key, &header)?;
+                assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            raw_tables_of(&storage, "notes").len(),
+            1,
+            "the transaction was dropped"
+        );
+        storage.raw_table_put("anything", "key", b"value").unwrap();
+        assert_eq!(
+            raw_tables_of(&storage, "notes").len(),
+            1,
+            "a later commit does not bring the dropped header in"
+        );
+        put_header(&mut storage, "notes", 0x22);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 2);
+    }
+
+    /// A commit that wrote no header keeps what is remembered: a row put, an index
+    /// mutation and a delete later, the raw tables of a table are still answered from
+    /// memory.
+    #[test]
+    fn a_write_that_is_not_a_header_keeps_what_is_remembered() {
+        let (_dir, mut storage) = temp_store();
+        put_header(&mut storage, "notes", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+        let before = storage.prefix_scans.get();
+
+        storage.raw_table_put("anything", "key", b"value").unwrap();
+        storage
+            .apply_index_mutations(&[IndexMutation::Insert {
+                table: "notes",
+                column: "title",
+                branch: "main",
+                value: Value::Text("a".to_string()),
+                row_id: ObjectId::new(),
+            }])
+            .unwrap();
+        storage.raw_table_delete("anything", "key").unwrap();
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+        assert_eq!(
+            storage.prefix_scans.get(),
+            before,
+            "no header was written: the headers are not read again"
+        );
+    }
+
+    /// A header write drops what is remembered of every table, not of the one read
+    /// next: the other tables' raw tables are read again too.
+    #[test]
+    fn a_header_write_drops_what_is_remembered_of_every_table() {
+        let (_dir, mut storage) = temp_store();
+        put_header(&mut storage, "notes", 0x11);
+        put_header(&mut storage, "tasks", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+        assert_eq!(raw_tables_of(&storage, "tasks").len(), 1);
+
+        put_header(&mut storage, "notes", 0x22);
+        assert_eq!(raw_tables_of(&storage, "tasks").len(), 1);
+        assert_eq!(
+            raw_tables_of(&storage, "notes").len(),
+            2,
+            "read after another table was"
+        );
+    }
+
+    /// A closed store answers nothing, and not from what it remembers either.
+    #[test]
+    fn the_raw_tables_of_a_closed_store_are_not_answered_from_memory() {
+        let (_dir, mut storage) = temp_store();
+        put_header(&mut storage, "notes", 0x11);
+        assert_eq!(raw_tables_of(&storage, "notes").len(), 1);
+        storage.close().unwrap();
+        assert!(
+            super::super::row_raw_table_ids_for_table(&storage, RowRawTableKind::Visible, "notes")
+                .is_err(),
+            "a read of a closed store"
+        );
+    }
+
+    /// What one store remembers of its headers is not what another is served, and a
+    /// header written to one does not make the other read its own again.
+    #[test]
+    fn two_stores_do_not_share_what_they_remember_of_their_headers() {
+        let (_dir_a, mut store_a) = temp_store();
+        let (_dir_b, mut store_b) = temp_store();
+        put_header(&mut store_a, "notes", 0x11);
+        put_header(&mut store_b, "notes", 0x11);
+        put_header(&mut store_b, "notes", 0x22);
+        assert_eq!(raw_tables_of(&store_a, "notes").len(), 1);
+        assert_eq!(raw_tables_of(&store_b, "notes").len(), 2);
+        let before = store_a.prefix_scans.get();
+        put_header(&mut store_b, "notes", 0x33);
+        assert_eq!(raw_tables_of(&store_a, "notes").len(), 1);
+        assert_eq!(raw_tables_of(&store_b, "notes").len(), 3);
+        assert_eq!(
+            store_a.prefix_scans.get(),
+            before,
+            "a header written to another store"
+        );
+    }
 
     #[test]
     fn open_and_close() {
