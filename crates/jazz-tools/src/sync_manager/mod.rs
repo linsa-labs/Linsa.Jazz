@@ -311,7 +311,7 @@ pub struct SyncManager {
     /// Whether the sweep has walked the retained submission table for this process yet.
     pub(super) sealed_batch_sweep_primed: bool,
     /// Tracks which clients are interested in row batch-member state updates.
-    pub(super) row_batch_interest: HashMap<RowBatchKey, HashSet<ClientId>>,
+    pub(super) row_batch_interest: RowBatchInterest,
     /// Tracks clients that explicitly requested the current or next known fate
     /// for a batch whose row member state may not be present on this peer.
     pub(super) batch_fate_interest: HashMap<BatchId, HashSet<ClientId>>,
@@ -490,7 +490,7 @@ impl SyncManager {
             my_tiers: HashSet::new(),
             sealed_batches_to_sweep: BTreeSet::new(),
             sealed_batch_sweep_primed: false,
-            row_batch_interest: HashMap::new(),
+            row_batch_interest: RowBatchInterest::default(),
             batch_fate_interest: HashMap::new(),
             query_origin: HashMap::new(),
             remote_query_scopes: HashMap::new(),
@@ -692,11 +692,7 @@ impl SyncManager {
                 subscriptions += 48;
             }
         }
-        for (row_batch_key, clients) in &self.row_batch_interest {
-            subscriptions += std::mem::size_of_val(row_batch_key);
-            subscriptions += clients.len() * std::mem::size_of::<ClientId>();
-            subscriptions += 48;
-        }
+        subscriptions += self.row_batch_interest.memory_size();
         for (batch_id, clients) in &self.batch_fate_interest {
             subscriptions += std::mem::size_of_val(batch_id);
             subscriptions += clients.len() * std::mem::size_of::<ClientId>();
@@ -910,10 +906,7 @@ impl SyncManager {
             .retain(|(asked_by, _), _| *asked_by != client_id);
         self.clients.remove(&client_id);
         // Clean up interest map
-        self.row_batch_interest.retain(|_, clients| {
-            clients.remove(&client_id);
-            !clients.is_empty()
-        });
+        self.row_batch_interest.remove_client(client_id);
         self.batch_fate_interest.retain(|_, clients| {
             clients.remove(&client_id);
             !clients.is_empty()
@@ -1408,12 +1401,7 @@ impl SyncManager {
                         .insert(client_id);
                 }
             }
-            if let Some(clients) = self.row_batch_interest.get_mut(&key) {
-                clients.remove(&client_id);
-                if clients.is_empty() {
-                    self.row_batch_interest.remove(&key);
-                }
-            }
+            self.row_batch_interest.remove(&key, client_id);
         }
     }
 

@@ -105,6 +105,208 @@ pub struct RowBatchKey {
     pub batch_id: BatchId,
 }
 
+/// The clients interested in each row batch, held by batch: a batch's fate goes to every
+/// client interested in one of its rows, and is asked for once per batch a scope delivers —
+/// walking every row batch any client was sent, per batch, cost the server 8 % of a search's
+/// tick.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RowBatchInterest {
+    by_batch: HashMap<BatchId, BatchRows>,
+}
+
+/// The rows of one batch some client is interested in. Almost every batch has one row, held
+/// inline so that it costs no table of its own; a batch whose rows go down to one is held
+/// inline again.
+#[derive(Debug, Clone)]
+enum BatchRows {
+    One((ObjectId, BranchName), HashSet<ClientId>),
+    Many(HashMap<(ObjectId, BranchName), HashSet<ClientId>>),
+}
+
+impl BatchRows {
+    fn iter(&self) -> impl Iterator<Item = (&(ObjectId, BranchName), &HashSet<ClientId>)> {
+        let (one, many) = match self {
+            BatchRows::One(row, clients) => (Some((row, clients)), None),
+            BatchRows::Many(rows) => (None, Some(rows.iter())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
+
+    /// A batch of more than one row whose rows went down to one is held inline again.
+    fn settle(&mut self) {
+        if let BatchRows::Many(rows) = self
+            && rows.len() == 1
+            && let Some((row, clients)) = std::mem::take(rows).into_iter().next()
+        {
+            *self = BatchRows::One(row, clients);
+        }
+    }
+
+    /// Takes `client_id` out of every row; whether any row is left.
+    fn remove_client(&mut self, client_id: ClientId) -> bool {
+        let held = match self {
+            BatchRows::One(_, clients) => {
+                clients.remove(&client_id);
+                !clients.is_empty()
+            }
+            BatchRows::Many(rows) => {
+                rows.retain(|_, clients| {
+                    clients.remove(&client_id);
+                    !clients.is_empty()
+                });
+                !rows.is_empty()
+            }
+        };
+        self.settle();
+        held
+    }
+}
+
+impl RowBatchInterest {
+    pub(crate) fn insert(&mut self, key: RowBatchKey, client_id: ClientId) {
+        let row = (key.row_id, key.branch_name);
+        let Some(rows) = self.by_batch.get_mut(&key.batch_id) else {
+            self.by_batch.insert(
+                key.batch_id,
+                BatchRows::One(row, HashSet::from([client_id])),
+            );
+            return;
+        };
+        match rows {
+            BatchRows::One(held, clients) if *held == row => {
+                clients.insert(client_id);
+            }
+            BatchRows::One(held, clients) => {
+                let mut many = HashMap::with_capacity(2);
+                many.insert(*held, std::mem::take(clients));
+                many.insert(row, HashSet::from([client_id]));
+                *rows = BatchRows::Many(many);
+            }
+            BatchRows::Many(many) => {
+                many.entry(row).or_default().insert(client_id);
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &RowBatchKey, client_id: ClientId) {
+        let row = (key.row_id, key.branch_name);
+        let Some(rows) = self.by_batch.get_mut(&key.batch_id) else {
+            return;
+        };
+        let held = match rows {
+            BatchRows::One(held, clients) => {
+                if *held != row {
+                    return;
+                }
+                clients.remove(&client_id);
+                !clients.is_empty()
+            }
+            BatchRows::Many(many) => {
+                let Some(clients) = many.get_mut(&row) else {
+                    return;
+                };
+                clients.remove(&client_id);
+                if clients.is_empty() {
+                    many.remove(&row);
+                }
+                !many.is_empty()
+            }
+        };
+        if held {
+            rows.settle();
+        } else {
+            self.by_batch.remove(&key.batch_id);
+        }
+    }
+
+    pub(crate) fn remove_client(&mut self, client_id: ClientId) {
+        self.by_batch
+            .retain(|_, rows| rows.remove_client(client_id));
+    }
+
+    /// Every row batch some client is interested in, with its clients.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (RowBatchKey, &HashSet<ClientId>)> {
+        self.by_batch.iter().flat_map(|(batch_id, rows)| {
+            rows.iter().map(|((row_id, branch_name), clients)| {
+                (RowBatchKey::new(*row_id, *branch_name, *batch_id), clients)
+            })
+        })
+    }
+
+    /// How many batches some client is interested in a row of.
+    #[cfg(test)]
+    pub(crate) fn batch_count(&self) -> usize {
+        self.by_batch.len()
+    }
+
+    /// Whether the rows of `batch_id` are held inline: one row, no table.
+    #[cfg(test)]
+    pub(crate) fn holds_inline(&self, batch_id: BatchId) -> bool {
+        matches!(self.by_batch.get(&batch_id), Some(BatchRows::One(..)))
+    }
+
+    /// Bytes held, by the estimate `SyncManager::memory_size` uses: a batch's entry, which
+    /// holds a batch of one row inline, each row of a batch of more than one, and the clients
+    /// of each row. A batch of one row and one client counts as the flat map of row batches
+    /// it replaced counted one entry.
+    pub(crate) fn memory_size(&self) -> usize {
+        let clients = |clients: &HashSet<ClientId>| clients.len() * std::mem::size_of::<ClientId>();
+        self.by_batch
+            .values()
+            .map(|rows| {
+                let held = match rows {
+                    BatchRows::One(_, held) => clients(held),
+                    BatchRows::Many(many) => many
+                        .values()
+                        .map(|held| {
+                            std::mem::size_of::<(ObjectId, BranchName)>()
+                                + std::mem::size_of::<HashSet<ClientId>>()
+                                + clients(held)
+                        })
+                        .sum(),
+                };
+                std::mem::size_of::<BatchId>() + std::mem::size_of::<BatchRows>() + held
+            })
+            .sum()
+    }
+
+    /// The row batches of `batch_id` some client is interested in.
+    pub(crate) fn keys_of_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> impl Iterator<Item = RowBatchKey> + '_ {
+        self.by_batch
+            .get(&batch_id)
+            .into_iter()
+            .flat_map(move |rows| {
+                rows.iter().map(move |((row_id, branch_name), _)| {
+                    RowBatchKey::new(*row_id, *branch_name, batch_id)
+                })
+            })
+    }
+
+    /// The clients interested in a row of `batch_id`: a client interested in several of its
+    /// rows comes once for each.
+    pub(crate) fn clients_of_batch(
+        &self,
+        batch_id: BatchId,
+    ) -> impl Iterator<Item = ClientId> + '_ {
+        self.by_batch
+            .get(&batch_id)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .flat_map(|(_, clients)| clients.iter().copied())
+    }
+
+    /// Whether `client_id` is interested in a row of `batch_id`.
+    pub(crate) fn batch_has_client(&self, batch_id: BatchId, client_id: ClientId) -> bool {
+        self.by_batch
+            .get(&batch_id)
+            .is_some_and(|rows| rows.iter().any(|(_, clients)| clients.contains(&client_id)))
+    }
+}
+
 impl RowBatchKey {
     pub fn new(row_id: ObjectId, branch_name: BranchName, batch_id: BatchId) -> Self {
         Self {
@@ -836,6 +1038,179 @@ pub struct PendingPermissionCheck {
 mod tests {
     use super::*;
     use crate::query_manager::session::AuthMode;
+
+    /// Random inserts and removals of row batch interest, and clients going away, against
+    /// a plain map: what is held by batch is what walking the map answers. Windows that mostly
+    /// add alternate with windows that mostly take away, so batches empty and fill again all
+    /// through a seed.
+    #[test]
+    fn row_batch_interest_by_batch_matches_a_walk_of_every_row_batch() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, bound: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % bound
+            }
+        }
+        let by_row = |key: &RowBatchKey| {
+            (
+                *key.row_id.uuid().as_bytes(),
+                key.branch_name.as_str().to_string(),
+            )
+        };
+        let mut emptied_by_a_removal = 0;
+        let mut emptied_by_a_client_leaving = 0;
+        for seed in 1..=8u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let clients: Vec<ClientId> = (0..4).map(|_| ClientId::new()).collect();
+            let batches: Vec<BatchId> = (0..6).map(|_| BatchId::new()).collect();
+            let rows: Vec<ObjectId> = (0..8).map(|_| ObjectId::new()).collect();
+            let branches = [BranchName::new("main"), BranchName::new("draft")];
+            let mut interest = RowBatchInterest::default();
+            let mut model: HashMap<RowBatchKey, HashSet<ClientId>> = HashMap::new();
+            for step in 0..3000 {
+                let key = RowBatchKey::new(
+                    rows[rng.below(8) as usize],
+                    branches[rng.below(2) as usize],
+                    batches[rng.below(6) as usize],
+                );
+                let client = clients[rng.below(4) as usize];
+                let adding = (step / 250) % 2 == 0;
+                let inserts_below = if adding { 5 } else { 1 };
+                let held_before: HashSet<BatchId> = model.keys().map(|key| key.batch_id).collect();
+                let mut client_left = false;
+                match rng.below(10) {
+                    roll if roll < inserts_below => {
+                        interest.insert(key, client);
+                        model.entry(key).or_default().insert(client);
+                    }
+                    roll if roll < 8 => {
+                        // Taking away, a removal hits a held pair, picked in a fixed order.
+                        let (key, client) = if adding || model.is_empty() {
+                            (key, client)
+                        } else {
+                            let mut held: Vec<RowBatchKey> = model.keys().copied().collect();
+                            held.sort_by_key(|key| (by_row(key), key.batch_id.0));
+                            let key = held[rng.below(held.len() as u64) as usize];
+                            let holders: Vec<ClientId> = clients
+                                .iter()
+                                .copied()
+                                .filter(|client| model[&key].contains(client))
+                                .collect();
+                            (key, holders[rng.below(holders.len() as u64) as usize])
+                        };
+                        interest.remove(&key, client);
+                        if let Some(held) = model.get_mut(&key) {
+                            held.remove(&client);
+                            if held.is_empty() {
+                                model.remove(&key);
+                            }
+                        }
+                    }
+                    8 => {
+                        if rng.below(4) == 0 {
+                            client_left = true;
+                            interest.remove_client(client);
+                            model.retain(|_, held| {
+                                held.remove(&client);
+                                !held.is_empty()
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                let walked: HashMap<RowBatchKey, HashSet<ClientId>> = interest
+                    .iter()
+                    .map(|(key, held)| (key, held.clone()))
+                    .collect();
+                assert_eq!(walked, model, "seed {seed}, step {step}: the row batches");
+                let held: HashSet<BatchId> = interest.by_batch.keys().copied().collect();
+                let want: HashSet<BatchId> = model.keys().map(|key| key.batch_id).collect();
+                assert_eq!(
+                    held, want,
+                    "seed {seed}, step {step}: a batch is held exactly while a row of it is"
+                );
+                assert_eq!(interest.batch_count(), want.len());
+                for rows in interest.by_batch.values() {
+                    assert!(
+                        matches!(rows, BatchRows::One(_, clients) if !clients.is_empty())
+                            || matches!(rows, BatchRows::Many(many)
+                                if many.len() > 1 && many.values().all(|clients| !clients.is_empty())),
+                        "seed {seed}, step {step}: a batch of one row is held inline, and nothing held is empty"
+                    );
+                }
+                let emptied = held_before.difference(&want).count();
+                if client_left {
+                    emptied_by_a_client_leaving += emptied;
+                } else {
+                    emptied_by_a_removal += emptied;
+                }
+                for batch_id in &batches {
+                    let mut keys: Vec<RowBatchKey> = interest.keys_of_batch(*batch_id).collect();
+                    let mut want: Vec<RowBatchKey> = model
+                        .keys()
+                        .filter(|key| key.batch_id == *batch_id)
+                        .copied()
+                        .collect();
+                    keys.sort_by_key(by_row);
+                    want.sort_by_key(by_row);
+                    assert_eq!(keys, want, "seed {seed}, step {step}: the rows of a batch");
+                    let got: HashSet<ClientId> = interest.clients_of_batch(*batch_id).collect();
+                    let want: HashSet<ClientId> = model
+                        .iter()
+                        .filter(|(key, _)| key.batch_id == *batch_id)
+                        .flat_map(|(_, held)| held.iter().copied())
+                        .collect();
+                    assert_eq!(
+                        got, want,
+                        "seed {seed}, step {step}: the clients of a batch"
+                    );
+                    for client in &clients {
+                        assert_eq!(
+                            interest.batch_has_client(*batch_id, *client),
+                            want.contains(client),
+                            "seed {seed}, step {step}: whether a client holds a row of a batch"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            emptied_by_a_removal > 100 && emptied_by_a_client_leaving > 5,
+            "batches must empty all through the seeds, by a removal ({emptied_by_a_removal}) \
+             and by a client leaving ({emptied_by_a_client_leaving}), else this gates neither"
+        );
+    }
+
+    /// A batch of one row is counted as its entry and its clients — what the flat map it
+    /// replaced counted for one row batch — and a second row brings the rows' own entries.
+    #[test]
+    fn a_batch_of_one_row_is_counted_as_one_entry() {
+        let mut interest = RowBatchInterest::default();
+        let batch_id = BatchId::new();
+        let client_id = ClientId::new();
+        interest.insert(
+            RowBatchKey::new(ObjectId::new(), BranchName::new("main"), batch_id),
+            client_id,
+        );
+        let entry = std::mem::size_of::<BatchId>() + std::mem::size_of::<BatchRows>();
+        let client = std::mem::size_of::<ClientId>();
+        assert_eq!(interest.memory_size(), entry + client);
+        assert_eq!(
+            interest.memory_size(),
+            std::mem::size_of::<RowBatchKey>() + client + std::mem::size_of::<HashSet<ClientId>>(),
+            "the flat map's count of one row batch"
+        );
+        interest.insert(
+            RowBatchKey::new(ObjectId::new(), BranchName::new("main"), batch_id),
+            client_id,
+        );
+        let row = std::mem::size_of::<(ObjectId, BranchName)>()
+            + std::mem::size_of::<HashSet<ClientId>>();
+        assert_eq!(interest.memory_size(), entry + 2 * (row + client));
+    }
 
     #[test]
     fn destination_exposes_peer_identity_for_telemetry() {

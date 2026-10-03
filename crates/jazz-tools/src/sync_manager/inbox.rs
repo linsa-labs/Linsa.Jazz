@@ -1319,9 +1319,9 @@ impl SyncManager {
             BatchFate::DurableDirect { batch_id, .. }
             | BatchFate::AcceptedTransaction { batch_id, .. }
             | BatchFate::Rejected { batch_id, .. } => {
-                let row_interest = self.row_batch_interest.iter().any(|(key, clients)| {
-                    key.batch_id == *batch_id && clients.contains(&client_id)
-                });
+                let row_interest = self
+                    .row_batch_interest
+                    .batch_has_client(*batch_id, client_id);
                 let fate_interest = self
                     .batch_fate_interest
                     .get(batch_id)
@@ -1337,12 +1337,10 @@ impl SyncManager {
             BatchFate::DurableDirect { batch_id, .. }
             | BatchFate::AcceptedTransaction { batch_id, .. }
             | BatchFate::Rejected { batch_id, .. } => {
-                let mut interested = HashSet::new();
-                for (key, clients) in &self.row_batch_interest {
-                    if key.batch_id == *batch_id {
-                        interested.extend(clients.iter().copied());
-                    }
-                }
+                let mut interested: HashSet<ClientId> = self
+                    .row_batch_interest
+                    .clients_of_batch(*batch_id)
+                    .collect();
                 if let Some(clients) = self.batch_fate_interest.get(batch_id) {
                     interested.extend(clients.iter().copied());
                 }
@@ -1463,11 +1461,11 @@ impl SyncManager {
         for scope in self.remote_query_scopes.values() {
             object_ids.extend(scope.iter().map(|(object_id, _)| *object_id));
         }
-        for key in self.row_batch_interest.keys() {
-            if key.batch_id == batch_id {
-                object_ids.insert(key.row_id);
-            }
-        }
+        object_ids.extend(
+            self.row_batch_interest
+                .keys_of_batch(batch_id)
+                .map(|key| key.row_id),
+        );
         if let Ok(Some(submission)) = storage.load_sealed_batch_submission(batch_id) {
             object_ids.extend(submission.members.iter().map(|member| member.object_id));
             return self.transactional_batch_rows(
@@ -2839,9 +2837,7 @@ impl SyncManager {
                             && Self::matches_replayed_row_batch(existing_history_row, row)
                         {
                             self.row_batch_interest
-                                .entry(RowBatchKey::from_row(row))
-                                .or_default()
-                                .insert(client_id);
+                                .insert(RowBatchKey::from_row(row), client_id);
                             self.try_accept_completed_sealed_batch_from_client(
                                 storage,
                                 client_id,
@@ -3093,10 +3089,10 @@ impl SyncManager {
                 let object_id = row.row_id;
                 let branch_name = BranchName::new(&row.branch);
                 let batch_id = row.batch_id;
-                self.row_batch_interest
-                    .entry(RowBatchKey::new(object_id, branch_name, batch_id))
-                    .or_default()
-                    .insert(client_id);
+                self.row_batch_interest.insert(
+                    RowBatchKey::new(object_id, branch_name, batch_id),
+                    client_id,
+                );
 
                 if let Some(applied) = self.apply_row_updated(
                     storage,

@@ -33,8 +33,7 @@ fn memory_size_separates_sync_state_buckets() {
         Some(session.clone()),
     );
 
-    sm.row_batch_interest
-        .insert(row_key, HashSet::from([client_id]));
+    sm.row_batch_interest.insert(row_key, client_id);
     sm.query_origin
         .insert(QueryId(7), HashSet::from([client_id]));
     sm.clients
@@ -119,6 +118,89 @@ fn memory_size_separates_sync_state_buckets() {
     assert!(subscriptions > 0);
     assert!(queues > 0);
     assert_eq!(total, catalogue + connections + subscriptions + queues);
+}
+
+/// Row interest is counted in `memory_size`.
+#[test]
+fn memory_size_counts_row_interest() {
+    let client_id = ClientId::new();
+    let row = |batch_id| RowBatchKey::new(ObjectId::new(), BranchName::new("main"), batch_id);
+    let mut sm = SyncManager::new();
+    let (_, _, before, _, _) = sm.memory_size();
+    sm.row_batch_interest.insert(row(BatchId::new()), client_id);
+    let one_row = sm.row_batch_interest.memory_size();
+    let shared = BatchId::new();
+    sm.row_batch_interest.insert(row(shared), client_id);
+    sm.row_batch_interest.insert(row(shared), client_id);
+    let (_, _, after, _, _) = sm.memory_size();
+
+    assert!(one_row > 0);
+    assert_eq!(after - before, sm.row_batch_interest.memory_size());
+}
+
+/// A client that goes leaves no row interest behind.
+#[test]
+fn a_removed_client_leaves_no_row_interest() {
+    let mut sm = SyncManager::new();
+    let io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let other_id = ClientId::new();
+    add_client(&mut sm, &io, client_id);
+    add_client(&mut sm, &io, other_id);
+    let batch_id = BatchId::new();
+    let key = RowBatchKey::new(ObjectId::new(), BranchName::new("main"), batch_id);
+    sm.row_batch_interest.insert(key, client_id);
+    sm.row_batch_interest.insert(
+        RowBatchKey::new(ObjectId::new(), BranchName::new("main"), batch_id),
+        other_id,
+    );
+
+    assert!(
+        !sm.row_batch_interest.holds_inline(batch_id),
+        "a batch of two rows holds a table of them, else this gates nothing"
+    );
+
+    assert!(sm.remove_client(client_id));
+    assert!(!sm.row_batch_interest.batch_has_client(batch_id, client_id));
+    assert!(sm.row_batch_interest.batch_has_client(batch_id, other_id));
+    assert!(
+        sm.row_batch_interest.holds_inline(batch_id),
+        "the batch's one row left is held inline again"
+    );
+}
+
+/// A row that leaves a client's scope takes the client's interest in the batch it was sent.
+#[test]
+fn a_row_leaving_a_clients_scope_takes_its_row_interest() {
+    let mut sm = SyncManager::new();
+    let mut io = MemoryStorage::new();
+    let client_id = ClientId::new();
+    let row_id = ObjectId::new();
+    let row = visible_row(row_id, "main", Vec::new(), 1_000, b"alice");
+    add_client(&mut sm, &io, client_id);
+    seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    set_client_query_scope(
+        &mut sm,
+        &io,
+        client_id,
+        QueryId(1),
+        HashSet::from([(row_id, BranchName::new("main"))]),
+        None,
+    );
+    confirm_queued(&mut sm);
+    sm.take_outbox();
+    assert!(
+        sm.row_batch_interest
+            .batch_has_client(row.batch_id, client_id),
+        "the delivered row must be held, else this gates nothing"
+    );
+
+    sm.drop_client_query_subscription(&io, client_id, QueryId(1));
+
+    assert!(
+        !sm.row_batch_interest
+            .batch_has_client(row.batch_id, client_id)
+    );
 }
 
 #[test]

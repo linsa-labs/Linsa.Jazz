@@ -473,10 +473,10 @@ impl SyncManager {
                 );
             }
         }
-        self.row_batch_interest
-            .entry(RowBatchKey::new(object_id, branch_name, batch_id))
-            .or_default()
-            .insert(client_id);
+        self.row_batch_interest.insert(
+            RowBatchKey::new(object_id, branch_name, batch_id),
+            client_id,
+        );
 
         self.outbox.push(OutboxEntry {
             destination: Destination::Client(client_id),

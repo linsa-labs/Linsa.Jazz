@@ -944,3 +944,75 @@ fn seal_batch_rejection_stops_when_settlement_persistence_fails() {
     );
     assert!(sm.take_outbox().is_empty());
 }
+
+/// A batch's accepted fate from upstream settles a staged row this node holds only because a
+/// client sent it: no query scope covers the row and no sealed submission lists it, so the
+/// row interest is the one place the fate can find it.
+#[test]
+fn an_accepted_fate_from_upstream_settles_a_staged_row_only_a_client_sent() {
+    let mut io = MemoryStorage::new();
+    seed_users_schema(&mut io);
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::EdgeServer);
+    let client_id = ClientId::new();
+    let server_id = ServerId::new();
+    add_client(&mut sm, &io, client_id);
+    sm.set_client_role(client_id, ClientRole::Peer);
+    add_server(&mut sm, &io, server_id);
+
+    let row_id = ObjectId::new();
+    let batch_id = BatchId(*ObjectId::new().uuid().as_bytes());
+    let staged = row_with_batch_state(
+        visible_row(row_id, "main", Vec::new(), 1_000, b"alice"),
+        batch_id,
+        crate::row_histories::RowState::StagingPending,
+        None,
+    );
+    sm.process_from_client(
+        &mut io,
+        client_id,
+        SyncPayload::RowBatchCreated {
+            metadata: Some(RowMetadata {
+                id: row_id,
+                metadata: row_metadata("users"),
+            }),
+            row: staged,
+        },
+    );
+    sm.take_outbox();
+    assert_eq!(
+        io.load_history_row_batch("users", "main", row_id, batch_id)
+            .unwrap()
+            .map(|row| row.state),
+        Some(crate::row_histories::RowState::StagingPending),
+        "the client's staged row must be held, else this gates nothing"
+    );
+    assert!(
+        sm.remote_query_scopes.is_empty()
+            && io.load_sealed_batch_submission(batch_id).unwrap().is_none(),
+        "no scope and no submission may name the row, else the row interest is not what finds it"
+    );
+
+    sm.process_from_server(
+        &mut io,
+        server_id,
+        SyncPayload::BatchFate {
+            fate: BatchFate::AcceptedTransaction {
+                batch_id,
+                confirmed_tier: DurabilityTier::GlobalServer,
+            },
+        },
+    );
+
+    let settled = io
+        .load_history_row_batch("users", "main", row_id, batch_id)
+        .unwrap()
+        .expect("the row is still held");
+    assert_eq!(
+        (settled.state, settled.confirmed_tier),
+        (
+            crate::row_histories::RowState::VisibleTransactional,
+            Some(DurabilityTier::GlobalServer)
+        ),
+        "the accepted fate did not reach the row a client sent"
+    );
+}
