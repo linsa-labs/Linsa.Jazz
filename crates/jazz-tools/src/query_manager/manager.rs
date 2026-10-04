@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -170,7 +171,8 @@ impl LocalWriteAuthority<'_> {
 
 /// What the three maps tracking a local write say about one row. See
 /// `QueryManager::retire_local_row_tracking`. Exists for the gates that assert the family
-/// retires together, so it is test-only by construction.
+/// retires together (and that a confirmed direct write leaves the overlay first, with its
+/// exemption parked), so it is test-only by construction.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct LocalRowTracking {
@@ -651,6 +653,10 @@ pub struct QueryManager {
     /// Used to let `local_updates = Immediate` queries fall back to the current
     /// local row batch entry when the requested remote durability tier has not been
     /// reached yet.
+    ///
+    /// A row leaves on a rejection, on a non-local version of it from another batch or
+    /// confirmed at `GlobalServer` (`retire_local_row_tracking`), and — a direct write — on
+    /// its batch's `DurableDirect` fate at `GlobalServer` (`release_local_overlay_row`).
     pub(super) pending_local_row_batches: HashMap<ObjectId, RowBatchKey>,
     /// Rows this node authored that the REMOTE SCOPE is not yet known to cover.
     ///
@@ -661,7 +667,10 @@ pub struct QueryManager {
     /// evidence from the scope channel. One map, one clear, three retirements was the
     /// design error: it left the scope exemption with no expiry at all for a node whose
     /// reads are one-shot, because the clear only ever fired on an inbound update for the
-    /// row and the server never sends a row back to its author.
+    /// row, and the server forwards a write to every client except its author. (Scope
+    /// delivery does send the author its own rows back; that copy is a no-op — a forwarded
+    /// row carries no tier at all, only the batch's fate does, and the stored row is
+    /// identical.)
     ///
     /// Branch-aware, unlike the map it came from: the filter used to compare ids only, so
     /// a row pending on one branch exempted the same id in a query over another.
@@ -684,6 +693,11 @@ pub struct QueryManager {
     /// The later-pass requirement is what the two-phase release is for: a settle applied in
     /// the same pass that parked the row would collapse it to a single phase and let the
     /// row blink out of a reader still holding the older scope.
+    ///
+    /// One other exit: a non-local version of the row on the parked branch retires it
+    /// (`prepare_row_update_with_origin`), whether the row is still in the overlay or was
+    /// released from it on its direct fate. That is a row version, not scope evidence — see
+    /// the arm for the window it leaves.
     pub(super) confirmed_local_rows_awaiting_scope: HashMap<ObjectId, ParkedExemption>,
 
     /// Counts settle passes, so a parked exemption can tell "a scope snapshot arrived
@@ -1871,6 +1885,46 @@ impl QueryManager {
             }
         }
 
+        // A direct write confirmed at the top tier no longer needs the source overlay: the
+        // tier-gated loader takes a row's tier from its authoritative fate
+        // (`row_confirmed_tier_with_batch_fate`), so a subscription at any tier reads the
+        // stored version without it. The overlay's other retirement on confirmation — a
+        // visibility change carrying `GlobalServer`, in `prepare_row_update_with_origin` —
+        // comes only for a transactional batch, whose rows its fate patches; a direct
+        // batch's rows are not patched, so its row stayed in the overlay for the process
+        // lifetime, and every `Immediate` subscription with a tier rescanned every scan on
+        // every settle from the first local write on (measured on the app: never drained,
+        // 3 to 5 rows across a session).
+        //
+        // `DurableDirect` only: a transactional row still staged is served by the overlay
+        // alone, and its own retirement is the visibility change above. `GlobalServer` only:
+        // the map is shared by readers of every tier, and a version below the top tier is
+        // invisible to a top-tier reader without it. Only the overlay role ends here; the
+        // scope exemption was parked above, from this same map, and keeps its two-phase
+        // retirement. Before the marking below, so the marks flag the subscriptions whose
+        // pending ids this leaves unbacked.
+        let confirmed_direct: HashSet<BatchId> = batch_fates
+            .iter()
+            .filter_map(|fate| match fate {
+                BatchFate::DurableDirect {
+                    batch_id,
+                    confirmed_tier: DurabilityTier::GlobalServer,
+                } => Some(*batch_id),
+                _ => None,
+            })
+            .collect();
+        if !confirmed_direct.is_empty() {
+            let released: Vec<ObjectId> = self
+                .pending_local_row_batches
+                .iter()
+                .filter(|(_, key)| confirmed_direct.contains(&key.batch_id))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in released {
+                self.release_local_overlay_row(id);
+            }
+        }
+
         let mut batch_ids = batch_fates
             .iter()
             .map(BatchFate::batch_id)
@@ -2001,7 +2055,7 @@ impl QueryManager {
         // often unsubscribe and immediately resubscribe; draining removals
         // first prevents stale per-client scope from suppressing the replay
         // that the new subscription depends on.
-        self.process_pending_query_unsubscriptions();
+        self.process_pending_query_unsubscriptions(storage);
 
         // 3b. Process pending query subscriptions from downstream clients
         // (after indices are updated, so initial settle finds existing data)
@@ -2135,6 +2189,7 @@ impl QueryManager {
             // short-circuit above, so it is about to do real settle work — the
             // clock read sits next to a graph settle, never next to a skip.
             let settle_started = web_time::Instant::now();
+            let skip_violations_before = super::settle_cost::settle_skip_violations_on_thread();
             let delta = {
                 let schema_context = &self.schema_context;
                 let branch_schema_map = &self.branch_schema_map;
@@ -2216,6 +2271,15 @@ impl QueryManager {
             // Local subscriptions have no downstream client; the query id alone
             // identifies them.
             super::settle_cost::note_subscription_settle(None, sub_id.0, settle_started.elapsed());
+            if super::settle_cost::settle_skip_violations_on_thread() != skip_violations_before {
+                tracing::error!(
+                    target: "jazz::settle_skips",
+                    sub_id = sub_id.0,
+                    query_digest = super::settle_skips::query_digest(&subscription.query),
+                    table = %table,
+                    "settle skip violation in this subscription's settle"
+                );
+            }
             subscription.needs_visibility_recompute = false;
             let new_schema_warnings = Self::finalize_schema_warnings(
                 &mut subscription.reported_schema_warnings,
@@ -2267,14 +2331,14 @@ impl QueryManager {
                 let (auth_schema_context, auth_branch_schema_map) =
                     (&*auth_schema_context, &*auth_branch_schema_map);
                 let mut settlement_eval_cache = SettlementEvalCache::default();
-                Cow::Owned(self.authorized_tuples_from_graph_with_cache(
+                self.authorized_tuples_from_graph_with_cache(
                     storage_ref,
                     &mut settlement_eval_cache,
                     &subscription.graph,
                     auth_schema_context,
                     auth_branch_schema_map,
                     subscription.session.as_ref(),
-                ))
+                )
             } else {
                 Cow::Borrowed(subscription.graph.current_output_tuples_ref())
             };
@@ -2288,17 +2352,15 @@ impl QueryManager {
                 && (subscription.propagation == QueryPropagation::Full
                     || !self.sync_manager.has_durability_identity())
             {
-                visible_tuples = Cow::Owned(
-                    self.filter_synced_query_scope_tuples(
-                        QueryId(sub_id.0),
-                        subscription.durability_tier,
-                        LocalWriteAuthority {
-                            overlay: (!subscription.local_overlay_rows.is_empty())
-                                .then_some(&subscription.local_overlay_rows),
-                            process_wide: subscription.local_updates == LocalUpdates::Immediate,
-                        },
-                        visible_tuples.into_owned(),
-                    ),
+                visible_tuples = self.filter_synced_query_scope_tuples(
+                    QueryId(sub_id.0),
+                    subscription.durability_tier,
+                    LocalWriteAuthority {
+                        overlay: (!subscription.local_overlay_rows.is_empty())
+                            .then_some(&subscription.local_overlay_rows),
+                        process_wide: subscription.local_updates == LocalUpdates::Immediate,
+                    },
+                    visible_tuples,
                 );
             }
 
@@ -2362,11 +2424,6 @@ impl QueryManager {
             } else {
                 let visible_rows =
                     Self::rows_from_tuples(&subscription.graph, visible_tuples.as_ref());
-                let visible_rows_by_id: HashMap<_, _> = visible_rows
-                    .iter()
-                    .cloned()
-                    .map(|row| (row.id, row))
-                    .collect();
                 let visible_delta = Self::row_delta_from_rows(
                     &subscription.current_visible_rows,
                     &subscription.current_ordered_ids,
@@ -2392,7 +2449,8 @@ impl QueryManager {
                     false,
                 );
                 subscription.current_ordered_ids = ordered.ordered_ids_after;
-                subscription.current_visible_rows = visible_rows_by_id;
+                subscription.current_visible_rows =
+                    visible_rows.into_iter().map(|row| (row.id, row)).collect();
                 tracing::debug!(
                     sub_id = sub_id.0,
                     added = visible_delta.added.len(),
@@ -2567,6 +2625,31 @@ impl QueryManager {
             && (pending_row_key.batch_id != current_batch_id
                 || update.row.confirmed_tier == Some(DurabilityTier::GlobalServer))
         {
+            self.retire_local_row_tracking(update.object_id);
+        } else if !self
+            .pending_local_row_batches
+            .contains_key(&update.object_id)
+            && self
+                .confirmed_local_rows_awaiting_scope
+                .get(&update.object_id)
+                .is_some_and(|parked| parked.branch.as_str() == update.row.branch.as_str())
+        {
+            // A direct write released from the overlay on its `GlobalServer` fate keeps only
+            // its parked exemption, and the arm above no longer sees it. A version of the row
+            // from upstream means the server holds the row, which is all the exemption stood
+            // in for — the same retirement the arm above gives a row still in the overlay.
+            //
+            // It retires on a row VERSION, not on scope evidence: a reader still holding a
+            // scope older than the write loses the row until the server's scope answer
+            // arrives. The arm above has always had the same window. A server sends that
+            // answer when it applies the write's row — no later than the write's fate and
+            // before any later version of the row — whenever the write changes the reader's
+            // scope; when it does not, the older scope already holds the row and there is no
+            // window. So on an ordered link only a lost answer opens it. An edge answers
+            // `edge` readers itself at once, but relays the top tier's answer on its
+            // watermark while it forwards rows at once: behind one, a `GlobalServer`
+            // reader's window lasts until the relay. Same branch only: rows, and scopes, are
+            // per branch.
             self.retire_local_row_tracking(update.object_id);
         }
 
@@ -3256,6 +3339,12 @@ impl QueryManager {
         }
     }
 
+    /// Rows in the source overlay. For gates that must know the overlay was engaged.
+    #[cfg(test)]
+    pub(crate) fn pending_local_row_count(&self) -> usize {
+        self.pending_local_row_batches.len()
+    }
+
     /// For gates: how many pending local row ids live subscriptions hold, and how many
     /// subscriptions hold an id no local batch backs while not flagged for the retain that
     /// drops it. That last number must always be zero.
@@ -3302,7 +3391,9 @@ impl QueryManager {
     /// that is going away entirely must leave all of them together. Splitting the scope
     /// exemption out of `pending_local_row_batches` and forgetting one removal site is
     /// exactly how a stale exemption outlives the write it stood for, which is the defect
-    /// this family was split to fix. Route every removal through here.
+    /// this family was split to fix. Route every removal through here — with one deliberate
+    /// exception: `release_local_overlay_row` ends the overlay role alone when a direct write
+    /// is confirmed at the top tier, after its exemption has been parked.
     ///
     /// Must not run inside the settle loop in `process`: a subscription being settled is
     /// out of `self.subscriptions` there and would miss the flag set below. Debug builds
@@ -3322,6 +3413,27 @@ impl QueryManager {
         }
         self.scope_exempt_local_rows.remove(&id);
         self.confirmed_local_rows_awaiting_scope.remove(&id);
+    }
+
+    /// End a local write's source-overlay role alone, once its direct batch is confirmed at
+    /// the top tier: the row is served from storage at every tier from then on, and the
+    /// scope exemption — parked from the same map just before — retires on its own terms
+    /// (the drain in `process`, or an upstream version of the row in
+    /// `prepare_row_update_with_origin`). Every other removal goes through
+    /// `retire_local_row_tracking`.
+    fn release_local_overlay_row(&mut self, id: ObjectId) {
+        debug_assert!(
+            !self.in_settle_loop,
+            "releasing a local row's overlay inside the settle loop misses the subscription \
+             being settled"
+        );
+        if self.pending_local_row_batches.remove(&id).is_some() {
+            for subscription in self.subscriptions.values_mut() {
+                if subscription.pending_local_row_ids.contains(&id) {
+                    subscription.pending_local_row_ids_may_be_unbacked = true;
+                }
+            }
+        }
     }
 
     pub(crate) fn clear_local_pending_row_overlay(&mut self, table: &str, id: ObjectId) {
@@ -3841,18 +3953,7 @@ impl QueryManager {
         previous_order: &[ObjectId],
         next_rows: &[Row],
     ) -> RowDelta {
-        let next_rows_by_id: HashMap<_, _> =
-            next_rows.iter().cloned().map(|row| (row.id, row)).collect();
-        let previous_indices: HashMap<_, _> = previous_order
-            .iter()
-            .enumerate()
-            .map(|(index, id)| (*id, index))
-            .collect();
-        let next_indices: HashMap<_, _> = next_rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| (row.id, index))
-            .collect();
+        let next_ids: ahash::AHashSet<ObjectId> = next_rows.iter().map(|row| row.id).collect();
 
         let added = next_rows
             .iter()
@@ -3862,7 +3963,7 @@ impl QueryManager {
         let removed = previous_order
             .iter()
             .filter_map(|id| previous_rows.get(id))
-            .filter(|row| !next_rows_by_id.contains_key(&row.id))
+            .filter(|row| !next_ids.contains(&row.id))
             .cloned()
             .collect();
         let updated = next_rows
@@ -3874,20 +3975,39 @@ impl QueryManager {
                 })
             })
             .collect();
-        let moved = next_rows
+        // The same id sequence moves nothing: every row keeps its index.
+        let moved = if previous_order
             .iter()
-            .filter(|row| {
-                previous_rows.contains_key(&row.id)
-                    && previous_rows
-                        .get(&row.id)
-                        .map(|previous| {
-                            previous.data == row.data && previous.batch_id == row.batch_id
-                        })
-                        .unwrap_or(false)
-                    && previous_indices.get(&row.id) != next_indices.get(&row.id)
-            })
-            .map(|row| row.id)
-            .collect();
+            .copied()
+            .eq(next_rows.iter().map(|row| row.id))
+        {
+            Vec::new()
+        } else {
+            let previous_indices: ahash::AHashMap<_, _> = previous_order
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (*id, index))
+                .collect();
+            let next_indices: ahash::AHashMap<_, _> = next_rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| (row.id, index))
+                .collect();
+            next_rows
+                .iter()
+                .filter(|row| {
+                    previous_rows.contains_key(&row.id)
+                        && previous_rows
+                            .get(&row.id)
+                            .map(|previous| {
+                                previous.data == row.data && previous.batch_id == row.batch_id
+                            })
+                            .unwrap_or(false)
+                        && previous_indices.get(&row.id) != next_indices.get(&row.id)
+                })
+                .map(|row| row.id)
+                .collect()
+        };
 
         RowDelta {
             added,
@@ -3937,93 +4057,96 @@ impl QueryManager {
     ///   answer accounts for it. Without this bound the exemption never expired on a node
     ///   whose reads are one-shot, and every row it had ever written stayed frozen in its
     ///   own reads for the process lifetime.
-    fn filter_synced_query_scope_tuples(
+    fn filter_synced_query_scope_tuples<'a>(
         &self,
         query_id: QueryId,
         durability_tier: Option<DurabilityTier>,
         local_writes: LocalWriteAuthority<'_>,
-        tuples: Vec<Tuple>,
-    ) -> Vec<Tuple> {
+        tuples: Cow<'a, [Tuple]>,
+    ) -> Cow<'a, [Tuple]> {
         let authoritative_snapshot_pass = self.authoritative_snapshot_pass.get(&query_id).copied();
-        let remote_scope = match durability_tier {
+        // The union of these is the remote scope; membership in it is membership in one.
+        let remote_scopes: SmallVec<[&HashSet<(ObjectId, BranchName)>; 2]> = match durability_tier {
             Some(tier) => self
                 .sync_manager
-                .remote_query_scope_at_least(query_id, tier),
-            None => self.sync_manager.remote_query_scope(query_id),
+                .remote_query_scope_sets_at_least(query_id, tier)
+                .collect(),
+            None => self
+                .sync_manager
+                .remote_query_scope_sets(query_id)
+                .collect(),
         };
-        tuples
-            .into_iter()
-            .filter(|tuple| {
-                let in_remote_scope = tuple
-                    .provenance()
+        retain_tuples(tuples, |tuple| {
+            let in_remote_scope = tuple.provenance().iter().any(|scoped_object| {
+                remote_scopes
                     .iter()
-                    .any(|scoped_object| remote_scope.contains(scoped_object));
-                if in_remote_scope {
-                    return true;
-                }
-                if local_writes.grants_nothing() {
-                    return false;
-                }
-                if let Some(overlay) = local_writes.overlay
-                    && tuple.provenance().iter().any(|(id, branch)| {
-                        overlay
-                            .get(id)
-                            .is_some_and(|staged| staged.branch_name == *branch)
-                    })
+                    .any(|remote_scope| remote_scope.contains(scoped_object))
+            });
+            if in_remote_scope {
+                return true;
+            }
+            if local_writes.grants_nothing() {
+                return false;
+            }
+            if let Some(overlay) = local_writes.overlay
+                && tuple.provenance().iter().any(|(id, branch)| {
+                    overlay
+                        .get(id)
+                        .is_some_and(|staged| staged.branch_name == *branch)
+                })
+            {
+                return true;
+            }
+            if !local_writes.process_wide {
+                return false;
+            }
+            // The per-subscription `pending_local_row_ids` is deliberately NOT consulted
+            // here. It serves two other roles (the IndexScan overlay and the row-loader
+            // durability downgrade) and is retired on different terms, so as a scope
+            // exemption it outlived the write it stood for. The two maps below are the
+            // single authority for this role:
+            //
+            //   `scope_exempt_local_rows`            — written but not yet durable at the
+            //                                          settlement target; unbounded on
+            //                                          purpose, nothing upstream can know
+            //                                          about it yet. A row staged in an
+            //                                          open transaction stays here until
+            //                                          the batch commits and confirms.
+            //   `confirmed_local_rows_awaiting_scope` — durable, but no scope refresh has
+            //                                          landed since. Held one more round
+            //                                          so the exemption does not drop
+            //                                          before the server's answer can
+            //                                          account for the write.
+            tuple.provenance().iter().any(|(id, branch)| {
+                // Chained, not `or_else`: the two maps are disjoint by construction
+                // (every insert into one removes from the other, and phase one moves an
+                // entry across), but a short-circuit would make a violation of that
+                // invariant silently drop the tuple instead of failing loudly.
+                debug_assert!(
+                    !(self.scope_exempt_local_rows.contains_key(id)
+                        && self.confirmed_local_rows_awaiting_scope.contains_key(id)),
+                    "a local row must be exempt-pending or awaiting-scope, never both"
+                );
+                if self
+                    .scope_exempt_local_rows
+                    .get(id)
+                    .is_some_and(|pending_branch| pending_branch == branch)
                 {
+                    // Written, not yet durable at the settlement target. Unbounded on
+                    // purpose: nothing upstream can know about it.
                     return true;
                 }
-                if !local_writes.process_wide {
-                    return false;
-                }
-                // The per-subscription `pending_local_row_ids` is deliberately NOT consulted
-                // here. It serves two other roles (the IndexScan overlay and the row-loader
-                // durability downgrade) and is retired on different terms, so as a scope
-                // exemption it outlived the write it stood for. The two maps below are the
-                // single authority for this role:
-                //
-                //   `scope_exempt_local_rows`            — written but not yet durable at the
-                //                                          settlement target; unbounded on
-                //                                          purpose, nothing upstream can know
-                //                                          about it yet. A row staged in an
-                //                                          open transaction stays here until
-                //                                          the batch commits and confirms.
-                //   `confirmed_local_rows_awaiting_scope` — durable, but no scope refresh has
-                //                                          landed since. Held one more round
-                //                                          so the exemption does not drop
-                //                                          before the server's answer can
-                //                                          account for the write.
-                tuple.provenance().iter().any(|(id, branch)| {
-                    // Chained, not `or_else`: the two maps are disjoint by construction
-                    // (every insert into one removes from the other, and phase one moves an
-                    // entry across), but a short-circuit would make a violation of that
-                    // invariant silently drop the tuple instead of failing loudly.
-                    debug_assert!(
-                        !(self.scope_exempt_local_rows.contains_key(id)
-                            && self.confirmed_local_rows_awaiting_scope.contains_key(id)),
-                        "a local row must be exempt-pending or awaiting-scope, never both"
-                    );
-                    if self
-                        .scope_exempt_local_rows
-                        .get(id)
-                        .is_some_and(|pending_branch| pending_branch == branch)
-                    {
-                        // Written, not yet durable at the settlement target. Unbounded on
-                        // purpose: nothing upstream can know about it.
-                        return true;
-                    }
-                    self.confirmed_local_rows_awaiting_scope
-                        .get(id)
-                        .is_some_and(|parked| {
-                            parked.branch == *branch
+                self.confirmed_local_rows_awaiting_scope
+                    .get(id)
+                    .is_some_and(|parked| {
+                        parked.branch == *branch
                                 // Durable, and still exempt for THIS reader until an answer
                                 // this reader can trust arrives after the write did.
                                 && authoritative_snapshot_pass
                                     .is_none_or(|pass| pass <= parked.parked_in_pass)
-                        })
-                })
+                    })
             })
-            .collect()
+        })
     }
 
     fn scope_from_tuples(tuples: &[Tuple]) -> HashSet<(ObjectId, BranchName)> {
@@ -4054,17 +4177,28 @@ impl QueryManager {
         settlement
     }
 
-    fn transactional_batch_complete_for_query_scope(
+    /// Whether every batch `tuple` carries is visible to this query: a transactional
+    /// batch only once the query's remote scope lies inside the rows the query holds
+    /// (`all_tuples`). That answer is the same for every batch and tuple of one pass, so
+    /// it is worked out once, and only when a transactional batch asks for it.
+    fn tuple_transaction_visible(
         &mut self,
         storage: &dyn Storage,
-        batch_id: BatchId,
-        local_scope: &HashSet<(ObjectId, BranchName)>,
-        query_scope: &HashSet<(ObjectId, BranchName)>,
+        query_id: QueryId,
+        all_tuples: &[Tuple],
+        tuple: &Tuple,
+        remote_within_local: &mut Option<bool>,
     ) -> bool {
-        let settlement = self.authoritative_batch_fate_cached(storage, batch_id);
-
-        !matches!(settlement, Some(BatchFate::AcceptedTransaction { .. }))
-            || query_scope.is_subset(local_scope)
+        tuple.batch_provenance().iter().copied().all(|batch_id| {
+            let settlement = self.authoritative_batch_fate_cached(storage, batch_id);
+            !matches!(settlement, Some(BatchFate::AcceptedTransaction { .. }))
+                || *remote_within_local.get_or_insert_with(|| {
+                    let local_scope = Self::scope_from_tuples(all_tuples);
+                    let mut query_scope = local_scope.clone();
+                    query_scope.extend(self.sync_manager.remote_query_scope(query_id));
+                    query_scope.is_subset(&local_scope)
+                })
+        })
     }
 
     fn filter_transaction_visible_tuples<'a>(
@@ -4077,42 +4211,30 @@ impl QueryManager {
             return tuples;
         }
 
-        let local_scope = Self::scope_from_tuples(tuples.as_ref());
-        let mut query_scope = local_scope.clone();
-        query_scope.extend(self.sync_manager.remote_query_scope(query_id));
-
-        let mut first_hidden = None;
-
-        for (index, tuple) in tuples.as_ref().iter().enumerate() {
-            let is_visible = tuple.batch_provenance().iter().copied().all(|batch_id| {
-                self.transactional_batch_complete_for_query_scope(
-                    storage,
-                    batch_id,
-                    &local_scope,
-                    &query_scope,
-                )
-            });
-            if !is_visible {
-                first_hidden = Some(index);
-                break;
-            }
-        }
-
-        let Some(first_hidden) = first_hidden else {
+        let mut remote_within_local = None;
+        let all_tuples = tuples.as_ref();
+        let Some(first_hidden) = all_tuples.iter().position(|tuple| {
+            !self.tuple_transaction_visible(
+                storage,
+                query_id,
+                all_tuples,
+                tuple,
+                &mut remote_within_local,
+            )
+        }) else {
             return tuples;
         };
 
-        let mut filtered = Vec::with_capacity(tuples.len().saturating_sub(1));
-        filtered.extend_from_slice(&tuples.as_ref()[..first_hidden]);
-        for tuple in &tuples.as_ref()[first_hidden + 1..] {
-            if tuple.batch_provenance().iter().copied().all(|batch_id| {
-                self.transactional_batch_complete_for_query_scope(
-                    storage,
-                    batch_id,
-                    &local_scope,
-                    &query_scope,
-                )
-            }) {
+        let mut filtered = Vec::with_capacity(all_tuples.len().saturating_sub(1));
+        filtered.extend_from_slice(&all_tuples[..first_hidden]);
+        for tuple in &all_tuples[first_hidden + 1..] {
+            if self.tuple_transaction_visible(
+                storage,
+                query_id,
+                all_tuples,
+                tuple,
+                &mut remote_within_local,
+            ) {
                 filtered.push(tuple.clone());
             }
         }
@@ -4175,4 +4297,263 @@ fn subscription_group_key(query: &str, branches: &[String], propagation: &str) -
         hasher.update([0]);
     }
     hex::encode(hasher.finalize())
+}
+
+/// `tuples` without those `keep` rejects, each asked once, in order: borrowed as long as
+/// nothing is rejected, and an owned list filtered in place.
+fn retain_tuples<'a>(
+    tuples: Cow<'a, [Tuple]>,
+    mut keep: impl FnMut(&Tuple) -> bool,
+) -> Cow<'a, [Tuple]> {
+    match tuples {
+        Cow::Owned(mut owned) => {
+            owned.retain(|tuple| keep(tuple));
+            Cow::Owned(owned)
+        }
+        Cow::Borrowed(borrowed) => {
+            let Some(first_dropped) = borrowed.iter().position(|tuple| !keep(tuple)) else {
+                return Cow::Borrowed(borrowed);
+            };
+            let mut kept = Vec::with_capacity(borrowed.len() - 1);
+            kept.extend_from_slice(&borrowed[..first_dropped]);
+            kept.extend(
+                borrowed[first_dropped + 1..]
+                    .iter()
+                    .filter(|tuple| keep(tuple))
+                    .cloned(),
+            );
+            Cow::Owned(kept)
+        }
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    //! Both helpers below replaced a version that always copied or always built maps. Each is
+    //! checked against that version on random inputs, including the inputs the shortcuts take.
+
+    use super::*;
+    use crate::metadata::RowProvenance;
+
+    /// xorshift64* — deterministic, dependency-free.
+    struct Prng(u64);
+
+    impl Prng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+
+        fn shuffle<T>(&mut self, items: &mut [T]) {
+            for index in (1..items.len()).rev() {
+                items.swap(index, self.below(index + 1));
+            }
+        }
+    }
+
+    #[test]
+    fn retained_tuples_match_a_plain_filter_and_ask_each_tuple_once() {
+        let mut rng = Prng(0x5eed_d4);
+        let (mut borrowed_kept_whole, mut borrowed_dropped, mut owned_dropped) = (0, 0, 0);
+        for _ in 0..2000 {
+            let tuples: Vec<Tuple> = (0..rng.below(7))
+                .map(|_| Tuple::from_id(ObjectId::new()))
+                .collect();
+            let ids: Vec<ObjectId> = tuples.iter().filter_map(Tuple::first_id).collect();
+            // Every third case keeps everything, so the borrowed shortcut is taken often.
+            let keep_all = rng.below(3) == 0;
+            let rejected: HashSet<ObjectId> = ids
+                .iter()
+                .copied()
+                .filter(|_| !keep_all && rng.below(2) == 0)
+                .collect();
+            let expected: Vec<ObjectId> = ids
+                .iter()
+                .copied()
+                .filter(|id| !rejected.contains(id))
+                .collect();
+
+            for owned in [false, true] {
+                let input = if owned {
+                    Cow::Owned(tuples.clone())
+                } else {
+                    Cow::Borrowed(tuples.as_slice())
+                };
+                let mut asked = Vec::new();
+                let kept = retain_tuples(input, |tuple| {
+                    let id = tuple.first_id().expect("one id per tuple");
+                    asked.push(id);
+                    !rejected.contains(&id)
+                });
+                let kept_ids: Vec<ObjectId> = kept.iter().filter_map(Tuple::first_id).collect();
+                assert_eq!(kept_ids, expected, "owned={owned}: kept tuples");
+                assert_eq!(asked, ids, "owned={owned}: each tuple asked once, in order");
+                match (owned, &kept) {
+                    (false, Cow::Borrowed(_)) => {
+                        assert!(
+                            rejected.is_empty(),
+                            "a rejected tuple left the list borrowed"
+                        );
+                        borrowed_kept_whole += 1;
+                    }
+                    (false, Cow::Owned(_)) => {
+                        assert!(
+                            !rejected.is_empty(),
+                            "nothing rejected, yet the list was copied"
+                        );
+                        borrowed_dropped += 1;
+                    }
+                    (true, Cow::Owned(_)) => owned_dropped += usize::from(!rejected.is_empty()),
+                    (true, Cow::Borrowed(_)) => panic!("an owned list came back borrowed"),
+                }
+            }
+        }
+        assert!(borrowed_kept_whole > 0 && borrowed_dropped > 0 && owned_dropped > 0);
+    }
+
+    /// `row_delta_from_rows` as it was before the unchanged-order shortcut: the move map is
+    /// built on every call.
+    fn row_delta_reference(
+        previous_rows: &HashMap<ObjectId, Row>,
+        previous_order: &[ObjectId],
+        next_rows: &[Row],
+    ) -> RowDelta {
+        let next_rows_by_id: HashMap<_, _> =
+            next_rows.iter().cloned().map(|row| (row.id, row)).collect();
+        let previous_indices: HashMap<_, _> = previous_order
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect();
+        let next_indices: HashMap<_, _> = next_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.id, index))
+            .collect();
+        let unchanged = |row: &Row| {
+            previous_rows.get(&row.id).is_some_and(|previous| {
+                previous.data == row.data && previous.batch_id == row.batch_id
+            })
+        };
+        RowDelta {
+            added: next_rows
+                .iter()
+                .filter(|row| !previous_rows.contains_key(&row.id))
+                .cloned()
+                .collect(),
+            removed: previous_order
+                .iter()
+                .filter_map(|id| previous_rows.get(id))
+                .filter(|row| !next_rows_by_id.contains_key(&row.id))
+                .cloned()
+                .collect(),
+            moved: next_rows
+                .iter()
+                .filter(|row| {
+                    unchanged(row) && previous_indices.get(&row.id) != next_indices.get(&row.id)
+                })
+                .map(|row| row.id)
+                .collect(),
+            updated: next_rows
+                .iter()
+                .filter_map(|row| {
+                    previous_rows.get(&row.id).and_then(|previous| {
+                        (previous.data != row.data || previous.batch_id != row.batch_id)
+                            .then(|| (previous.clone(), row.clone()))
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn row_deltas_match_the_reference_with_and_without_a_reorder() {
+        let mut rng = Prng(0x5eed_d6);
+        let ids: Vec<ObjectId> = (0..6).map(|_| ObjectId::new()).collect();
+        let batches = [BatchId::new(), BatchId::new()];
+        let provenance = RowProvenance::for_insert("author", 1);
+        let row = |id: ObjectId, data: u8, batch: usize| {
+            Row::new(id, vec![data], batches[batch], provenance.clone())
+        };
+        let (mut same_order, mut pure_moves) = (0, 0);
+        for _ in 0..4000 {
+            let mut previous_order: Vec<ObjectId> =
+                ids.iter().copied().filter(|_| rng.below(4) != 0).collect();
+            rng.shuffle(&mut previous_order);
+            let previous_rows: HashMap<ObjectId, Row> = previous_order
+                .iter()
+                .map(|id| (*id, row(*id, rng.below(2) as u8, rng.below(2))))
+                .collect();
+            // States the engine should never hold, which both versions must still agree on:
+            // an ordered id with no row behind it.
+            if rng.below(8) == 0 {
+                let at = rng.below(previous_order.len() + 1);
+                previous_order.insert(at, ObjectId::new());
+            }
+
+            let mut next_rows: Vec<Row> = match rng.below(3) {
+                // The same rows in the same order, some of them rewritten.
+                0 => previous_order
+                    .iter()
+                    .filter_map(|id| previous_rows.get(id))
+                    .map(|before| {
+                        if rng.below(3) == 0 {
+                            row(before.id, before.data.as_ref()[0] ^ 1, rng.below(2))
+                        } else {
+                            before.clone()
+                        }
+                    })
+                    .collect(),
+                // The same rows, unchanged, reordered.
+                1 => {
+                    let mut order = previous_order.clone();
+                    rng.shuffle(&mut order);
+                    order
+                        .iter()
+                        .filter_map(|id| previous_rows.get(id))
+                        .cloned()
+                        .collect()
+                }
+                // Anything: rows come and go, change and move.
+                _ => {
+                    let mut order: Vec<ObjectId> =
+                        ids.iter().copied().filter(|_| rng.below(3) != 0).collect();
+                    rng.shuffle(&mut order);
+                    order
+                        .iter()
+                        .map(|id| match previous_rows.get(id) {
+                            Some(before) if rng.below(2) == 0 => before.clone(),
+                            _ => row(*id, rng.below(2) as u8, rng.below(2)),
+                        })
+                        .collect()
+                }
+            };
+            // ... and the same id twice in the next rows.
+            if !next_rows.is_empty() && rng.below(8) == 0 {
+                let twin = next_rows[rng.below(next_rows.len())].clone();
+                next_rows.insert(rng.below(next_rows.len() + 1), twin);
+            }
+
+            let delta =
+                QueryManager::row_delta_from_rows(&previous_rows, &previous_order, &next_rows);
+            let expected = row_delta_reference(&previous_rows, &previous_order, &next_rows);
+            assert_eq!(delta.added, expected.added, "added");
+            assert_eq!(delta.removed, expected.removed, "removed");
+            assert_eq!(delta.updated, expected.updated, "updated");
+            assert_eq!(delta.moved, expected.moved, "moved");
+
+            let next_order: Vec<ObjectId> = next_rows.iter().map(|row| row.id).collect();
+            same_order += usize::from(next_order == previous_order);
+            pure_moves += usize::from(!expected.moved.is_empty());
+        }
+        assert!(same_order > 0 && pure_moves > 0);
+    }
 }

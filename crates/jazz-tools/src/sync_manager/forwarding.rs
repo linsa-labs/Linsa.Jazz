@@ -178,11 +178,17 @@ impl SyncManager {
             .flatten()
     }
 
-    pub(super) fn queue_batch_fate_to_client(&mut self, client_id: ClientId, fate: BatchFate) {
+    /// Queue `fate` to the client in the form it may see; false when it may see none of it.
+    pub(super) fn queue_batch_fate_to_client(
+        &mut self,
+        client_id: ClientId,
+        fate: BatchFate,
+    ) -> bool {
         let Some(fate) = self.batch_fate_for_client(client_id, &fate) else {
-            return;
+            return false;
         };
         self.queue_batch_fate_to_client_unfiltered(client_id, fate);
+        true
     }
 
     pub(super) fn queue_batch_fate_to_client_unfiltered(
@@ -190,6 +196,13 @@ impl SyncManager {
         client_id: ClientId,
         fate: BatchFate,
     ) {
+        // What the client was sent when the batch entered its scope is not what the prune
+        // would read any more: let the prune read the fate again.
+        if let Some(client) = self.clients.get_mut(&client_id)
+            && !client.settled_fates_sent.is_empty()
+        {
+            client.settled_fates_sent.remove(&fate.batch_id());
+        }
         self.outbox.push(OutboxEntry {
             destination: Destination::Client(client_id),
             payload: SyncPayload::BatchFate { fate },

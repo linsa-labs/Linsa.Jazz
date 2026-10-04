@@ -2526,9 +2526,9 @@ mod tests {
             "dev/main",
             "v2",
             crate::metadata::RowProvenance {
-                created_by: "alice".to_string(),
+                created_by: "alice".to_string().into(),
                 created_at: 10,
-                updated_by: "alice".to_string(),
+                updated_by: "alice".to_string().into(),
                 updated_at: 20,
             },
             RowState::VisibleDirect,
@@ -3954,9 +3954,9 @@ mod tests {
                     RowProvenance::for_insert("alice".to_string(), updated_at)
                 } else {
                     RowProvenance {
-                        created_by: "alice".to_string(),
+                        created_by: "alice".to_string().into(),
                         created_at: 10,
-                        updated_by: "alice".to_string(),
+                        updated_by: "alice".to_string().into(),
                         updated_at,
                     }
                 },

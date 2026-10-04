@@ -12,8 +12,9 @@
 //! - after every pass, a key whose last word is a withdrawal is not registered;
 //! - on every drain, the hub never withdraws a query id upstream that it has not subscribed there;
 //! - at every checkpoint, once the outbox is drained, nothing is left in the queue, the registered
-//!   keys are exactly those whose last word is a subscription, each with that word's shape, and a
-//!   query id is subscribed upstream exactly when its key is registered.
+//!   keys are exactly those whose last word is a subscription, each with that word's shape, a
+//!   query id is subscribed upstream exactly when its key is registered, and the hub holds a scope
+//!   for a client's query exactly when its key is registered.
 //!
 //! One client subscribes local-only under the same query ids as another, so a withdrawal that
 //! matched a queued subscription by query id alone would take the other client's. Its
@@ -276,6 +277,19 @@ impl Run {
                 assert_eq!(
                     registered, expected,
                     "seed {} step {step}: client {client} query {id} once the queue emptied",
+                    self.seed
+                );
+                // The rows a client is sent and kept up to date with are the scopes the hub
+                // holds for it, so a withdrawn key must take its scope along.
+                let holds_scope = self
+                    .hub
+                    .sync_manager()
+                    .get_client(key.0)
+                    .is_some_and(|state| state.queries.contains_key(&key.1));
+                assert_eq!(
+                    holds_scope,
+                    expected.is_some(),
+                    "seed {} step {step}: the hub's scope for client {client} query {id}",
                     self.seed
                 );
                 if client == LOCAL_ONLY_CLIENT {

@@ -476,6 +476,7 @@ mod policied_row_repeat_submissions;
 mod pre_write_row_from_tips;
 mod query_scope;
 mod round2_cross_generation_review;
+mod scope_withdrawal;
 mod server_origin_seal;
 mod server_sync;
 mod settlements;

@@ -761,9 +761,9 @@ impl SeedRun {
         let provenance = match &row.created {
             None => RowProvenance::for_insert(author.to_string(), ts),
             Some((created_by, created_at)) => RowProvenance {
-                created_by: created_by.clone(),
+                created_by: created_by.clone().into(),
                 created_at: *created_at,
-                updated_by: author.to_string(),
+                updated_by: author.to_string().into(),
                 updated_at: ts,
             },
         };

@@ -645,9 +645,9 @@ fn add_row_commit(
         RowProvenance::for_insert(author.clone(), timestamp)
     } else {
         RowProvenance {
-            created_by: author.clone(),
+            created_by: author.clone().into(),
             created_at: 1_000,
-            updated_by: author.clone(),
+            updated_by: author.clone().into(),
             updated_at: timestamp,
         }
     };
@@ -1368,12 +1368,14 @@ mod deletes;
 mod delivery_confirmation_differential;
 mod e2e_sync;
 mod empty_binding_fills;
+mod forward_ref_routing;
 mod include_routing_liveness;
 mod joins;
 mod json_storage;
 mod kept_verdicts;
 mod local_write_exemption;
 mod misc;
+mod ordered_in_place;
 mod policies;
 mod recursive_queries;
 mod server_subscription_withdrawal_differential;

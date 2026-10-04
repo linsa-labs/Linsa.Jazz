@@ -912,9 +912,9 @@ pub fn evaluate_expr_recursive_with_row_id(
 
 fn provenance_value(kind: MagicColumnKind, provenance: &RowProvenance) -> Value {
     match kind {
-        MagicColumnKind::CreatedBy => Value::Text(provenance.created_by.clone()),
+        MagicColumnKind::CreatedBy => Value::Text(provenance.created_by.to_string()),
         MagicColumnKind::CreatedAt => Value::Timestamp(provenance.created_at),
-        MagicColumnKind::UpdatedBy => Value::Text(provenance.updated_by.clone()),
+        MagicColumnKind::UpdatedBy => Value::Text(provenance.updated_by.to_string()),
         MagicColumnKind::UpdatedAt => Value::Timestamp(provenance.updated_at),
         MagicColumnKind::CanRead | MagicColumnKind::CanEdit | MagicColumnKind::CanDelete => {
             Value::Null

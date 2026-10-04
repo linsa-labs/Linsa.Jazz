@@ -174,7 +174,10 @@ fn tuple_as_id_only(tuple: &Tuple) -> Tuple {
 }
 
 /// Check if tuple content or provenance changed (for tuples with same IDs).
-fn has_tuple_content_changed(old: &Tuple, new: &Tuple) -> bool {
+///
+/// The rows' own provenance (`RowProvenance`) is not compared: it changes only with
+/// the row's batch, which is.
+pub(crate) fn has_tuple_content_changed(old: &Tuple, new: &Tuple) -> bool {
     if old.provenance() != new.provenance() || old.batch_provenance() != new.batch_provenance() {
         return true;
     }

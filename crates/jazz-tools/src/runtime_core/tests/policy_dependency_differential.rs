@@ -35,11 +35,10 @@
 //! applied it — and the row comes back on both nodes. That defect predates this oracle and is
 //! tracked on its own; deletes here only target rows whose last write has already gone up.
 //!
-//! And one blind spot is deliberate. A query the client withdraws keeps its scope on the server:
-//! `process_pending_query_unsubscriptions` removes the server subscription but never calls
-//! `drop_client_query_subscription`, so the scope of every fresh subscription a check opens and
-//! closes stays behind, frozen. The server-scope property therefore looks only at the queries of
-//! live subscriptions. That defect predates this oracle too and is tracked on its own.
+//! The server-scope property looks at every query the server holds for the client, withdrawn ones
+//! included: a withdrawal drops the query's scope when the server's pass runs it, so the scope of
+//! every fresh subscription a check opens and closes must not stay behind. (It used to: the
+//! property once looked only at the queries of live subscriptions to step around that.)
 //!
 //! Backend: `SqliteStorage` on both nodes, as on the phone.
 
@@ -49,7 +48,6 @@ use crate::query_manager::relation_ir::{
     ColumnRef, PredicateCmpOp, PredicateExpr, RelExpr, RowIdRef, ValueRef,
 };
 use crate::storage::SqliteStorage;
-use crate::sync_manager::QueryId;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 type Node = RuntimeCore<SqliteStorage, NoopScheduler>;
@@ -338,13 +336,8 @@ fn subscribe(
     subscribed.expect("a session may subscribe to teams")
 }
 
-/// Whether any of `queries` holds `row` in the scope the server keeps for the client.
-fn in_live_server_scope(
-    server: &Node,
-    client_id: ClientId,
-    queries: &[QueryId],
-    row: ObjectId,
-) -> bool {
+/// Whether any query the server keeps for the client holds `row` in its scope.
+fn in_server_scope(server: &Node, client_id: ClientId, row: ObjectId) -> bool {
     let branch = server.schema_manager().branch_name();
     server
         .schema_manager()
@@ -352,12 +345,10 @@ fn in_live_server_scope(
         .sync_manager()
         .get_client(client_id)
         .is_some_and(|client| {
-            queries.iter().any(|query_id| {
-                client
-                    .queries
-                    .get(query_id)
-                    .is_some_and(|query| query.scope.contains(&(row, branch)))
-            })
+            client
+                .queries
+                .values()
+                .any(|query| query.scope.contains(&(row, branch)))
         })
 }
 
@@ -581,17 +572,12 @@ fn check(
         context()
     );
 
-    // The server keeps a scope per query. Over alice's live synced subscriptions — all teams and
-    // the red ones — their union is everything alice sees. Queries withdrawn earlier are left
-    // out on purpose; see the module note.
+    // The server keeps a scope per query. Over every query it holds for alice — her live synced
+    // subscriptions, all teams and the red ones, and nothing she withdrew — their union is
+    // everything alice sees.
     let alice_visible = model.visible("alice", None);
-    let live_queries: Vec<QueryId> = watches
-        .iter()
-        .filter(|watch| watch.synced)
-        .map(|watch| QueryId(watch.sub.0))
-        .collect();
     for (team, _) in &model.teams {
-        let in_scope = in_live_server_scope(&link.server, link.client_id, &live_queries, *team);
+        let in_scope = in_server_scope(&link.server, link.client_id, *team);
         if !model_alone && in_scope != alice_visible.contains(team) {
             report_scope_mismatch(link, model, watches, *team, in_scope, log, context());
         }

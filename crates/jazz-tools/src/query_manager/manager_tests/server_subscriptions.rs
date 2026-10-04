@@ -1786,6 +1786,71 @@ fn a_resubscription_after_the_unsubscription_in_the_same_pass_stays_registered()
     );
 }
 
+/// The query that is withdrawn and asked again inside one pass keeps its client as an origin,
+/// so what an upstream server settles for it still reaches the client. The withdrawal drops
+/// the client's scope for the query when the pass runs, after the new subscription arrived:
+/// were it to drop the origin with it, the registered subscription would be cut off from
+/// every settlement relayed from above.
+#[test]
+fn a_resubscription_in_the_same_pass_is_still_told_what_upstream_settled() {
+    use crate::object::{BranchName, ObjectId};
+    use crate::sync_manager::{ClientId, Destination, QueryId};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let upstream = ServerId::new();
+    connect_query_manager_upstream(&mut server_qm, &storage, upstream);
+    let query = server_qm.query("users").build();
+
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    push_subscription(&mut server_qm, client_id, QueryId(1), &query);
+    server_qm.process(&mut storage);
+    assert_eq!(
+        live_server_subscriptions(&server_qm),
+        1,
+        "fixture: registered again"
+    );
+    assert!(
+        server_qm
+            .sync_manager()
+            .query_origin_contains(QueryId(1), client_id),
+        "the withdrawal took the client off the query it asked again in the same pass"
+    );
+    server_qm.sync_manager_mut().take_outbox();
+
+    let upstream_row = (ObjectId::new(), BranchName::new("main"));
+    server_qm.sync_manager_mut().push_inbox(InboxEntry {
+        source: Source::Server(upstream),
+        payload: SyncPayload::QuerySettled {
+            query_id: QueryId(1),
+            tier: DurabilityTier::GlobalServer,
+            scope: vec![upstream_row],
+            through_seq: 0,
+        },
+    });
+    server_qm.process(&mut storage);
+
+    let relayed = server_qm
+        .sync_manager_mut()
+        .take_outbox()
+        .into_iter()
+        .any(|entry| {
+            entry.destination == Destination::Client(client_id)
+                && matches!(
+                    &entry.payload,
+                    SyncPayload::QuerySettled { query_id: QueryId(1), scope, .. }
+                        if scope.contains(&upstream_row)
+                )
+        });
+    assert!(
+        relayed,
+        "the settlement upstream sent for the query never reached the client that asked it"
+    );
+}
+
 /// Subscribe, withdraw and subscribe again inside one pass: the last word is a subscription.
 /// Green on the stock core as well; it would go red if the cancel ran when the pass does.
 #[test]
@@ -3348,4 +3413,89 @@ fn windowed_page_scope_matches_the_model_under_random_writes() {
             confirm_delivered(&mut server_qm, &outbox);
         }
     }
+}
+
+/// A withdrawn subscription stops keeping its rows up to date for the client. A row only it
+/// held is not forwarded on a later write, and the hub stops holding it in the client's scope;
+/// a row another live subscription of the client holds still is forwarded.
+#[test]
+fn a_withdrawn_subscription_no_longer_forwards_its_rows() {
+    use crate::sync_manager::{ClientId, Destination, QueryId, SyncPayload};
+
+    let (mut server_qm, mut storage) = create_query_manager(SyncManager::new(), test_schema());
+    let client_id = ClientId::new();
+    connect_client(&mut server_qm, &storage, client_id);
+    let low = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("low".into()), Value::Integer(10)],
+        )
+        .unwrap();
+    let high = server_qm
+        .insert(
+            &mut storage,
+            "users",
+            &[Value::Text("high".into()), Value::Integer(90)],
+        )
+        .unwrap();
+    let all = server_qm.query("users").build();
+    let high_only = server_qm
+        .query("users")
+        .filter_gt("score", Value::Integer(50))
+        .build();
+    push_subscription(&mut server_qm, client_id, QueryId(1), &all);
+    push_subscription(&mut server_qm, client_id, QueryId(2), &high_only);
+    server_qm.process(&mut storage);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    push_unsubscription(&mut server_qm, client_id, QueryId(1));
+    server_qm.process(&mut storage);
+    let _ = server_qm.sync_manager_mut().take_outbox();
+
+    let branch = crate::object::BranchName::new(get_branch(&server_qm));
+    let state = server_qm.sync_manager().get_client(client_id).unwrap();
+    assert!(
+        !state.is_in_scope(low.row_id, &branch),
+        "only the withdrawn subscription held the row"
+    );
+    assert!(
+        state.is_in_scope(high.row_id, &branch),
+        "a live subscription still holds the row"
+    );
+
+    server_qm
+        .update(
+            &mut storage,
+            low.row_id,
+            &[Value::Text("low, edited".into()), Value::Integer(20)],
+        )
+        .unwrap();
+    server_qm
+        .update(
+            &mut storage,
+            high.row_id,
+            &[Value::Text("high, edited".into()), Value::Integer(95)],
+        )
+        .unwrap();
+    server_qm.process(&mut storage);
+
+    let forwarded: Vec<ObjectId> = server_qm
+        .sync_manager_mut()
+        .take_outbox()
+        .into_iter()
+        .filter(|entry| entry.destination == Destination::Client(client_id))
+        .filter_map(|entry| match entry.payload {
+            SyncPayload::RowBatchNeeded { row, .. } => Some(row.row_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !forwarded.contains(&low.row_id),
+        "the edit of a row only the withdrawn subscription held was forwarded"
+    );
+    assert!(
+        forwarded.contains(&high.row_id),
+        "the edit of a row a live subscription holds was not forwarded"
+    );
 }

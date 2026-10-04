@@ -252,6 +252,7 @@ impl ArraySubqueryNode {
                 scratch: Vec::new(),
                 probe: EmptyProbe::Unknown,
                 empty: AHashMap::new(),
+                evicted_held: AHashMap::new(),
             }),
         }
     }
@@ -266,6 +267,7 @@ impl ArraySubqueryNode {
             .subgraph_cache
             .keys()
             .chain(self.dirt.empty.keys())
+            .chain(self.dirt.evicted_held.keys())
             .filter(|(id, _)| *id == outer_id)
             .copied()
             .collect();
@@ -288,7 +290,15 @@ impl ArraySubqueryNode {
             .min_by_key(|(_, cached)| cached.last_used)
             .map(|(key, _)| *key)
         {
+            let held = self
+                .subgraph_cache
+                .get(&victim)
+                .map(|cached| cached.held_rows.clone())
+                .unwrap_or_default();
             self.drop_cached_subgraph(&victim);
+            if !held.is_empty() {
+                self.dirt.evicted_held.insert(victim, held);
+            }
         }
     }
 
@@ -300,6 +310,7 @@ impl ArraySubqueryNode {
     /// never `subgraph_state_clean` — `reevaluate_all` re-instantiates it from
     /// a fresh, all-dirty compile.
     fn drop_cached_subgraph(&mut self, key: &CacheKey) {
+        self.dirt.evicted_held.remove(key);
         if let Some(cached) = self.subgraph_cache.remove(key) {
             self.dirt
                 .routing
@@ -750,6 +761,30 @@ impl ArraySubqueryNode {
     /// reads it here instead of walking the instance graphs a second time.
     pub(crate) fn extend_routed_row_ids(&self, out: &mut Vec<ObjectId>) {
         self.dirt.routing.extend_tracked_row_ids(out);
+        out.extend(self.dirt.evicted_held.values().flatten().copied());
+        // A forward reference's bindings are the ids it probes. Every outer row
+        // this node holds names one, found or not, so an enclosing include
+        // routes an insert of that id to the instance waiting for it. Read off
+        // `instances`, which holds every outer row: the bindings are capped and
+        // evicted. Only UUID values are exported, and that is coupled to
+        // `include_routing::nested_link`: a forward reference through any other
+        // column type (a Text column holding an id) is `Unroutable` there, so an
+        // enclosing include broadcasts instead of relying on this export. Widen
+        // both together or neither.
+        if self.dirt.routing.correlates_by_row_id() {
+            for state in self.instances.values() {
+                match &state.correlation_value {
+                    Value::Uuid(id) => out.push(*id),
+                    Value::Array(elements) => {
+                        out.extend(elements.iter().filter_map(|element| match element {
+                            Value::Uuid(id) => Some(*id),
+                            _ => None,
+                        }))
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Check if the inner table changed (need to reevaluate all instances).
@@ -757,7 +792,15 @@ impl ArraySubqueryNode {
         self.inner_dirty
     }
 
+    /// An inner-table change or routed inner dirt waiting for the next run.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.inner_dirty || !self.dirt.pending.is_empty()
+    }
+
     /// Process outer deltas with access to Storage and object manager for subgraph settling.
+    ///
+    /// `input.moved` is not read, as before include routing: a reorder of the
+    /// outer input that changes no membership or content produces nothing here.
     pub fn process_with_context<F>(
         &mut self,
         input: TupleDelta,
@@ -1045,6 +1088,8 @@ impl ArraySubqueryNode {
         crate::query_manager::settle_cost::bump(
             &crate::query_manager::settle_cost::SUBQUERY_INSTANCE_EVALS,
         );
+        #[cfg(test)]
+        super::include_routing::note_instance_eval();
 
         // A NULL correlation value can never match: the include's answer is the
         // empty array, and there is no query to run. Short-circuiting here is
@@ -1891,6 +1936,45 @@ mod tests {
         assert!(!node.subgraph_cache.contains_key(&(oldest, 0)));
         assert!(node.subgraph_cache.contains_key(&(newer, 0)));
         assert!(node.subgraph_cache.contains_key(&(newest, 0)));
+    }
+
+    /// An instance evicted at the ceiling leaves the rows it held behind for routing: an
+    /// enclosing include still routes a change to one of them to the outer row that lost its
+    /// instance, which then rebuilds it. Forgetting that outer row forgets them too.
+    #[test]
+    fn an_evicted_instance_routes_its_held_rows_until_its_outer_row_is_forgotten() {
+        let mut node = cache_test_node();
+        let victim = (ObjectId::new(), 0);
+        let held = ObjectId::new();
+        seed_cache_entry(&mut node, victim, 1);
+        node.subgraph_cache
+            .get_mut(&victim)
+            .expect("seeded")
+            .held_rows = vec![held];
+        node.dirt.routing.set_held(victim, &[], &[held]);
+        while node.subgraph_cache.len() < MAX_CACHED_SUBGRAPHS {
+            seed_cache_entry(&mut node, (ObjectId::new(), 0), 100);
+        }
+
+        node.evict_subgraphs_over_capacity(&(ObjectId::new(), 0));
+        assert!(
+            !node.subgraph_cache.contains_key(&victim),
+            "fixture precondition: the least recently used instance was evicted"
+        );
+        let mut routed = Vec::new();
+        node.extend_routed_row_ids(&mut routed);
+        assert!(
+            routed.contains(&held),
+            "a row only the evicted instance held must still route to its outer row"
+        );
+
+        node.forget_cached_subgraphs(victim.0);
+        let mut routed = Vec::new();
+        node.extend_routed_row_ids(&mut routed);
+        assert!(
+            !routed.contains(&held),
+            "forgetting the outer row must forget what its evicted instance held"
+        );
     }
 
     #[test]

@@ -1053,8 +1053,10 @@ impl IndexScanNode {
                 continue;
             }
             // The overlay is `QueryManager::pending_local_row_batches`, which is global: it
-            // holds every locally written row of every table until a non-local update
-            // confirms it. The load below resolves by row id and ignores the table name it
+            // holds every locally written row of every table until it is rejected, a
+            // non-local version of it from another batch (or confirmed at `GlobalServer`)
+            // retires it, or, for a direct write, its `DurableDirect` fate at `GlobalServer`
+            // releases it. The load below resolves by row id and ignores the table name it
             // is handed, so without this check a scan over one table reads the full bytes
             // of rows belonging to another — and, where the condition happens to match,
             // admits them into this index's id set. Measured on a device store, an upload

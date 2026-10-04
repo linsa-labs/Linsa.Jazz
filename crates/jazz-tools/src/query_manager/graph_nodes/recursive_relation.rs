@@ -105,6 +105,11 @@ impl RecursiveRelationNode {
         self.inner_dirty
     }
 
+    /// A recursive-step dependency change waiting for the next run.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.inner_dirty
+    }
+
     /// Process seed tuple deltas with query context.
     pub(crate) fn process_with_context<F>(
         &mut self,

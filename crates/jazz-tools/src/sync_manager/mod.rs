@@ -109,6 +109,38 @@ pub const MISSING_ANSWER_GIVE_UP_AFTER_MICROS: u64 = REDELIVERY_GIVE_UP_AFTER_MI
 /// further. A peer that cycles fresh ids to dodge the budget hits both.
 pub(super) const MAX_TRACKED_MISSING_ANSWERS: usize = 1024;
 
+/// How many batches a client is kept on, per client, only because rows of theirs left the
+/// client's scope before the batch's fate settled (`prune_client_scope_tracking`).
+///
+/// The window that rule exists for is short: a direct row is forwarded as soon as it is
+/// applied, and its seal settles the batch moments later. But a batch whose fate never comes
+/// — a legacy row stored with none, a seal that can never complete — would hold its entry for
+/// as long as the client stays connected, and every scope exit can add one. Past the cap the
+/// oldest entry goes: the batches still waiting on a seal in flight are the newest.
+pub(super) const MAX_PRUNED_FATE_INTEREST: usize = 1024;
+
+/// How many settled fates a client's [`ClientState::settled_fates_sent`] holds before it is
+/// dropped whole. An entry leaves when the scope prune walks its batch (every batch a row in
+/// scope was delivered or is offered at), when a later fate for the batch is sent, when a newer
+/// version replaces an unconfirmed offer of it, and when a newer version takes it off the
+/// delivered frontier through its parents. The cap is a backstop for an exit none of those
+/// mirror. A dense search's scope is about a thousand batches.
+pub(super) const MAX_SETTLED_FATES_SENT: usize = 8192;
+
+/// The batches the scope prune holds one client on, in the order it registered them.
+///
+/// A registration can end before it reaches the front: the fate settles and the interest is
+/// retired, or the client asks about the batch itself. And the prune can register the same
+/// batch again later. So each registration carries its own number, and `live` keeps the number
+/// of the one that still counts: a queue entry whose number is not there any more is stale,
+/// and evicting it takes nothing.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PrunedFateInterest {
+    order: VecDeque<(BatchId, u64)>,
+    live: HashMap<BatchId, u64>,
+    next: u64,
+}
+
 /// How many recoverably-failed row batches are kept parked per `(row, branch)`.
 ///
 /// A parked batch is one whose apply failed for a reason a later arrival can cure — a
@@ -315,6 +347,10 @@ pub struct SyncManager {
     /// Tracks clients that explicitly requested the current or next known fate
     /// for a batch whose row member state may not be present on this peer.
     pub(super) batch_fate_interest: HashMap<BatchId, HashSet<ClientId>>,
+    /// The batches `batch_fate_interest` holds a client on because the scope prune put it
+    /// there, oldest first, at most [`MAX_PRUNED_FATE_INTEREST`] per client. An entry whose
+    /// registration has since ended is left to age out.
+    pub(super) pruned_fate_interest: HashMap<ClientId, PrunedFateInterest>,
 
     /// Tracks which clients originated each query (for relaying QuerySettled).
     pub(super) query_origin: HashMap<QueryId, HashSet<ClientId>>,
@@ -492,6 +528,7 @@ impl SyncManager {
             sealed_batch_sweep_primed: false,
             row_batch_interest: RowBatchInterest::default(),
             batch_fate_interest: HashMap::new(),
+            pruned_fate_interest: HashMap::new(),
             query_origin: HashMap::new(),
             remote_query_scopes: HashMap::new(),
             remote_query_scope_tiers: HashMap::new(),
@@ -597,6 +634,16 @@ impl SyncManager {
         }
     }
 
+    /// The highest settlement target `fate` is terminal at: every target for a rejection, its
+    /// confirmed tier for an accepted batch, none for `Missing`.
+    pub(super) fn fate_settles_up_to(fate: &BatchFate) -> Option<DurabilityTier> {
+        match fate {
+            BatchFate::Rejected { .. } => Some(DurabilityTier::GlobalServer),
+            BatchFate::Missing { .. } => None,
+            fate => fate.confirmed_tier(),
+        }
+    }
+
     /// True when `fate` is terminal at `target`: rejected outright, or
     /// confirmed at/above it. `Missing` is neither — it pends retransmission,
     /// not retirement.
@@ -667,6 +714,8 @@ impl SyncManager {
             connections += std::mem::size_of_val(state);
             connections += 48;
             connections += state.sent_metadata.len() * std::mem::size_of::<ObjectId>();
+            connections += state.settled_fates_sent.len()
+                * (std::mem::size_of::<BatchId>() + std::mem::size_of::<DurabilityTier>());
             if let Some(session) = &state.session {
                 connections += session.user_id.len();
             }
@@ -697,6 +746,12 @@ impl SyncManager {
             subscriptions += std::mem::size_of_val(batch_id);
             subscriptions += clients.len() * std::mem::size_of::<ClientId>();
             subscriptions += 48;
+        }
+        for interest in self.pruned_fate_interest.values() {
+            subscriptions += std::mem::size_of::<ClientId>();
+            subscriptions += interest.order.capacity() * std::mem::size_of::<(BatchId, u64)>();
+            subscriptions += interest.live.len() * std::mem::size_of::<(BatchId, u64)>();
+            subscriptions += 96;
         }
         for (query_id, clients) in &self.query_origin {
             subscriptions += std::mem::size_of_val(query_id);
@@ -911,6 +966,7 @@ impl SyncManager {
             clients.remove(&client_id);
             !clients.is_empty()
         });
+        self.pruned_fate_interest.remove(&client_id);
         // Clean up query origin map
         self.query_origin.retain(|_, clients| {
             clients.remove(&client_id);
@@ -948,12 +1004,29 @@ impl SyncManager {
         self.batch_fate_interest.values().map(HashSet::len).sum()
     }
 
+    /// Entries in the scope prune's fate-interest queue for this client, stale ones included.
+    #[cfg(test)]
+    pub(crate) fn pruned_fate_interest_len(&self, client_id: ClientId) -> usize {
+        self.pruned_fate_interest
+            .get(&client_id)
+            .map_or(0, |interest| interest.order.len())
+    }
+
     /// Clients registered as waiting for this batch's fate.
     #[cfg(test)]
     pub(crate) fn batch_fate_interest_clients(&self, batch_id: BatchId) -> usize {
         self.batch_fate_interest
             .get(&batch_id)
             .map_or(0, HashSet::len)
+    }
+
+    /// Whether `client_id` is recorded as an origin of `query_id`: the client a
+    /// `QuerySettled` from upstream is relayed to.
+    #[cfg(test)]
+    pub(crate) fn query_origin_contains(&self, query_id: QueryId, client_id: ClientId) -> bool {
+        self.query_origin
+            .get(&query_id)
+            .is_some_and(|clients| clients.contains(&client_id))
     }
 
     /// Get client state.
@@ -1109,19 +1182,6 @@ impl SyncManager {
             .is_some_and(|owed| owed.values().any(|pending| !pending.demoted))
     }
 
-    /// The rows this client is owed, as scope entries.
-    ///
-    /// A re-offer is built from this rather than from the whole scope: the trigger is
-    /// per-client, so without narrowing one unconfirmed row would retransmit an entire
-    /// query on every resubscribe — and a phone resubscribes whenever it comes back to the
-    /// foreground.
-    fn undelivered_scope_entries(&self, client_id: ClientId) -> HashSet<(ObjectId, BranchName)> {
-        self.pending_client_deliveries
-            .get(&client_id)
-            .map(|owed| owed.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// Publish how much is owed right now. Called once per tick; the map is empty on a
     /// healthy server, so this is two length checks.
     pub fn publish_undelivered_gauges(&self) {
@@ -1238,42 +1298,35 @@ impl SyncManager {
             return;
         };
 
+        // What changes is this query's scope alone, so what leaves the client's scope is what
+        // this query no longer covers and no other query of the client does.
         let old_query_scope = client
             .queries
-            .get(&query_id)
-            .map(|query| query.scope.clone())
+            .remove(&query_id)
+            .map(|query| query.scope)
             .unwrap_or_default();
-        let old_scope: HashSet<(ObjectId, BranchName)> = client
-            .queries
-            .values()
-            .flat_map(|q| q.scope.iter().cloned())
+        let no_longer_visible = Self::leaving_client_scope(client, old_query_scope.iter(), &scope);
+        // What this query newly covers, plus whatever this peer never confirmed that is still
+        // in scope. For a returning peer the difference is empty — its scope did not change,
+        // it was away — so the owed rows are the whole of the re-offer. Re-offering a row the
+        // peer already holds is harmless: applying an identical batch is an idempotent no-op
+        // on the receiver. The re-offer is the owed rows, not the whole scope: the trigger is
+        // per client, so one unconfirmed row would otherwise retransmit an entire query on
+        // every resubscribe — and a phone resubscribes whenever it comes back to the
+        // foreground.
+        let mut newly_visible_for_query: Vec<(ObjectId, BranchName)> = scope
+            .iter()
+            .filter(|entry| !old_query_scope.contains(*entry))
+            .copied()
             .collect();
-
-        client.queries.insert(
-            query_id,
-            QueryScope {
-                scope: scope.clone(),
-                session,
-            },
-        );
-
-        let new_scope: HashSet<(ObjectId, BranchName)> = client
-            .queries
-            .values()
-            .flat_map(|q| q.scope.iter().cloned())
-            .collect();
-
-        let no_longer_visible: HashSet<(ObjectId, BranchName)> =
-            old_scope.difference(&new_scope).cloned().collect();
-        // Plus whatever this peer never confirmed that is still in scope. For a returning
-        // peer the difference is empty — its scope did not change, it was away — so the
-        // owed rows are the whole of the re-offer. Re-offering a row the peer already holds
-        // is harmless: applying an identical batch is an idempotent no-op on the receiver.
-        let newly_visible_for_query: Vec<(ObjectId, BranchName)> = {
-            let mut entries: HashSet<(ObjectId, BranchName)> =
-                scope.difference(&old_query_scope).cloned().collect();
-            let owed = self.undelivered_scope_entries(client_id);
-            let re_offered = owed.intersection(&scope).count();
+        if let Some(owed) = self.pending_client_deliveries.get(&client_id) {
+            let mut re_offered = 0;
+            for entry in owed.keys().filter(|entry| scope.contains(*entry)) {
+                re_offered += 1;
+                if old_query_scope.contains(entry) {
+                    newly_visible_for_query.push(*entry);
+                }
+            }
             if re_offered > 0 {
                 tracing::info!(
                     target: "jazz::conn",
@@ -1284,9 +1337,10 @@ impl SyncManager {
                     "re-offering rows the peer never confirmed"
                 );
             }
-            entries.extend(owed.intersection(&scope).cloned());
-            entries.into_iter().collect()
-        };
+        }
+        client
+            .queries
+            .insert(query_id, QueryScope { scope, session });
 
         self.prune_client_scope_tracking(storage, client_id, &no_longer_visible);
 
@@ -1306,9 +1360,22 @@ impl SyncManager {
         // Initial query scope delivery can include many rows from the same
         // sealed batch. Queue rows first so client interest is complete, then
         // send one fate per batch instead of one growing fate per row.
+        // A fate that is settled now is what the prune would read when these rows leave the
+        // scope again, so the client keeps it and the prune does not read it twice.
+        let target = self.settlement_target();
         for batch_id in newly_visible_batch_ids {
             if let Some(fate) = self.load_batch_fate_by_batch_id_from_storage(storage, batch_id) {
-                self.queue_batch_fate_to_client(client_id, fate);
+                let settled = Self::fate_settles_up_to(&fate).filter(|tier| *tier >= target);
+                let sent = self.queue_batch_fate_to_client(client_id, fate);
+                if sent
+                    && let Some(tier) = settled
+                    && let Some(client) = self.clients.get_mut(&client_id)
+                {
+                    if client.settled_fates_sent.len() >= MAX_SETTLED_FATES_SENT {
+                        client.settled_fates_sent.clear();
+                    }
+                    client.settled_fates_sent.insert(batch_id, tier);
+                }
             }
         }
     }
@@ -1322,22 +1389,7 @@ impl SyncManager {
         client_id: ClientId,
         query_id: QueryId,
     ) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            let old_scope: HashSet<(ObjectId, BranchName)> = client
-                .queries
-                .values()
-                .flat_map(|q| q.scope.iter().cloned())
-                .collect();
-            client.queries.remove(&query_id);
-            let new_scope: HashSet<(ObjectId, BranchName)> = client
-                .queries
-                .values()
-                .flat_map(|q| q.scope.iter().cloned())
-                .collect();
-            let no_longer_visible: HashSet<(ObjectId, BranchName)> =
-                old_scope.difference(&new_scope).cloned().collect();
-            self.prune_client_scope_tracking(storage, client_id, &no_longer_visible);
-        }
+        self.drop_client_query_scope(storage, client_id, query_id);
 
         if let Some(clients) = self.query_origin.get_mut(&query_id) {
             clients.remove(&client_id);
@@ -1345,6 +1397,49 @@ impl SyncManager {
                 self.query_origin.remove(&query_id);
             }
         }
+    }
+
+    /// Drop the scope a client's query holds, when the client withdraws the query: the rows only
+    /// it covered stop being kept up to date for the client.
+    ///
+    /// Origin tracking is not touched here. The inbox drops it when the withdrawal arrives, in
+    /// arrival order, and a subscription under the same key that arrived after the withdrawal
+    /// has registered its origin since.
+    pub fn drop_client_query_scope<H: Storage + ?Sized>(
+        &mut self,
+        storage: &H,
+        client_id: ClientId,
+        query_id: QueryId,
+    ) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        let Some(old_query) = client.queries.remove(&query_id) else {
+            return;
+        };
+        let no_longer_visible =
+            Self::leaving_client_scope(client, old_query.scope.iter(), &HashSet::new());
+        self.prune_client_scope_tracking(storage, client_id, &no_longer_visible);
+    }
+
+    /// The entries a query held that leave the client's scope when the query's scope becomes
+    /// `new_query_scope`: not in it, and not in any other query of the client. The query is
+    /// out of `client.queries` while this runs.
+    fn leaving_client_scope<'a>(
+        client: &ClientState,
+        old_query_scope: impl Iterator<Item = &'a (ObjectId, BranchName)>,
+        new_query_scope: &HashSet<(ObjectId, BranchName)>,
+    ) -> HashSet<(ObjectId, BranchName)> {
+        old_query_scope
+            .filter(|entry| {
+                !new_query_scope.contains(*entry)
+                    && !client
+                        .queries
+                        .values()
+                        .any(|query| query.scope.contains(*entry))
+            })
+            .copied()
+            .collect()
     }
 
     fn prune_client_scope_tracking<H: Storage + ?Sized>(
@@ -1377,31 +1472,114 @@ impl SyncManager {
             }
         }
 
+        // A row the client was offered and has not confirmed is no longer owed once it leaves
+        // the client's scope: a re-offer only ever covers rows in scope, so the entry would
+        // stay for good and keep forcing re-derivations. Its batch was queued with row
+        // interest like a delivered one, and goes the same way.
+        if let Some(owed) = self.pending_client_deliveries.get_mut(&client_id) {
+            for &(object_id, branch_name) in removed_scope {
+                if let Some(pending) = owed.remove(&(object_id, branch_name)) {
+                    removed_row_batches.push(RowBatchKey::new(
+                        object_id,
+                        branch_name,
+                        pending.batch_id,
+                    ));
+                }
+            }
+            if owed.is_empty() {
+                self.pending_client_deliveries.remove(&client_id);
+            }
+        }
+
         // The client keeps the versions it was sent after the row leaves its scope, and the row
-        // interest dropped here is what would carry a later fate to it. While an upstream can
-        // still reject one of those batches, keep the client on the batch's fate instead: the
-        // relay that brings the rejection reaches it, and retires the entry once the fate is
-        // settled. A node with no upstream settles every fate itself, so it keeps nothing.
-        let has_upstream = self.has_servers_or_pending_servers();
+        // interest dropped here is what would carry a later fate to it. While the batch's fate
+        // is not settled, keep the client on the batch's fate instead: the relay that brings it
+        // reaches the client, and retires the entry once the fate is settled. That holds on a
+        // node with no upstream too: a direct row is forwarded as soon as it is applied, before
+        // its seal settles the batch. Each batch's fate is read once, however many of its rows
+        // left: a scope drop is on the path of every withdrawn query.
+        let mut settled_at_send: HashMap<BatchId, DurabilityTier> = HashMap::new();
+        if let Some(client) = self.clients.get_mut(&client_id)
+            && !client.settled_fates_sent.is_empty()
+        {
+            for key in &removed_row_batches {
+                if let Some(tier) = client.settled_fates_sent.remove(&key.batch_id) {
+                    settled_at_send.insert(key.batch_id, tier);
+                }
+            }
+        }
+        let target = self.settlement_target();
+        let mut needs_fate: HashMap<BatchId, bool> = HashMap::new();
         for key in removed_row_batches {
-            if has_upstream
-                && !self
-                    .batch_fate_interest
-                    .get(&key.batch_id)
-                    .is_some_and(|clients| clients.contains(&client_id))
+            if !self
+                .batch_fate_interest
+                .get(&key.batch_id)
+                .is_some_and(|clients| clients.contains(&client_id))
             {
-                let fate = storage
-                    .load_authoritative_batch_fate(key.batch_id)
-                    .ok()
-                    .flatten();
-                if self.batch_needs_settlement(fate.as_ref()) {
+                let needs = *needs_fate.entry(key.batch_id).or_insert_with(|| {
+                    if settled_at_send
+                        .get(&key.batch_id)
+                        .is_some_and(|tier| *tier >= target)
+                    {
+                        return false;
+                    }
+                    let fate = storage
+                        .load_authoritative_batch_fate(key.batch_id)
+                        .ok()
+                        .flatten();
+                    self.batch_needs_settlement(fate.as_ref())
+                });
+                if needs {
                     self.batch_fate_interest
                         .entry(key.batch_id)
                         .or_default()
                         .insert(client_id);
+                    self.note_pruned_fate_interest(client_id, key.batch_id);
                 }
             }
             self.row_batch_interest.remove(&key, client_id);
+        }
+    }
+
+    /// Record that the scope prune put `client_id` on `batch_id`'s fate, and past
+    /// [`MAX_PRUNED_FATE_INTEREST`] take the client off the oldest such batch, unless that
+    /// registration has already ended. Only this client comes off: others may wait on the same
+    /// batch. A batch the client asked about itself (`BatchFateNeeded`) is never taken: asking
+    /// first means the prune finds the client registered and adds nothing, asking later ends the
+    /// prune's registration ([`Self::claim_pruned_fate_interest`]).
+    fn note_pruned_fate_interest(&mut self, client_id: ClientId, batch_id: BatchId) {
+        let interest = self.pruned_fate_interest.entry(client_id).or_default();
+        if interest.order.len() >= MAX_PRUNED_FATE_INTEREST
+            && let Some((oldest, number)) = interest.order.pop_front()
+            && interest.live.get(&oldest) == Some(&number)
+        {
+            interest.live.remove(&oldest);
+            if let Some(clients) = self.batch_fate_interest.get_mut(&oldest) {
+                clients.remove(&client_id);
+                if clients.is_empty() {
+                    self.batch_fate_interest.remove(&oldest);
+                }
+            }
+        }
+        let number = interest.next;
+        interest.next += 1;
+        interest.order.push_back((batch_id, number));
+        interest.live.insert(batch_id, number);
+    }
+
+    /// The batches a client asked about are its own interest from now on: end the prune's
+    /// registration of each, so the prune's bound never takes one of them off. The client asks
+    /// again only when it reconnects.
+    pub(super) fn claim_pruned_fate_interest(
+        &mut self,
+        client_id: ClientId,
+        batch_ids: &[BatchId],
+    ) {
+        let Some(interest) = self.pruned_fate_interest.get_mut(&client_id) else {
+            return;
+        };
+        for batch_id in batch_ids {
+            interest.live.remove(batch_id);
         }
     }
 
@@ -1526,10 +1704,8 @@ impl SyncManager {
 
     /// Return the union of latest upstream scope snapshots for this query.
     pub fn remote_query_scope(&self, query_id: QueryId) -> HashSet<(ObjectId, BranchName)> {
-        self.remote_query_scopes
-            .iter()
-            .filter(|((_, remote_query_id), _)| *remote_query_id == query_id)
-            .flat_map(|(_, scope)| scope.iter().copied())
+        self.remote_query_scope_sets(query_id)
+            .flat_map(|scope| scope.iter().copied())
             .collect()
     }
 
@@ -1540,17 +1716,40 @@ impl SyncManager {
         query_id: QueryId,
         requested_tier: DurabilityTier,
     ) -> HashSet<(ObjectId, BranchName)> {
+        self.remote_query_scope_sets_at_least(query_id, requested_tier)
+            .flat_map(|scope| scope.iter().copied())
+            .collect()
+    }
+
+    /// The latest upstream scope snapshots for this query, one per server, borrowed:
+    /// `remote_query_scope` is their union, without copying it.
+    pub fn remote_query_scope_sets(
+        &self,
+        query_id: QueryId,
+    ) -> impl Iterator<Item = &HashSet<(ObjectId, BranchName)>> {
         self.remote_query_scopes
             .iter()
-            .filter(|((server_id, remote_query_id), _)| {
+            .filter(move |((_, remote_query_id), _)| *remote_query_id == query_id)
+            .map(|(_, scope)| scope)
+    }
+
+    /// The snapshots at or above the requested tier, borrowed:
+    /// `remote_query_scope_at_least` is their union, without copying it.
+    pub fn remote_query_scope_sets_at_least(
+        &self,
+        query_id: QueryId,
+        requested_tier: DurabilityTier,
+    ) -> impl Iterator<Item = &HashSet<(ObjectId, BranchName)>> {
+        self.remote_query_scopes
+            .iter()
+            .filter(move |((server_id, remote_query_id), _)| {
                 *remote_query_id == query_id
                     && self
                         .remote_query_scope_tiers
                         .get(&(*server_id, *remote_query_id))
                         .is_some_and(|tier| *tier >= requested_tier)
             })
-            .flat_map(|(_, scope)| scope.iter().copied())
-            .collect()
+            .map(|(_, scope)| scope)
     }
 
     /// Whether we have received at least one upstream scope snapshot for this query.

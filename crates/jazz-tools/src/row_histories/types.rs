@@ -173,9 +173,9 @@ impl QueryRowBatch {
 
     pub fn row_provenance(&self) -> RowProvenance {
         RowProvenance {
-            created_by: self.created_by.to_string(),
+            created_by: self.created_by.clone(),
             created_at: self.created_at,
-            updated_by: self.updated_by.to_string(),
+            updated_by: self.updated_by.clone(),
             updated_at: self.updated_at,
         }
     }
@@ -323,9 +323,9 @@ impl StoredRowBatch {
             branch,
             parents,
             updated_at: provenance.updated_at,
-            created_by: provenance.created_by.into(),
+            created_by: provenance.created_by,
             created_at: provenance.created_at,
-            updated_by: provenance.updated_by.into(),
+            updated_by: provenance.updated_by,
             state,
             confirmed_tier,
             delete_kind,
@@ -337,9 +337,9 @@ impl StoredRowBatch {
 
     pub fn row_provenance(&self) -> RowProvenance {
         RowProvenance {
-            created_by: self.created_by.to_string(),
+            created_by: self.created_by.clone(),
             created_at: self.created_at,
-            updated_by: self.updated_by.to_string(),
+            updated_by: self.updated_by.clone(),
             updated_at: self.updated_at,
         }
     }

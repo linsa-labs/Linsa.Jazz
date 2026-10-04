@@ -1004,9 +1004,9 @@ mod tests {
             vec![BatchId([9; 16])],
             user_data.clone(),
             RowProvenance {
-                created_by: "alice".to_string(),
+                created_by: "alice".to_string().into(),
                 created_at: 100,
-                updated_by: "bob".to_string(),
+                updated_by: "bob".to_string().into(),
                 updated_at: 123,
             },
             HashMap::from([("source".to_string(), "test".to_string())]),

@@ -412,6 +412,18 @@ impl SyncManager {
         if !self.clients.contains_key(&client_id) {
             return;
         }
+        // The batches this row supersedes leave the client's frontier (`record_delivery`), so
+        // the scope prune never walks to them again: what they entered the scope settled with
+        // goes with them.
+        if let Some(client) = self.clients.get_mut(&client_id)
+            && !client.settled_fates_sent.is_empty()
+        {
+            for parent in &parent_ids {
+                if *parent != batch_id {
+                    client.settled_fates_sent.remove(parent);
+                }
+            }
+        }
         if !acks_deliveries {
             // Old client: it will never confirm, so waiting for it would leave every row
             // outstanding and re-offer the scope on every subscription. Record the claim as
@@ -438,6 +450,23 @@ impl SyncManager {
             );
             let now = self.clock.reserve_timestamp();
             let owed = self.pending_client_deliveries.entry(client_id).or_default();
+            // The offer this one replaces will never be confirmed (a late confirmation of it is
+            // dropped), so unless the client confirmed that batch before, the scope prune never
+            // walks to it again: what it entered the scope settled with goes with it. On the
+            // durable stores a row loads without its parents, so this is the exit there.
+            if let Some(replaced) = owed
+                .get(&(object_id, branch_name))
+                .map(|pending| pending.batch_id)
+                .filter(|replaced| *replaced != batch_id)
+                && let Some(client) = self.clients.get_mut(&client_id)
+                && !client.settled_fates_sent.is_empty()
+                && !client
+                    .sent_batch_ids
+                    .get(&(object_id, branch_name))
+                    .is_some_and(|sent| sent.contains(&replaced))
+            {
+                client.settled_fates_sent.remove(&replaced);
+            }
             let (attempts, first_offered_at) = owed
                 .get(&(object_id, branch_name))
                 .filter(|pending| pending.batch_id == batch_id)

@@ -868,6 +868,123 @@ impl SenderAndPeer {
     }
 }
 
+impl SenderAndPeer {
+    /// Settle, holding back every message `hold` picks out of the wire; returns what was held,
+    /// in the order it was sent.
+    fn settle_holding(&mut self, hold: &dyn Fn(&InFlight) -> bool) -> Vec<InFlight> {
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            self.network.collect(&mut self.server, &mut self.peers);
+            let (picked, passed): (Vec<_>, Vec<_>) = std::mem::take(&mut self.network.wire)
+                .into_iter()
+                .partition(|message| hold(message));
+            held.extend(picked);
+            self.network.wire = passed;
+            if self.network.wire.is_empty() {
+                return held;
+            }
+            self.network
+                .deliver_some(&mut self.server, &mut self.peers, &mut self.rng, true);
+        }
+        panic!("the network never went quiet with the held messages out of it");
+    }
+}
+
+fn is_seal(message: &InFlight) -> bool {
+    message.to_server && matches!(message.payload, SyncPayload::SealBatch { .. })
+}
+
+/// A peer's direct write is applied by the sender, and forwarded to every peer holding the row,
+/// as soon as it arrives — before its seal settles the batch. When the row leaves a peer's scope
+/// in that window, the sender has no upstream to hear the fate from, and the row interest that
+/// would have carried the fate goes with the scope. The peer must be kept on the batch's fate
+/// instead: the seal's fate reaches it, and the sender forgets it then.
+///
+/// `confirms`: the watching peer confirms deliveries and its confirmation is held back, so the
+/// row is still owed — not yet recorded as sent — when it leaves the scope.
+fn a_direct_write_sealed_after_leaving_scope(tag: &str, seed: u64, confirms: bool) {
+    let mut f = SenderAndPeer::new(tag, seed);
+    if confirms {
+        let watcher = f.peers[0].client_id;
+        f.server.set_client_acks_deliveries(watcher, true);
+        f.peers[0].core.set_upstream_supports_delivery_acks(true);
+    }
+    let writer = f.add_peer();
+    f.settle();
+
+    let batch_id = f.peers[writer]
+        .core
+        .update(f.row_id, SenderAndPeer::update_values(), None)
+        .expect("a peer may update a row it holds");
+    let hold = move |message: &InFlight| {
+        is_seal(message)
+            || (confirms
+                && message.to_server
+                && message.peer_index == 0
+                && matches!(message.payload, SyncPayload::DeliveryConfirmed { .. }))
+    };
+    let mut held = f.settle_holding(&hold);
+    assert!(
+        held.iter().any(|message| matches!(
+            &message.payload,
+            SyncPayload::SealBatch { submission } if submission.batch_id == batch_id
+        )),
+        "fixture precondition: the writer seals its update"
+    );
+    assert_eq!(
+        visible_docs(&mut f.peers[0].core),
+        f.row("updated", 1),
+        "fixture precondition: the update reached the watching peer before its seal"
+    );
+
+    let kept_before = batch_fate_interest_clients(&mut f.server, batch_id);
+    let subscription = f.peers[0]
+        .subscription
+        .take()
+        .expect("fixture precondition: the watching peer is subscribed");
+    f.peers[0].core.unsubscribe(subscription);
+    held.extend(f.settle_holding(&hold));
+    assert_eq!(
+        batch_fate_interest_clients(&mut f.server, batch_id),
+        kept_before + 1,
+        "the row left the watching peer's scope before its batch settled, so the sender must \
+         keep that peer on the batch's fate"
+    );
+
+    let (seals, rest): (Vec<_>, Vec<_>) = held.into_iter().partition(is_seal);
+    f.network.wire.extend(seals);
+    f.network
+        .deliver_some(&mut f.server, &mut f.peers, &mut f.rng, true);
+    f.network.collect(&mut f.server, &mut f.peers);
+    assert!(
+        f.network.wire.iter().any(|message| !message.to_server
+            && message.peer_index == 0
+            && matches!(
+                &message.payload,
+                SyncPayload::BatchFate { fate } if fate.batch_id() == batch_id
+            )),
+        "the seal settled the batch on the sender, which must tell the peer that took the update \
+         before it left its scope"
+    );
+    f.network.wire.extend(rest);
+    f.settle();
+    assert_eq!(
+        batch_fate_interest_clients(&mut f.server, batch_id),
+        0,
+        "the settled fate went out, so the sender must stop keeping anyone on it"
+    );
+}
+
+#[test]
+fn a_direct_write_sealed_after_leaving_a_peers_scope_still_tells_that_peer_its_fate() {
+    a_direct_write_sealed_after_leaving_scope("seal-after-exit", 0x5EED_000A, false);
+}
+
+#[test]
+fn a_direct_write_owed_when_it_leaves_a_peers_scope_still_tells_that_peer_its_fate() {
+    a_direct_write_sealed_after_leaving_scope("seal-after-exit-owed", 0x5EED_000B, true);
+}
+
 fn batch_fate_interest_len(node: &mut Node) -> usize {
     node.schema_manager_mut()
         .query_manager_mut()
@@ -1075,10 +1192,10 @@ fn a_sender_delete_rejected_upstream_after_leaving_scope_is_undone_on_a_subscrib
     );
 }
 
-/// The same loss with a peer that confirms deliveries: the confirmed delete is recorded as sent
-/// only when the confirmation arrives, which here is after the settle pass has dropped the row
-/// from the peer's scope, so the delete's interest outlives that prune and the rejection gets
-/// through without help. This pins that the kept interest changes nothing for such a peer.
+/// The same loss with a peer that confirms deliveries: the delete is owed, not yet recorded as
+/// sent, when the settle pass drops the row from the peer's scope. The prune forgets what is owed
+/// out of scope, row interest included, and keeps the peer on the batch's fate instead, which is
+/// what carries the rejection to it.
 #[test]
 fn a_sender_delete_rejected_upstream_after_leaving_scope_is_undone_on_a_confirming_peer() {
     let mut f = SenderAndPeer::new("reject-delete-acks", 0x5EED_0009);
@@ -1300,7 +1417,7 @@ fn a_sender_delete_reaches_a_subscribed_peer() {
     assert_eq!(
         batch_fate_interest_len(&mut server),
         0,
-        "with no upstream nothing can reject the delete later, so the row leaving the peer's \
+        "the sender's own delete is settled when it is written, so the row leaving the peer's \
          scope must not keep the peer waiting for its fate"
     );
 

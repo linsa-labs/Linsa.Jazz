@@ -1356,7 +1356,8 @@ impl SyncManager {
         batch_ids: &[crate::row_histories::BatchId],
     ) {
         // Same list, same reason as in `respond_to_batch_fate_request`: one entry per named
-        // batch, held until the client goes away, and the peer picks how many.
+        // batch, held until the fate settles or the client goes away (the scope prune's bound
+        // never takes it: `claim_pruned_fate_interest`), and the peer picks how many.
         //
         // Past the cap the list is put in the same order that function truncates in, so the
         // batches registered are the batches answered. Taking the peer's raw order instead
@@ -1369,6 +1370,7 @@ impl SyncManager {
                     .or_default()
                     .insert(client_id);
             }
+            self.claim_pruned_fate_interest(client_id, batch_ids);
             return;
         }
         tracing::warn!(
@@ -1379,12 +1381,14 @@ impl SyncManager {
         let mut canonical = batch_ids.to_vec();
         canonical.sort();
         canonical.dedup();
-        for batch_id in canonical.iter().take(MAX_TRACKED_MISSING_ANSWERS) {
+        canonical.truncate(MAX_TRACKED_MISSING_ANSWERS);
+        for batch_id in &canonical {
             self.batch_fate_interest
                 .entry(*batch_id)
                 .or_default()
                 .insert(client_id);
         }
+        self.claim_pruned_fate_interest(client_id, &canonical);
     }
 
     pub(super) fn transactional_batch_rows<H: Storage>(
@@ -1722,10 +1726,7 @@ impl SyncManager {
         }
 
         if let Some(client_id) = origin_client_id {
-            self.outbox.push(OutboxEntry {
-                destination: Destination::Client(client_id),
-                payload: SyncPayload::BatchFate { fate: fate.clone() },
-            });
+            self.queue_batch_fate_to_client_unfiltered(client_id, fate.clone());
         }
     }
 
@@ -2528,12 +2529,7 @@ impl SyncManager {
                 // Keep forwarding downstream: another connected client may not know it.
                 let interested = self.interested_clients_for_batch_fate(&fate);
                 for cid in interested {
-                    if let Some(fate) = self.batch_fate_for_client(cid, &fate) {
-                        self.outbox.push(OutboxEntry {
-                            destination: Destination::Client(cid),
-                            payload: SyncPayload::BatchFate { fate },
-                        });
-                    }
+                    self.queue_batch_fate_to_client(cid, fate.clone());
                 }
                 self.retire_batch_fate_interest_if_settled(&fate);
             }

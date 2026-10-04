@@ -3,8 +3,14 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 use crate::object::ObjectId;
+use crate::query_manager::graph_nodes::tuple_delta::has_tuple_content_changed;
+use crate::query_manager::ordered_in_place::{InPlaceMode, in_place_mode};
+use crate::query_manager::settle_cost::{ORDERED_IN_PLACE, ORDERED_IN_PLACE_PARITY_VIOLATIONS};
+use crate::query_manager::settle_skips::SkipMode;
 use crate::query_manager::settlement_eval_cache::SettlementEvalCache;
-use crate::query_manager::types::{LoadedRow, RowDelta, TableName, Tuple, TupleDelta};
+use crate::query_manager::types::{
+    LoadedRow, RowDelta, TableName, Tuple, TupleDelta, TupleElement,
+};
 use crate::storage::Storage;
 use crate::sync_manager::RowBatchKey;
 
@@ -46,7 +52,9 @@ impl QueryGraph {
     }
 
     /// Every row id this graph's scans currently hold, recursing into the
-    /// cached instances of any include it contains.
+    /// cached instances of any include it contains, plus the ids a forward
+    /// reference's instances probe (found or not), so an insert of a missing
+    /// target routes to the instance waiting for it.
     ///
     /// This is the source of include routing's reverse index (v14 L1). It is
     /// deliberately PRE-filter and PRE-window: an instance whose scan holds a
@@ -504,6 +512,130 @@ impl QueryGraph {
             .map(<[Tuple]>::to_vec)
     }
 
+    /// Visit a node's ordered tuples without cloning them — the borrowing twin of
+    /// `ordered_tuples_owned`. `visit` returns false to stop. The result says whether the
+    /// walk reached the end; `None` when the node has no ordered output.
+    fn visit_ordered(
+        &self,
+        node_id: NodeId,
+        visit: &mut dyn FnMut(&Tuple) -> bool,
+    ) -> Option<bool> {
+        if self.deferred_arrays_tail.is_some()
+            && let Some(GraphNode::ArraySubquery(node)) = self.get_node(node_id)
+        {
+            let input = self.get_inputs(node_id).first().copied()?;
+            let current = RowNode::current_tuples(node);
+            return self.visit_ordered(input, &mut |tuple| match current.get(tuple) {
+                Some(mapped) => visit(mapped),
+                None => true,
+            });
+        }
+        for tuple in self.ordered_tuples_from_node(node_id)? {
+            if !visit(tuple) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// The tuples an update-only `delta` changed in `input`'s ordered output, cloned,
+    /// with their positions — when that output still has `len` tuples whose ids
+    /// `ids_match` accepts position by position (see `ordered_in_place`). `None`, which
+    /// means rebuild, on any difference: a reorder, a length change, an updated tuple
+    /// the ordered output does not hold, a delta that is not update-only.
+    fn in_place_updates(
+        &self,
+        input: NodeId,
+        delta: &TupleDelta,
+        len: usize,
+        ids_match: &dyn Fn(usize, &Tuple) -> bool,
+    ) -> Option<Vec<(usize, Tuple)>> {
+        if !(delta.added.is_empty() && delta.removed.is_empty() && delta.moved.is_empty())
+            || delta.updated.is_empty()
+        {
+            return None;
+        }
+        let wanted: AHashSet<&Tuple> = delta.updated.iter().map(|(_, new)| new).collect();
+        if wanted.len() != delta.updated.len() {
+            return None;
+        }
+        let mut updates = Vec::with_capacity(wanted.len());
+        // Each wanted tuple must stand at exactly one position: one met twice would be
+        // replaced twice while another, never met, kept its stale content.
+        let mut matched: AHashSet<&Tuple> = AHashSet::with_capacity(wanted.len());
+        let mut position = 0usize;
+        let complete = self.visit_ordered(input, &mut |tuple| {
+            if position >= len || !ids_match(position, tuple) {
+                return false;
+            }
+            if let Some(&want) = wanted.get(tuple) {
+                if !matched.insert(want) {
+                    return false;
+                }
+                updates.push((position, tuple.clone()));
+            }
+            position += 1;
+            true
+        })?;
+        (complete && position == len && updates.len() == wanted.len()).then_some(updates)
+    }
+
+    /// Whether a node the inputs rule would skip holds work of its own that its dirty bit
+    /// does not show. `Project` and `Output` are skipped by another rule and never by being
+    /// clean.
+    fn clean_with_pending_work(&self, node_id: NodeId) -> bool {
+        let node = self.get_node(node_id);
+        !matches!(
+            node,
+            None | Some(GraphNode::Project(_) | GraphNode::Output(_))
+        ) && !self.is_dirty(node_id)
+            && node.is_some_and(GraphNode::has_pending_work)
+    }
+
+    /// Whether this pass can answer `node_id` with an empty delta without
+    /// running it (see `query_manager::settle_skips`): its inputs all emitted
+    /// nothing, and either it is a clean node that is not a scan, or it is the
+    /// `Project`/`Output` tail re-materializing an unchanged list. The tail is
+    /// dirtied by every include below it whether or not routing reached an
+    /// instance, so it needs the second rule; scans never qualify, because a
+    /// clean scan still rescans under a local overlay.
+    fn unchanged_by_this_pass(
+        &self,
+        node_id: NodeId,
+        tuple_deltas: &AHashMap<NodeId, TupleDelta>,
+    ) -> bool {
+        let node = self.get_node(node_id);
+        if matches!(node, None | Some(GraphNode::IndexScan(_))) {
+            return false;
+        }
+        let inputs = self.get_inputs(node_id);
+        if inputs.is_empty()
+            || !inputs
+                .iter()
+                .all(|dep| tuple_deltas.get(dep).is_none_or(TupleDelta::is_empty))
+        {
+            return false;
+        }
+        // The first settle delivers the initial list, empty or not.
+        let output_materialized = matches!(
+            self.get_node(self.output_node),
+            Some(GraphNode::Output(output)) if output.has_materialized()
+        );
+        if matches!(node, Some(GraphNode::Project(_) | GraphNode::Output(_))) {
+            return output_materialized;
+        }
+        let clean = !self.is_dirty(node_id);
+        // A clean node is skipped on its inputs alone, which is sound only while
+        // every internal "needs work" state is set together with the node's dirty
+        // bit. Nothing enforces that at the mutation sites; this does.
+        debug_assert!(
+            !clean || node.is_none_or(|node| !node.has_pending_work()),
+            "settle skip: node {} is clean but holds pending work of its own",
+            node_id.0
+        );
+        clean
+    }
+
     fn ordered_tuples_from_node(&self, node_id: NodeId) -> Option<&[Tuple]> {
         match self.get_node(node_id) {
             Some(GraphNode::Sort(node)) => Some(node.sorted_tuples()),
@@ -681,8 +813,34 @@ impl QueryGraph {
             storage,
             local_overlay_rows,
         };
+        let skip_mode = crate::query_manager::settle_skips::settle_skip_mode();
+        let mut skipped = 0u64;
+        let mut verified = 0u64;
 
         for node_id in order {
+            let skippable =
+                skip_mode != SkipMode::Off && self.unchanged_by_this_pass(node_id, &tuple_deltas);
+            if skippable {
+                skipped += 1;
+            }
+            if skippable && skip_mode == SkipMode::Verify {
+                verified += 1;
+                if self.clean_with_pending_work(node_id) {
+                    crate::query_manager::settle_cost::note_settle_skip_violation(
+                        &crate::query_manager::settle_cost::SETTLE_SKIP_PENDING_VIOLATIONS,
+                    );
+                    tracing::error!(
+                        target: "jazz::settle_skips",
+                        table = %self.table,
+                        node_id = node_id.0,
+                        "settle skip: a clean node holds pending work of its own"
+                    );
+                }
+            }
+            if skippable && skip_mode == SkipMode::Skip {
+                tuple_deltas.insert(node_id, TupleDelta::new());
+                continue;
+            }
             let node_type = match self.get_node(node_id) {
                 Some(GraphNode::IndexScan(_)) => "IndexScan",
                 Some(GraphNode::Union(_)) => "Union",
@@ -810,22 +968,74 @@ impl QueryGraph {
                     let input_delta = input_node
                         .and_then(|dep| tuple_deltas.get(&dep).cloned())
                         .unwrap_or_default();
-                    let ordered_input = input_node.and_then(|dep| self.ordered_tuples_owned(dep));
+                    let mode = in_place_mode();
+                    let in_place = match (mode, input_node, self.get_node(node_id)) {
+                        (
+                            InPlaceMode::Apply | InPlaceMode::Verify,
+                            Some(dep),
+                            Some(GraphNode::Project(project)),
+                        ) => project
+                            .in_place_len()
+                            .and_then(|len| {
+                                self.in_place_updates(dep, &input_delta, len, &|position, tuple| {
+                                    project.in_place_ids_match(position, tuple)
+                                })
+                            })
+                            .and_then(|updates| project.project_in_place(&updates)),
+                        _ => None,
+                    };
 
-                    if let Some(GraphNode::Project(project_node)) = self.get_node_mut(node_id) {
-                        let delta = if let Some(ordered) = ordered_input {
-                            project_node.process_with_ordered_input(input_delta, &ordered)
-                        } else {
-                            RowNode::process(project_node, input_delta)
-                        };
-                        tracing::debug!(
-                            node_id = node_id.0,
-                            node_type,
-                            added = delta.added.len(),
-                            removed = delta.removed.len(),
-                            "graph node evaluated"
-                        );
-                        tuple_deltas.insert(node_id, delta);
+                    if mode == InPlaceMode::Apply
+                        && let Some(projected) = in_place
+                    {
+                        ORDERED_IN_PLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(GraphNode::Project(project_node)) = self.get_node_mut(node_id) {
+                            let delta = project_node.apply_in_place(projected);
+                            tracing::debug!(
+                                node_id = node_id.0,
+                                node_type,
+                                updated = delta.updated.len(),
+                                "graph node updated in place"
+                            );
+                            tuple_deltas.insert(node_id, delta);
+                        }
+                    } else {
+                        let before = in_place
+                            .as_ref()
+                            .and_then(|_| match self.get_node(node_id) {
+                                Some(GraphNode::Project(project)) => {
+                                    Some(project.ordered_tuples().to_vec())
+                                }
+                                _ => None,
+                            });
+                        let ordered_input =
+                            input_node.and_then(|dep| self.ordered_tuples_owned(dep));
+
+                        if let Some(GraphNode::Project(project_node)) = self.get_node_mut(node_id) {
+                            let delta = if let Some(ordered) = ordered_input {
+                                project_node.process_with_ordered_input(input_delta, &ordered)
+                            } else {
+                                RowNode::process(project_node, input_delta)
+                            };
+                            if let (Some(before), Some(projected)) = (before, in_place.as_ref()) {
+                                check_in_place(
+                                    node_id,
+                                    node_type,
+                                    &before,
+                                    projected,
+                                    project_node.ordered_tuples(),
+                                    &delta,
+                                );
+                            }
+                            tracing::debug!(
+                                node_id = node_id.0,
+                                node_type,
+                                added = delta.added.len(),
+                                removed = delta.removed.len(),
+                                "graph node evaluated"
+                            );
+                            tuple_deltas.insert(node_id, delta);
+                        }
                     }
                 }
                 Some(GraphNode::SelectElement(_)) => {
@@ -1077,25 +1287,85 @@ impl QueryGraph {
                 }
                 Some(GraphNode::Output(_)) => {
                     let input_node = self.get_inputs(node_id).first().copied();
-                    let ordered_input = input_node.and_then(|dep| self.ordered_tuples_owned(dep));
+                    let mode = in_place_mode();
+                    let in_place = match (mode, input_node, self.get_node(node_id)) {
+                        (
+                            InPlaceMode::Apply | InPlaceMode::Verify,
+                            Some(dep),
+                            Some(GraphNode::Output(output)),
+                        ) if output.can_update_in_place() => {
+                            tuple_deltas.get(&dep).and_then(|input_delta| {
+                                let list = output.ordered_tuples();
+                                self.in_place_updates(
+                                    dep,
+                                    input_delta,
+                                    list.len(),
+                                    &|position, tuple| {
+                                        list.get(position).is_some_and(|held| {
+                                            held.len() == tuple.len()
+                                                && held.id_iter().eq(tuple.id_iter())
+                                        })
+                                    },
+                                )
+                            })
+                        }
+                        _ => None,
+                    };
 
-                    if let Some(GraphNode::Output(output_node)) = self.get_node_mut(node_id) {
-                        let delta = if let Some(ordered) = ordered_input {
-                            output_node.process_with_ordered_input(&ordered)
-                        } else {
-                            let input_delta = input_node
-                                .and_then(|dep| tuple_deltas.get(&dep).cloned())
-                                .unwrap_or_default();
-                            RowNode::process(output_node, input_delta)
-                        };
-                        tracing::debug!(
-                            node_id = node_id.0,
-                            node_type,
-                            added = delta.added.len(),
-                            removed = delta.removed.len(),
-                            "graph node evaluated"
-                        );
-                        tuple_deltas.insert(node_id, delta);
+                    if mode == InPlaceMode::Apply
+                        && let Some(updates) = in_place
+                    {
+                        ORDERED_IN_PLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(GraphNode::Output(output_node)) = self.get_node_mut(node_id) {
+                            let delta = output_node.apply_in_place(updates);
+                            tracing::debug!(
+                                node_id = node_id.0,
+                                node_type,
+                                updated = delta.updated.len(),
+                                "graph node updated in place"
+                            );
+                            tuple_deltas.insert(node_id, delta);
+                        }
+                    } else {
+                        let before = in_place
+                            .as_ref()
+                            .and_then(|_| match self.get_node(node_id) {
+                                Some(GraphNode::Output(output)) => {
+                                    Some(output.ordered_tuples().to_vec())
+                                }
+                                _ => None,
+                            });
+                        let ordered_input =
+                            input_node.and_then(|dep| self.ordered_tuples_owned(dep));
+
+                        if let Some(GraphNode::Output(output_node)) = self.get_node_mut(node_id) {
+                            let delta = if let Some(ordered) = ordered_input {
+                                output_node.process_with_ordered_input(&ordered)
+                            } else {
+                                let input_delta = input_node
+                                    .and_then(|dep| tuple_deltas.get(&dep).cloned())
+                                    .unwrap_or_default();
+                                RowNode::process(output_node, input_delta)
+                            };
+                            if let (Some(before), Some(updates)) = (before, in_place.as_ref()) {
+                                check_in_place(
+                                    node_id,
+                                    node_type,
+                                    &before,
+                                    updates,
+                                    output_node.ordered_tuples(),
+                                    &delta,
+                                );
+                            }
+                            tracing::debug!(
+                                node_id = node_id.0,
+                                node_type,
+                                added = delta.added.len(),
+                                removed = delta.removed.len(),
+                                "graph node evaluated"
+                            );
+                            tuple_deltas.insert(node_id, delta);
+                        }
                     }
                 }
                 Some(GraphNode::ExistsOutput(_)) => {
@@ -1119,7 +1389,52 @@ impl QueryGraph {
                 }
                 None => {}
             }
+            // `SkipMode::Verify`: the node ran, and must have emitted what the skip
+            // would have. A release build counts and logs a violation instead of
+            // panicking, so a stand run with `JAZZ_SETTLE_SKIPS=verify` can show
+            // zero on real traffic.
+            if skippable
+                && tuple_deltas
+                    .get(&node_id)
+                    .is_some_and(|delta| !delta.is_empty())
+            {
+                crate::query_manager::settle_cost::note_settle_skip_violation(
+                    &crate::query_manager::settle_cost::SETTLE_SKIP_PARITY_VIOLATIONS,
+                );
+                let emitted = &tuple_deltas[&node_id];
+                tracing::error!(
+                    target: "jazz::settle_skips",
+                    table = %self.table,
+                    node_type,
+                    node_id = node_id.0,
+                    added = emitted.added.len(),
+                    removed = emitted.removed.len(),
+                    updated = emitted.updated.len(),
+                    moved = emitted.moved.len(),
+                    "settle skip parity: a node emitted a delta from unchanged inputs"
+                );
+                if cfg!(debug_assertions) {
+                    panic!(
+                        "settle skip parity: {node_type} node {} emitted a delta from unchanged \
+                         inputs",
+                        node_id.0
+                    );
+                }
+            }
         }
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::GRAPH_NODES_SKIPPED,
+            skipped,
+        );
+        crate::query_manager::settle_cost::add(
+            &crate::query_manager::settle_cost::SETTLE_SKIPS_VERIFIED,
+            verified,
+        );
+        #[cfg(test)]
+        crate::query_manager::settle_cost::SKIPS_ON_THREAD.with(|counts| {
+            let (skipped_before, verified_before) = counts.get();
+            counts.set((skipped_before + skipped, verified_before + verified));
+        });
 
         self.dirty_bitmap.fill(false);
 
@@ -1150,5 +1465,89 @@ impl QueryGraph {
                 _ => None,
             })
             .collect()
+    }
+}
+
+/// Every field of two tuples is equal: ids, element kind, content, batch and row provenance,
+/// and the tuple's provenance sets — everything a reader could tell apart, not only what
+/// `has_tuple_content_changed` counts as a change.
+fn tuples_identical(a: &Tuple, b: &Tuple) -> bool {
+    a.provenance() == b.provenance()
+        && a.batch_provenance() == b.batch_provenance()
+        && a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|pair| match pair {
+            (TupleElement::Id(a), TupleElement::Id(b)) => a == b,
+            (
+                TupleElement::Row {
+                    id: a_id,
+                    content: a_content,
+                    batch_id: a_batch,
+                    row_provenance: a_provenance,
+                },
+                TupleElement::Row {
+                    id: b_id,
+                    content: b_content,
+                    batch_id: b_batch,
+                    row_provenance: b_provenance,
+                },
+            ) => {
+                a_id == b_id
+                    && a_content == b_content
+                    && a_batch == b_batch
+                    && a_provenance == b_provenance
+            }
+            _ => false,
+        })
+}
+
+/// Under `InPlaceMode::Verify`: check a rebuild against the in-place update it stands in
+/// for — `before` with `updates` replaced where they stand, and a delta that updates
+/// exactly those of them whose content changed. A difference is a list the in-place path
+/// would have served wrong.
+fn check_in_place(
+    node_id: NodeId,
+    node_type: &str,
+    before: &[Tuple],
+    updates: &[(usize, Tuple)],
+    rebuilt: &[Tuple],
+    delta: &TupleDelta,
+) {
+    ORDERED_IN_PLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut expected: Vec<&Tuple> = before.iter().collect();
+    let mut changed: AHashSet<&Tuple> = AHashSet::new();
+    for (position, new) in updates {
+        if before
+            .get(*position)
+            .is_none_or(|old| has_tuple_content_changed(old, new))
+        {
+            changed.insert(new);
+        }
+        if let Some(slot) = expected.get_mut(*position) {
+            *slot = new;
+        }
+    }
+    let delta_updated: AHashSet<&Tuple> = delta.updated.iter().map(|(_, new)| new).collect();
+    let matches = delta.added.is_empty()
+        && delta.removed.is_empty()
+        && delta.moved.is_empty()
+        && expected.len() == rebuilt.len()
+        && expected
+            .iter()
+            .zip(rebuilt)
+            .all(|(expected, rebuilt)| tuples_identical(expected, rebuilt))
+        && delta_updated.len() == delta.updated.len()
+        && delta_updated == changed;
+    if !matches {
+        ORDERED_IN_PLACE_PARITY_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            node_id = node_id.0,
+            node_type,
+            "ordered in place: the rebuild differs from the in-place update"
+        );
+        debug_assert!(
+            matches,
+            "ordered in place: node {} ({node_type}) rebuilt differently from its in-place update",
+            node_id.0
+        );
     }
 }

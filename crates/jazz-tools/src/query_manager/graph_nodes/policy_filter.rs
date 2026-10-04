@@ -236,6 +236,11 @@ impl PolicyFilterNode {
         self.inherits_dirty = true;
     }
 
+    /// A dependency-table change waiting for the next run.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.inherits_dirty
+    }
+
     /// Process with context for INHERITS evaluation.
     /// Similar to ArraySubqueryNode::process_with_context().
     pub fn process_with_context<F>(

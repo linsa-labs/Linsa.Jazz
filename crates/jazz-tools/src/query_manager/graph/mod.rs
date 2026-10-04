@@ -81,6 +81,23 @@ pub enum GraphNode {
     ExistsOutput(ExistsOutputNode),
 }
 
+impl GraphNode {
+    /// Whether the node holds work of its own — an inner-table mark, a dependency
+    /// change, a buffered id — that it applies on its next run. Every such state is
+    /// set together with the node's dirty bit; the settle skips depend on it, and
+    /// debug builds assert it where a clean node is skipped.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        match self {
+            GraphNode::ArraySubquery(node) => node.has_pending_work(),
+            GraphNode::MagicColumns(node) => node.has_pending_work(),
+            GraphNode::PolicyFilter(node) => node.has_pending_work(),
+            GraphNode::RecursiveRelation(node) => node.has_pending_work(),
+            GraphNode::Materialize(node) => node.has_pending_work(),
+            _ => false,
+        }
+    }
+}
+
 /// Which rows of a paginated query get their includes built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncludePlacement {
@@ -374,6 +391,33 @@ impl QueryGraph {
     /// Get the current output tuples in output order.
     pub fn current_output_tuples(&self) -> Vec<Tuple> {
         self.current_output_tuples_ref().to_vec()
+    }
+
+    /// How many passes this graph's own `Output` and `Project` nodes took the in-place path
+    /// in, as `(output, project)`. Include instances are graphs of their own and are not
+    /// counted.
+    #[cfg(test)]
+    pub(crate) fn applied_in_place(&self) -> (usize, usize) {
+        self.nodes
+            .iter()
+            .fold((0, 0), |(output, project), compact| match &compact.node {
+                GraphNode::Output(node) => (output + node.applied_in_place, project),
+                GraphNode::Project(node) => (output, project + node.applied_in_place),
+                _ => (output, project),
+            })
+    }
+
+    /// Whether every index scan of this graph is clean and holds the exact baseline it last
+    /// emitted: the state in which a settle rescans it only because a local overlay is in play.
+    #[cfg(test)]
+    pub(crate) fn index_scans_hold_exact_baselines(&self) -> bool {
+        self.index_scan_nodes.iter().all(|(id, _, _)| {
+            !self.is_dirty(*id)
+                && matches!(
+                    self.get_node(*id),
+                    Some(GraphNode::IndexScan(scan)) if scan.holds_exact_baseline()
+                )
+        })
     }
 
     /// Borrow the current output tuples in output order.

@@ -3592,9 +3592,9 @@ fn build_many_branches_dataset<H: jazz_tools::storage::Storage>(
                 vec![head_id],
                 many_branches_row_data(&row_descriptor, scenario, branch_idx, commit_idx),
                 RowProvenance {
-                    created_by: author.clone(),
+                    created_by: author.as_str().into(),
                     created_at: root_timestamp,
-                    updated_by: author.clone(),
+                    updated_by: author.as_str().into(),
                     updated_at,
                 },
                 HashMap::new(),

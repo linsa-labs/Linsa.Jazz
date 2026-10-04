@@ -19,10 +19,11 @@
 //! by `filter_synced_query_scope_tuples`, which keeps a tuple unconditionally when its id
 //! is in that map — before it ever looks at the remote scope.
 //!
-//! The map is cleared only by an INBOUND update for the same object and branch. The server
-//! never sends a row back to its author (`inbox.rs` forwards to everyone EXCEPT the
-//! originating client, and `forwarding.rs` additionally requires scope membership, which a
-//! node holding no live subscription never has). So for a node whose reads are one-shot —
+//! The map was cleared only by an INBOUND update for the same object and branch, and none
+//! reached the author: `inbox.rs` forwards to everyone EXCEPT the originating client,
+//! `forwarding.rs` additionally requires scope membership, which a node holding no live
+//! subscription never has, and a copy of its own batch sent back to it is a no-op. So for a
+//! node whose reads are one-shot —
 //! the rpc-server's whole backend facade — the exemption never expires, and every row it
 //! has ever written is frozen in its own reads for the process lifetime.
 //!
@@ -744,5 +745,210 @@ fn a_durable_local_write_loses_its_exemption_behind_an_edge_server_too() {
          server's own tier, so behind an edge there is no `GlobalServer` settle to wait \
          for — a rule that requires one waits forever and the read stays stale for the \
          process lifetime, which is the defect this file exists for."
+    );
+}
+
+/// Only a `DurableDirect` fate at `GlobalServer` takes a direct write out of the source
+/// overlay. The overlay is shared by readers of every tier, so a lower tier must leave the
+/// row in it; and a transactional fate leaves it by its own path, the visibility change of
+/// the rows its sealed submission names, so its kind must not release a direct batch here.
+///
+/// Checked on the map itself, with the fate pushed straight into the sync manager, so each
+/// rule is held by a case of its own rather than by an end-to-end exchange that happens not
+/// to produce the fate. Two of the cases need no server at all: with none attached the
+/// write-side target is the node's own tier, and a release keyed on that target instead of
+/// on the top tier would let an `EdgeServer` fate through.
+#[test]
+fn only_a_direct_fate_at_the_top_tier_releases_a_direct_write_from_the_overlay() {
+    let cases: [(fn(BatchId) -> crate::batch_fate::BatchFate, bool, &str); 3] = [
+        (
+            |batch_id| crate::batch_fate::BatchFate::AcceptedTransaction {
+                batch_id,
+                confirmed_tier: DurabilityTier::GlobalServer,
+            },
+            true,
+            "a transactional fate at the top tier, for a direct batch",
+        ),
+        (
+            |batch_id| crate::batch_fate::BatchFate::DurableDirect {
+                batch_id,
+                confirmed_tier: DurabilityTier::EdgeServer,
+            },
+            true,
+            "a direct fate below the top tier, with a server attached",
+        ),
+        (
+            |batch_id| crate::batch_fate::BatchFate::DurableDirect {
+                batch_id,
+                confirmed_tier: DurabilityTier::EdgeServer,
+            },
+            false,
+            "a direct fate below the top tier, with no server attached",
+        ),
+    ];
+
+    for (fate_for, with_server, case) in cases {
+        let (mut client, mut client_io) = if with_server {
+            let (client, client_io, _, _, _, _) = author_and_server();
+            (client, client_io)
+        } else {
+            create_query_manager(SyncManager::new(), test_schema())
+        };
+
+        let handle = client
+            .insert(
+                &mut client_io,
+                "users",
+                &[Value::Text("Erin".into()), Value::Integer(500)],
+            )
+            .expect("the author writes the row");
+        client.process(&mut client_io);
+        assert!(
+            client.local_row_tracking(handle.row_id).pending_batch,
+            "{case}: fixture precondition: a local write enters the overlay"
+        );
+
+        client
+            .sync_manager_mut()
+            .push_pending_batch_fate(fate_for(handle.batch_id));
+        client.process(&mut client_io);
+        assert!(
+            client.local_row_tracking(handle.row_id).pending_batch,
+            "{case}: the row must stay in the source overlay. A reader at the top tier \
+             cannot see a version confirmed below it, and a transactional fate does not \
+             patch a direct batch's rows, so the overlay is the only thing serving the \
+             author's write to such a reader."
+        );
+
+        // The positive control: the same row, the fate that does release it.
+        client.sync_manager_mut().push_pending_batch_fate(
+            crate::batch_fate::BatchFate::DurableDirect {
+                batch_id: handle.batch_id,
+                confirmed_tier: DurabilityTier::GlobalServer,
+            },
+        );
+        client.process(&mut client_io);
+        assert!(
+            !client.local_row_tracking(handle.row_id).pending_batch,
+            "{case}: positive control: a direct fate at the top tier releases the row"
+        );
+    }
+}
+
+/// A released row's parked exemption retires on a version of the row from upstream — but
+/// only a version on the branch the exemption was parked for. The same id on another branch
+/// says nothing about whether the server's scope holds the author's row: rows are per
+/// branch, and so is the scope.
+///
+/// The client reads both branches, so the server sends it the other branch's version. No
+/// `QuerySettled` is carried, which is the other way a parked exemption retires; the only
+/// event after the release is the foreign version.
+#[test]
+fn a_version_on_another_branch_leaves_a_released_rows_parked_exemption() {
+    use crate::sync_manager::{Destination, InboxEntry, Source, SyncPayload};
+
+    let (mut client, mut client_io, mut server, mut server_io, client_id, server_id) =
+        author_and_server();
+    let main = get_branch(&client);
+    let other = get_branch_for_user_branch(&client, "other");
+
+    let query = client
+        .query("users")
+        .branches(&[main.as_str(), other.as_str()])
+        .build();
+    let _sub = client
+        .subscribe_with_sync(query, None, Some(DurabilityTier::GlobalServer))
+        .expect("the author reads both branches at a tier the server answers");
+    let _ = pump_scope_only(
+        &mut client,
+        &mut server,
+        &mut client_io,
+        &mut server_io,
+        client_id,
+        server_id,
+    );
+
+    let handle = client
+        .insert(
+            &mut client_io,
+            "users",
+            &[Value::Text("Faye".into()), Value::Integer(600)],
+        )
+        .expect("the author writes the row on the main branch");
+    client.process(&mut client_io);
+    client.sync_manager_mut().push_pending_batch_fate(
+        crate::batch_fate::BatchFate::DurableDirect {
+            batch_id: handle.batch_id,
+            confirmed_tier: DurabilityTier::GlobalServer,
+        },
+    );
+    client.process(&mut client_io);
+    let tracking = client.local_row_tracking(handle.row_id);
+    assert!(
+        !tracking.pending_batch && tracking.awaiting_scope,
+        "fixture precondition: the row is released from the overlay and its exemption \
+         parked ({tracking:?})"
+    );
+
+    let schema = server.schema_context().current_schema.clone();
+    server
+        .insert_on_branch_with_schema_and_write_context_and_id(
+            &mut server_io,
+            "users",
+            &other,
+            &[Value::Text("Gus".into()), Value::Integer(700)],
+            Some(handle.row_id),
+            &schema,
+            None,
+            true,
+        )
+        .expect("the server writes the same id on the other branch");
+    for _ in 0..10 {
+        server.process(&mut server_io);
+        for entry in server
+            .sync_manager_mut()
+            .take_outbox()
+            .into_iter()
+            .filter(|e| {
+                matches!(e.destination, Destination::Client(id) if id == client_id)
+                    && !matches!(e.payload, SyncPayload::QuerySettled { .. })
+            })
+        {
+            client.sync_manager_mut().push_inbox(InboxEntry {
+                source: Source::Server(server_id),
+                payload: entry.payload,
+            });
+        }
+        client.process(&mut client_io);
+        for entry in client
+            .sync_manager_mut()
+            .take_outbox()
+            .into_iter()
+            .filter(|e| {
+                matches!(e.destination, Destination::Server(id) if id == server_id)
+                    && !matches!(
+                        e.payload,
+                        SyncPayload::RowBatchCreated { .. } | SyncPayload::RowBatchNeeded { .. }
+                    )
+            })
+        {
+            server.sync_manager_mut().push_inbox(InboxEntry {
+                source: Source::Client(client_id),
+                payload: entry.payload,
+            });
+        }
+    }
+    assert_eq!(
+        client_io.index_lookup("users", "_id", &other, &Value::Uuid(handle.row_id)),
+        vec![handle.row_id],
+        "fixture precondition: the other branch's version reached the author"
+    );
+
+    assert!(
+        client.local_row_tracking(handle.row_id).awaiting_scope,
+        "a version of the row on another branch must not retire the exemption parked for \
+         the main branch: the server holding the id there is no evidence that its scope \
+         holds the author's row here, and with the exemption gone a reader holding a scope \
+         older than the write loses the row until the next answer arrives"
     );
 }

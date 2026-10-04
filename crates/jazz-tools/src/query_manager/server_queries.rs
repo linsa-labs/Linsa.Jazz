@@ -33,8 +33,9 @@ enum WriteSchemaResolution {
     Unresolved,
 }
 
-enum AuthorizedTuplesResult {
-    Ready(Vec<super::types::Tuple>),
+enum AuthorizedTuplesResult<'g> {
+    /// Borrowed from the graph when every tuple is served as it stands.
+    Ready(Cow<'g, [super::types::Tuple]>),
     PermissionsUnavailable,
 }
 
@@ -823,15 +824,15 @@ impl QueryManager {
         (verdict, Some(table_name))
     }
 
-    fn authorized_tuples_from_graph_result(
+    fn authorized_tuples_from_graph_result<'g>(
         &mut self,
         storage: &dyn Storage,
         settlement_eval_cache: &mut SettlementEvalCache,
-        graph: &super::graph::QueryGraph,
+        graph: &'g super::graph::QueryGraph,
         schema_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         session: Option<&Session>,
-    ) -> AuthorizedTuplesResult {
+    ) -> AuthorizedTuplesResult<'g> {
         if self.authorization_schema_required && self.authorization_schema.is_none() {
             return AuthorizedTuplesResult::PermissionsUnavailable;
         }
@@ -840,7 +841,9 @@ impl QueryManager {
             self.authorization_schema_for_context(&schema_context.env, &schema_context.user_branch)
         else {
             if !self.authorization_schema_required {
-                return AuthorizedTuplesResult::Ready(graph.current_output_tuples());
+                return AuthorizedTuplesResult::Ready(Cow::Borrowed(
+                    graph.current_output_tuples_ref(),
+                ));
             }
             return AuthorizedTuplesResult::PermissionsUnavailable;
         };
@@ -850,11 +853,12 @@ impl QueryManager {
                 .values()
                 .all(|table_schema| table_schema.policies.select.using.is_none())
         {
-            return AuthorizedTuplesResult::Ready(graph.current_output_tuples());
+            return AuthorizedTuplesResult::Ready(Cow::Borrowed(graph.current_output_tuples_ref()));
         }
 
         let universe = ReadPolicyBranchUniverse::from_authorization_context(&auth_context);
-        let mut authorization_cache: HashMap<(ObjectId, BranchName), bool> = HashMap::new();
+        let mut authorization_cache: ahash::AHashMap<(ObjectId, BranchName), bool> =
+            ahash::AHashMap::new();
         // Keying a session serializes its claims: once per walk, not once per row.
         let session_key = self.authz_verdicts.session_key(session);
         let scope = self
@@ -866,60 +870,78 @@ impl QueryManager {
         // data is flat in the served row — govern whether the tuple is
         // served; a denied NESTED include row prunes exactly its element
         // (and the subtree inside it), never the ancestors that carry it.
-        AuthorizedTuplesResult::Ready(
-            graph
-                .current_output_tuples()
-                .into_iter()
-                .filter_map(|tuple| {
-                    let mut any_denied = false;
-                    let mut denied_ids: HashSet<ObjectId> = HashSet::new();
-                    let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
-                    for (object_id, branch_name) in tuple.provenance().iter().copied() {
-                        let verdict = *authorization_cache
-                            .entry((object_id, branch_name))
-                            .or_insert_with(|| {
-                                self.provenance_row_matches_current_select_policy(
-                                    storage,
-                                    settlement_eval_cache,
-                                    object_id,
-                                    branch_name,
-                                    session,
-                                    session_key,
-                                    scope,
-                                    &auth_schema,
-                                    &auth_context,
-                                    source_branch_schema_map,
-                                    &universe,
-                                )
-                            });
-                        if verdict {
-                            allowed_ids.insert(object_id);
-                        } else {
-                            any_denied = true;
-                            denied_ids.insert(object_id);
-                        }
-                    }
-                    if !any_denied {
-                        return Some(tuple);
-                    }
-                    // A row allowed on any contributing branch is served; only
-                    // rows denied on every branch they contributed from prune.
-                    denied_ids.retain(|id| !allowed_ids.contains(id));
+        //
+        // Every provenance row's verdict is reached in order, as it always was; the
+        // tuples are copied only from the first one that is not served as it stands,
+        // and the id sets are built only for a tuple with a denied row.
+        let tuples = graph.current_output_tuples_ref();
+        let mut served: Option<Vec<super::types::Tuple>> = None;
+        for (index, tuple) in tuples.iter().enumerate() {
+            let mut any_denied = false;
+            for (object_id, branch_name) in tuple.provenance().iter().copied() {
+                let verdict = *authorization_cache
+                    .entry((object_id, branch_name))
+                    .or_insert_with(|| {
+                        self.provenance_row_matches_current_select_policy(
+                            storage,
+                            settlement_eval_cache,
+                            object_id,
+                            branch_name,
+                            session,
+                            session_key,
+                            scope,
+                            &auth_schema,
+                            &auth_context,
+                            source_branch_schema_map,
+                            &universe,
+                        )
+                    });
+                any_denied |= !verdict;
+            }
+            if !any_denied {
+                if let Some(served) = served.as_mut() {
+                    served.push(tuple.clone());
+                }
+                continue;
+            }
+            let mut denied_ids: HashSet<ObjectId> = HashSet::new();
+            let mut allowed_ids: HashSet<ObjectId> = HashSet::new();
+            for key in tuple.provenance().iter() {
+                if authorization_cache[key] {
+                    allowed_ids.insert(key.0);
+                } else {
+                    denied_ids.insert(key.0);
+                }
+            }
+            // A row allowed on any contributing branch is served; only
+            // rows denied on every branch they contributed from prune.
+            denied_ids.retain(|id| !allowed_ids.contains(id));
 
-                    // Every identity row must be readable — its data cannot
-                    // be clipped out of the served row.
-                    if tuple.id_iter().any(|id| !allowed_ids.contains(&id)) {
-                        return None;
-                    }
-                    if denied_ids.is_empty() {
-                        return Some(tuple);
-                    }
-                    // Fail closed: a tuple whose denied elements cannot be
-                    // pruned is not served at all.
-                    Self::tuple_with_denied_includes_pruned(graph, &tuple, &denied_ids)
-                })
-                .collect(),
-        )
+            let outcome = if tuple.id_iter().any(|id| !allowed_ids.contains(&id)) {
+                // Every identity row must be readable — its data cannot
+                // be clipped out of the served row.
+                None
+            } else if denied_ids.is_empty() {
+                Some(Cow::Borrowed(tuple))
+            } else {
+                // Fail closed: a tuple whose denied elements cannot be
+                // pruned is not served at all.
+                Self::tuple_with_denied_includes_pruned(graph, tuple, &denied_ids).map(Cow::Owned)
+            };
+            if let Some(Cow::Borrowed(_)) = outcome
+                && served.is_none()
+            {
+                continue;
+            }
+            let served = served.get_or_insert_with(|| tuples[..index].to_vec());
+            if let Some(tuple) = outcome {
+                served.push(tuple.into_owned());
+            }
+        }
+        AuthorizedTuplesResult::Ready(match served {
+            Some(served) => Cow::Owned(served),
+            None => Cow::Borrowed(tuples),
+        })
     }
 
     /// Rebuild `tuple` with every include element whose row the session may
@@ -992,15 +1014,15 @@ impl QueryManager {
         }
     }
 
-    pub(super) fn authorized_tuples_from_graph_with_cache(
+    pub(super) fn authorized_tuples_from_graph_with_cache<'g>(
         &mut self,
         storage: &dyn Storage,
         settlement_eval_cache: &mut SettlementEvalCache,
-        graph: &super::graph::QueryGraph,
+        graph: &'g super::graph::QueryGraph,
         schema_context: &crate::schema_manager::SchemaContext,
         source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
         session: Option<&Session>,
-    ) -> Vec<super::types::Tuple> {
+    ) -> Cow<'g, [super::types::Tuple]> {
         match self.authorized_tuples_from_graph_result(
             storage,
             settlement_eval_cache,
@@ -1010,7 +1032,7 @@ impl QueryManager {
             session,
         ) {
             AuthorizedTuplesResult::Ready(tuples) => tuples,
-            AuthorizedTuplesResult::PermissionsUnavailable => Vec::new(),
+            AuthorizedTuplesResult::PermissionsUnavailable => Cow::Owned(Vec::new()),
         }
     }
 
@@ -1055,6 +1077,8 @@ impl QueryManager {
             &branch_schema_map,
             sub.query.table.as_str(),
             query_id,
+            client_id,
+            &sub.query,
             schema_warnings,
         );
         let mut includes_past_page = false;
@@ -1075,6 +1099,8 @@ impl QueryManager {
                     &branch_schema_map,
                     table,
                     query_id,
+                    client_id,
+                    &sub.query,
                     schema_warnings,
                 )
             },
@@ -1098,6 +1124,8 @@ impl QueryManager {
         branch_schema_map: &HashMap<String, SchemaHash>,
         table: &str,
         query_id: crate::sync_manager::QueryId,
+        client_id: crate::sync_manager::ClientId,
+        query: &crate::query_manager::query::Query,
         schema_warnings: &mut SchemaWarningAccumulator,
     ) {
         let row_loader = |id: ObjectId, table_hint: Option<TableName>| -> Option<LoadedRow> {
@@ -1119,7 +1147,23 @@ impl QueryManager {
                 row_bytes_dedup,
             )
         };
+        let skip_violations_before =
+            crate::query_manager::settle_cost::settle_skip_violations_on_thread();
         let delta = graph.settle(storage, row_loader);
+        if crate::query_manager::settle_cost::settle_skip_violations_on_thread()
+            != skip_violations_before
+        {
+            // A client's query id is its own subscription id, so it names a query only with
+            // the client; the digest is the query's, so runs and clients can be compared.
+            tracing::error!(
+                target: "jazz::settle_skips",
+                %client_id,
+                query_id = query_id.0,
+                query_digest = crate::query_manager::settle_skips::query_digest(query),
+                table,
+                "settle skip violation in this server subscription's settle"
+            );
+        }
         crate::query_manager::settle_cost::add(
             &crate::query_manager::settle_cost::ROWS_EMITTED,
             (delta.added.len() + delta.removed.len() + delta.updated.len()) as u64,
@@ -1684,6 +1728,8 @@ impl QueryManager {
                 &branch_schema_map,
                 &table,
                 sub.query_id,
+                sub.client_id,
+                &sub.query,
                 &mut schema_warnings,
             );
             let mut reported_schema_warnings = HashSet::new();
@@ -1732,6 +1778,8 @@ impl QueryManager {
                             &branch_schema_map,
                             &table,
                             sub.query_id,
+                            sub.client_id,
+                            &sub.query,
                             &mut schema_warnings,
                         )
                     },
@@ -1785,6 +1833,8 @@ impl QueryManager {
                         &branch_schema_map,
                         &table,
                         sub.query_id,
+                        sub.client_id,
+                        &sub.query,
                         &mut rebuild_warnings,
                     );
                     let new_schema_warnings = Self::finalize_schema_warnings(
@@ -1811,6 +1861,8 @@ impl QueryManager {
                                 &branch_schema_map,
                                 &table,
                                 sub.query_id,
+                                sub.client_id,
+                                &sub.query,
                                 &mut rebuild_warnings,
                             )
                         },
@@ -1962,7 +2014,10 @@ impl QueryManager {
     /// For each pending unsubscription:
     /// 1. Remove the server-side QueryGraph
     /// 2. Forward the unsubscription to upstream servers
-    pub(super) fn process_pending_query_unsubscriptions(&mut self) {
+    pub(super) fn process_pending_query_unsubscriptions<H: Storage + ?Sized>(
+        &mut self,
+        storage: &H,
+    ) {
         let pending = self.sync_manager.take_pending_query_unsubscriptions();
 
         for unsub in pending {
@@ -1978,6 +2033,10 @@ impl QueryManager {
                 None if unsub.cancelled_queued_subscription => continue,
                 None => crate::sync_manager::QueryPropagation::Full,
             };
+            // The rows the query covered for the client stop being kept up to date for it, and
+            // stop costing every scope check of the client.
+            self.sync_manager
+                .drop_client_query_scope(storage, unsub.client_id, unsub.query_id);
 
             if propagation == crate::sync_manager::QueryPropagation::Full {
                 // Forward unsubscription to upstream servers
@@ -2067,6 +2126,8 @@ impl QueryManager {
                     &branch_schema_map,
                     &table,
                     query_id,
+                    client_id,
+                    &sub.query,
                     &mut schema_warnings,
                 );
 
@@ -2104,6 +2165,8 @@ impl QueryManager {
                                 &branch_schema_map,
                                 &table,
                                 query_id,
+                                client_id,
+                                &sub.query,
                                 &mut schema_warnings,
                             )
                         },

@@ -5,6 +5,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::query_manager::types::SharedString;
+
 /// Keys used in object metadata (`HashMap<String, String>`) and commit
 /// metadata (`BTreeMap<String, String>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,16 +125,20 @@ impl fmt::Display for DeleteKind {
 
 pub const SYSTEM_PRINCIPAL_ID: &str = "jazz:system";
 
+/// Who wrote a row and when. The authors are shared strings: a provenance rides
+/// on every tuple element a query graph holds, and those tuples are cloned on
+/// every settle pass that touches their list — an owned `String` made each
+/// clone two allocations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowProvenance {
-    pub created_by: String,
+    pub created_by: SharedString,
     pub created_at: u64,
-    pub updated_by: String,
+    pub updated_by: SharedString,
     pub updated_at: u64,
 }
 
 impl RowProvenance {
-    pub fn for_insert(author: impl Into<String>, timestamp: u64) -> Self {
+    pub fn for_insert(author: impl Into<SharedString>, timestamp: u64) -> Self {
         let author = author.into();
         Self {
             created_by: author.clone(),
@@ -142,7 +148,7 @@ impl RowProvenance {
         }
     }
 
-    pub fn for_update(existing: &Self, author: impl Into<String>, timestamp: u64) -> Self {
+    pub fn for_update(existing: &Self, author: impl Into<SharedString>, timestamp: u64) -> Self {
         Self {
             created_by: existing.created_by.clone(),
             created_at: existing.created_at,
@@ -159,7 +165,7 @@ pub fn row_provenance_metadata(
     let mut metadata = BTreeMap::from([
         (
             MetadataKey::CreatedBy.to_string(),
-            provenance.created_by.clone(),
+            provenance.created_by.to_string(),
         ),
         (
             MetadataKey::CreatedAt.to_string(),
@@ -180,7 +186,7 @@ pub fn row_provenance_from_metadata(
     updated_at: u64,
 ) -> Option<RowProvenance> {
     let metadata = metadata?;
-    let created_by = metadata.get(MetadataKey::CreatedBy.as_str())?.clone();
+    let created_by = SharedString::from(metadata.get(MetadataKey::CreatedBy.as_str())?.as_str());
     let created_at = metadata
         .get(MetadataKey::CreatedAt.as_str())?
         .parse::<u64>()
@@ -188,7 +194,7 @@ pub fn row_provenance_from_metadata(
     Some(RowProvenance {
         created_by,
         created_at,
-        updated_by: updated_by.to_string(),
+        updated_by: updated_by.into(),
         updated_at,
     })
 }

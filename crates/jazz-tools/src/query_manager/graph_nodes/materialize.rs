@@ -136,6 +136,11 @@ impl MaterializeNode {
             .unwrap_or(false)
     }
 
+    /// Updated or deleted ids buffered for the next run.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.updated_ids.is_empty() || !self.deleted_ids.is_empty()
+    }
+
     /// Mark an ID for content update checking — only if this node tracks it
     /// (a mark for an unknown id can never produce a delta: the id has no
     /// tuple to re-materialize, and if it arrives later the scan-add path

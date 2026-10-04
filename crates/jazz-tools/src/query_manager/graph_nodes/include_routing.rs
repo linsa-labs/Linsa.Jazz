@@ -57,6 +57,17 @@
 //! [`Route::Broadcast`] — correct, just not flat, and named rather than
 //! silently wrong.
 //!
+//! A nested include can also name its target by the TARGET's own id, read off
+//! a foreign key of its parent (`chat_members -> user`, `message_system ->
+//! actorUser`): a forward reference. A target row there is named by its id
+//! alone, so `held_by[id]` answers it — an update, a delete, and an insert
+//! too, because a forward-reference node exports every id its instances
+//! PROBE, found or not, into the enclosing include's held sets
+//! ([`DirtRouting::correlates_by_row_id`]). Without that export an id inserted
+//! after the parent naming it would reach no instance. Before this link
+//! existed the shape was unroutable, and one `users` write re-evaluated every
+//! cached instance of the chat list and of every page's message includes.
+//!
 //! ## Why under-routing is the only dangerous direction
 //!
 //! Every mark is a "re-check this" instruction, so delivering one to an
@@ -74,7 +85,7 @@ use smallvec::SmallVec;
 
 use crate::object::ObjectId;
 use crate::query_manager::query::{ArraySubqueryRequirement, ArraySubquerySpec};
-use crate::query_manager::types::{RowDescriptor, Schema, TableName, Value};
+use crate::query_manager::types::{ColumnType, RowDescriptor, Schema, TableName, Value};
 
 /// Identifies one cached subgraph instance: the outer row plus, for UUID[]
 /// forward includes, the index of the correlate array element it serves.
@@ -231,6 +242,12 @@ enum TableLink {
     /// identity. The value read there is a row id held by some instance, so it
     /// resolves through `held_by`.
     NestedByParentId(CorrelateSource),
+    /// A nested include whose inner column is the row's own id (a forward
+    /// reference: `user` under `chat_members`, read off `userId`). Every
+    /// instance whose subtree PROBES that id holds it, found or not (see
+    /// `correlates_by_row_id`), so `held_by[id]` is the answer for an insert
+    /// as much as for an update.
+    NestedByOwnId,
     /// Resolvable only by broadcast (see the module docs for the two shapes
     /// that land here).
     Unroutable,
@@ -289,6 +306,12 @@ pub(super) struct DirtRouting {
     /// The include's own inner table: the only table whose rows can turn an
     /// empty binding into a non-empty one (see [`EmptyBinding`]).
     inner_table: TableName,
+    /// The include's own correlate is the inner row's id (a forward
+    /// reference), so its bindings are the ids it probes. Taken from the
+    /// node's OWN link before the nested merge: a nested include over the same
+    /// table can turn `links[inner_table]` unroutable for this node's routing,
+    /// and that must not stop the node exporting what it probes.
+    probes_by_row_id: bool,
 }
 
 impl DirtRouting {
@@ -312,15 +335,17 @@ impl DirtRouting {
             .get(&inner_table)
             .and_then(|table| correlate_source(&table.columns, inner_column))
             .map_or(TableLink::Unroutable, TableLink::Direct);
+        let probes_by_row_id = direct == TableLink::Direct(CorrelateSource::RowId);
         links.insert(inner_table, direct);
 
         // Nested includes are registered against THIS node (see the
         // `nested_stack` walk in `graph/compile.rs`), so their tables arrive
         // here and must resolve to a parent row rather than to a binding.
-        let mut stack: Vec<&ArraySubquerySpec> = nested.iter().collect();
-        while let Some(spec) = stack.pop() {
-            stack.extend(spec.nested_arrays.iter());
-            let link = nested_link(schema, spec);
+        let mut stack: Vec<(&ArraySubquerySpec, TableName)> =
+            nested.iter().map(|spec| (spec, inner_table)).collect();
+        while let Some((spec, parent_table)) = stack.pop() {
+            stack.extend(spec.nested_arrays.iter().map(|child| (child, spec.table)));
+            let link = nested_link(schema, spec, parent_table);
             match links.entry(spec.table) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(link);
@@ -342,6 +367,7 @@ impl DirtRouting {
             links,
             routable: offset == 0,
             inner_table,
+            probes_by_row_id,
         }
     }
 
@@ -390,6 +416,8 @@ impl DirtRouting {
         };
         match (link, correlate) {
             (TableLink::Unroutable, _) => return Route::Broadcast,
+            // Held by exactly the instances that probe this id.
+            (TableLink::NestedByOwnId, _) => {}
             // The row is gone from this subscription's view: it can only leave
             // instances, never enter one.
             (_, None) => {}
@@ -444,6 +472,7 @@ impl DirtRouting {
         }
         match self.links.get(table)? {
             TableLink::Unroutable => None,
+            TableLink::NestedByOwnId => Some(CorrelateColumn(CorrelateSource::RowId)),
             TableLink::Direct(source) | TableLink::NestedByParentId(source) => {
                 Some(CorrelateColumn(*source))
             }
@@ -497,6 +526,13 @@ impl DirtRouting {
         }
     }
 
+    /// Whether this include's own correlate is the inner row's id, so its
+    /// bindings are the ids it probes: the enclosing include must hold them
+    /// for [`TableLink::NestedByOwnId`] to find the instance an insert fills.
+    pub(super) fn correlates_by_row_id(&self) -> bool {
+        self.probes_by_row_id
+    }
+
     /// Every row this node's instances track, for an ENCLOSING include's index.
     pub(super) fn extend_tracked_row_ids(&self, out: &mut Vec<ObjectId>) {
         out.extend(self.held_by.keys().copied());
@@ -530,7 +566,22 @@ impl CorrelateColumn {
     }
 }
 
-fn nested_link(schema: &Schema, spec: &ArraySubquerySpec) -> TableLink {
+/// Whether the parent column a forward reference reads holds row ids — one
+/// UUID or an array of them, the only correlation values whose probed ids an
+/// include can export.
+fn outer_column_holds_ids(schema: &Schema, parent_table: TableName, outer_column: &str) -> bool {
+    let column = outer_column.split('.').next_back().unwrap_or_default();
+    schema
+        .get(&parent_table)
+        .and_then(|table| table.columns.column(column))
+        .is_some_and(|descriptor| match &descriptor.column_type {
+            ColumnType::Uuid => true,
+            ColumnType::Array { element } => matches!(**element, ColumnType::Uuid),
+            _ => false,
+        })
+}
+
+fn nested_link(schema: &Schema, spec: &ArraySubquerySpec, parent_table: TableName) -> TableLink {
     // A nested include that can drop its PARENT from the containing array
     // (`AtLeastOne` / `MatchCorrelationCardinality`) makes a parent that is
     // absent today re-appear when a child arrives — and an absent parent is
@@ -538,11 +589,30 @@ fn nested_link(schema: &Schema, spec: &ArraySubquerySpec) -> TableLink {
     if spec.requirement != ArraySubqueryRequirement::Optional {
         return TableLink::Unroutable;
     }
+    let outer = spec.outer_column.split('.').next_back().unwrap_or_default();
+    let outer_is_parent_id = crate::query_manager::query::is_row_id_condition_column(outer);
+    // A forward reference: the inner column is the target's own id, read off
+    // a foreign key of the parent. Its instances export the ids they probe
+    // (`correlates_by_row_id`), which they can only do for UUID values. Not
+    // when the parent's OWN id is the outer column — a 1:1 shared id, which
+    // the parent-identity link below routes, as it did before forward
+    // references were routed.
+    if !outer_is_parent_id
+        && schema
+            .get(&spec.table)
+            .and_then(|table| correlate_source(&table.columns, &spec.inner_column))
+            == Some(CorrelateSource::RowId)
+    {
+        return if outer_column_holds_ids(schema, parent_table, &spec.outer_column) {
+            TableLink::NestedByOwnId
+        } else {
+            TableLink::Unroutable
+        };
+    }
     // Only a parent-identity correlate lands in `held_by`; a value correlate
     // would need a per-column index over held rows, which no production
     // include shape asks for.
-    let outer = spec.outer_column.split('.').next_back().unwrap_or_default();
-    if !crate::query_manager::query::is_row_id_condition_column(outer) {
+    if !outer_is_parent_id {
         return TableLink::Unroutable;
     }
     schema
@@ -885,6 +955,24 @@ pub(super) fn note_empty_binding_bound() {
     EMPTY_BINDINGS_BOUND.with(|bound| bound.set(bound.get() + 1));
 }
 
+#[cfg(test)]
+thread_local! {
+    static INSTANCE_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Include instances evaluated on this thread so far, at any nesting depth. A
+/// gate reads the difference across one write and its settle; unlike
+/// `SUBQUERY_INSTANCE_EVALS` it is not blended with other running tests.
+#[cfg(test)]
+pub(crate) fn instance_evals_on_this_thread() -> u64 {
+    INSTANCE_EVALS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn note_instance_eval() {
+    INSTANCE_EVALS.with(|evals| evals.set(evals.get() + 1));
+}
+
 /// The whole per-node include-dirt state, boxed as one unit by
 /// `ArraySubqueryNode`.
 ///
@@ -909,6 +997,14 @@ pub(super) struct IncludeDirt {
     /// Cache slots proven empty. A key is here or in the node's
     /// `subgraph_cache`, never both.
     pub(super) empty: AHashMap<CacheKey, EmptyBinding>,
+    /// Rows an instance evicted at the capacity ceiling held when it went,
+    /// until its slot is filled again or its outer row is forgotten. The
+    /// eviction un-indexes the instance, which is safe for THIS node — its
+    /// outer row is never clean again, so `reevaluate_all` re-instantiates it —
+    /// but an ENCLOSING include routes by what this node exports, and without
+    /// these the instance holding this node would stop hearing about rows only
+    /// the evicted one scanned or probed.
+    pub(super) evicted_held: AHashMap<CacheKey, Vec<ObjectId>>,
 }
 
 #[cfg(test)]
@@ -1103,5 +1199,44 @@ mod tests {
         // A re-evaluation that drops one row must shrink the index, not leak.
         routing.set_held((parent, 0), &rows, &rows[..2]);
         assert_eq!(routing.tracked_rows(), 2);
+    }
+
+    /// A nested include read off the parent's OWN id with the target's own id
+    /// as inner column — a 1:1 shared id — routes by parent identity, as it did
+    /// before forward references were routed; a forward reference through a
+    /// UUID foreign key routes by the ids its instances probe; one through a
+    /// column that holds no UUIDs stays unroutable.
+    #[test]
+    fn a_nested_include_links_by_what_its_outer_column_holds() {
+        let mut schema = schema();
+        schema.insert(
+            TableName::new("profiles"),
+            RowDescriptor::new(vec![
+                ColumnDescriptor::new("bio", ColumnType::Text),
+                ColumnDescriptor::new("owner_ref", ColumnType::Text),
+            ])
+            .into(),
+        );
+        let nested = |inner: &str, outer: &str| {
+            let mut spec = ArraySubquerySpec::new("nested", TableName::new("profiles"));
+            spec.inner_column = inner.to_string();
+            spec.outer_column = outer.to_string();
+            nested_link(&schema, &spec, TableName::new("children"))
+        };
+        assert_eq!(
+            nested("id", "children.id"),
+            TableLink::NestedByParentId(CorrelateSource::RowId),
+            "a 1:1 shared id routes by parent identity"
+        );
+        assert_eq!(
+            nested("id", "children.parent_id"),
+            TableLink::NestedByOwnId,
+            "a forward reference through a UUID foreign key routes by its probed ids"
+        );
+        assert_eq!(
+            nested("id", "children.title"),
+            TableLink::Unroutable,
+            "a forward reference through a text column cannot export its probes"
+        );
     }
 }

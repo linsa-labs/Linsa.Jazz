@@ -65,6 +65,61 @@ pub static SUBSCRIPTIONS_SETTLED: AtomicU64 = AtomicU64::new(0);
 /// of array subqueries, which settle through the same function.
 pub static GRAPH_NODES_EVALUATED: AtomicU64 = AtomicU64::new(0);
 
+/// Of `GRAPH_NODES_EVALUATED`, the nodes a settle skip covered
+/// (`settle_skips`): skipped under `Skip`, run and checked under `Verify`. The
+/// difference is the work the skips did not remove.
+pub static GRAPH_NODES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Settle skips whose node, run anyway under `Verify`, emitted a delta from
+/// unchanged inputs: a node the `Skip` mode would have served wrong. Must stay
+/// zero; `JAZZ_SETTLE_SKIPS=verify` makes a release build count it.
+pub static SETTLE_SKIP_PARITY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Of `GRAPH_NODES_SKIPPED`, the nodes run and checked under `Verify` — what says a verify
+/// run verified: under `Skip` this stays zero while `GRAPH_NODES_SKIPPED` grows.
+pub static SETTLE_SKIPS_VERIFIED: AtomicU64 = AtomicU64::new(0);
+
+/// Nodes a skip covered on their inputs alone, found under `Verify` holding pending work of
+/// their own. The skip is sound only while every such state sets the node's dirty bit too;
+/// a debug build asserts it, `JAZZ_SETTLE_SKIPS=verify` makes a release build count it. Must
+/// stay zero.
+pub static SETTLE_SKIP_PENDING_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// [`GRAPH_NODES_SKIPPED`] and [`SETTLE_SKIPS_VERIFIED`] as this thread raised them, for a
+    /// unit test that compares the two while other tests settle on other threads.
+    pub(crate) static SKIPS_ON_THREAD: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+thread_local! {
+    /// Settle-skip violations of both kinds as this thread raised them. A settle runs on the
+    /// caller's thread, so the count moving across one subscription's settle names it.
+    static SETTLE_SKIP_VIOLATIONS_ON_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Settle-skip violations raised on this thread so far.
+pub(crate) fn settle_skip_violations_on_thread() -> u64 {
+    SETTLE_SKIP_VIOLATIONS_ON_THREAD.with(std::cell::Cell::get)
+}
+
+/// Count a settle-skip violation of `counter`'s kind, process-wide and on this thread.
+pub(crate) fn note_settle_skip_violation(counter: &AtomicU64) {
+    bump(counter);
+    SETTLE_SKIP_VIOLATIONS_ON_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+/// `Project`/`Output` passes that updated their ordered list in place
+/// (`ordered_in_place`) instead of rebuilding it — under `Verify`, the passes
+/// that would have.
+pub static ORDERED_IN_PLACE: AtomicU64 = AtomicU64::new(0);
+
+/// In-place updates that, checked under `Verify`, differed from the rebuild.
+/// Must stay zero.
+pub static ORDERED_IN_PLACE_PARITY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Cached array-subquery instances (re-)evaluated —
 /// `ArraySubqueryNode::evaluate_subgraph_for_single` calls. This is the (a) of
 /// the split: work proportional to the number of live include instances rather
@@ -424,6 +479,10 @@ fn micros_of(elapsed: Duration) -> u64 {
 pub struct SettleCounts {
     pub subscriptions: u64,
     pub graph_nodes: u64,
+    pub graph_nodes_skipped: u64,
+    pub settle_skip_parity_violations: u64,
+    pub settle_skips_verified: u64,
+    pub settle_skip_pending_violations: u64,
     pub instance_evals: u64,
     pub subquery_instantiations: u64,
     pub empty_bindings: u64,
@@ -472,6 +531,10 @@ impl SettleCounts {
         Self {
             subscriptions: SUBSCRIPTIONS_SETTLED.load(Ordering::Relaxed),
             graph_nodes: GRAPH_NODES_EVALUATED.load(Ordering::Relaxed),
+            graph_nodes_skipped: GRAPH_NODES_SKIPPED.load(Ordering::Relaxed),
+            settle_skip_parity_violations: SETTLE_SKIP_PARITY_VIOLATIONS.load(Ordering::Relaxed),
+            settle_skips_verified: SETTLE_SKIPS_VERIFIED.load(Ordering::Relaxed),
+            settle_skip_pending_violations: SETTLE_SKIP_PENDING_VIOLATIONS.load(Ordering::Relaxed),
             instance_evals: SUBQUERY_INSTANCE_EVALS.load(Ordering::Relaxed),
             subquery_instantiations: SUBQUERY_INSTANTIATIONS.load(Ordering::Relaxed),
             empty_bindings: EMPTY_BINDINGS.load(Ordering::Relaxed),
@@ -518,6 +581,18 @@ impl SettleCounts {
         Self {
             subscriptions: self.subscriptions.saturating_sub(base.subscriptions),
             graph_nodes: self.graph_nodes.saturating_sub(base.graph_nodes),
+            graph_nodes_skipped: self
+                .graph_nodes_skipped
+                .saturating_sub(base.graph_nodes_skipped),
+            settle_skip_parity_violations: self
+                .settle_skip_parity_violations
+                .saturating_sub(base.settle_skip_parity_violations),
+            settle_skips_verified: self
+                .settle_skips_verified
+                .saturating_sub(base.settle_skips_verified),
+            settle_skip_pending_violations: self
+                .settle_skip_pending_violations
+                .saturating_sub(base.settle_skip_pending_violations),
             instance_evals: self.instance_evals.saturating_sub(base.instance_evals),
             subquery_instantiations: self
                 .subquery_instantiations
@@ -643,8 +718,15 @@ impl Drop for SettlePass {
         tracing::info!(
             target: "jazz::settle_cost",
             micros,
+            // Read where the pass is logged, so a stand run whose mode line was filtered out
+            // before the first settle still shows which mode it ran.
+            settle_skips_mode = ?crate::query_manager::settle_skips::settle_skip_mode(),
             subscriptions = cost.subscriptions,
             graph_nodes = cost.graph_nodes,
+            graph_nodes_skipped = cost.graph_nodes_skipped,
+            settle_skip_parity_violations = cost.settle_skip_parity_violations,
+            settle_skips_verified = cost.settle_skips_verified,
+            settle_skip_pending_violations = cost.settle_skip_pending_violations,
             instance_evals = cost.instance_evals,
             subquery_instantiations = cost.subquery_instantiations,
             empty_bindings = cost.empty_bindings,

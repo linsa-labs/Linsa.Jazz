@@ -12,8 +12,15 @@
 
 use super::*;
 use crate::query_manager::declared_index::load_record;
+use crate::query_manager::graph_nodes::include_routing::{
+    force_include_empty_probe, force_include_routing,
+};
 use crate::query_manager::graph_nodes::output::QuerySubscriptionId;
 use crate::query_manager::index_declarations::{IndexDeclarations, IndexPhase, IndexState};
+use crate::query_manager::precise_dirty::force_precise_dirty;
+use crate::query_manager::settle_cost::settle_skip_violations_on_thread;
+use crate::query_manager::settle_skips::{force_settle_skips, force_settle_skips_verify};
+use crate::query_manager::types::TableSchemaBuilder;
 use crate::storage::SqliteStorage;
 
 const CHAT_ROWS: u64 = 2_500;
@@ -841,4 +848,273 @@ fn a_released_engine_whose_open_failed_is_released_once_the_record_reads() {
     let search = qm.subscribe(search_query(&qm, chat)).expect("search");
     qm.process(&mut storage);
     assert_exact(&qm, page, search, &rows, chat, "on a released engine");
+}
+
+/// The wmsgs table, and reactions an include reads under each message.
+fn flip_schema() -> Schema {
+    let mut schema = fill_schema();
+    let (name, table) = TableSchemaBuilder::new("wreacts")
+        .fk_column("msg", "wmsgs")
+        .build_named();
+    schema.insert(name, table);
+    schema
+}
+
+/// How the settle skips run in a flip gate.
+#[derive(Clone, Copy, Debug)]
+enum Skips {
+    On,
+    Off,
+    /// Every skip is run anyway and checked against what it skipped: a node skipped wrongly
+    /// fails the pass that skipped it, with the node named.
+    Verify,
+}
+
+/// Which branches a flip gate reads, in the order the query names them.
+#[derive(Clone, Copy, Debug)]
+enum Branches {
+    Main,
+    /// A second, empty branch after the one that flips, so the scans meet in a `Union`.
+    MainThenDraft,
+    /// The empty branch first, the order a schema rollout gives (current branch, then the
+    /// older ones): the flipping scan is not the `Union`'s first input.
+    DraftThenMain,
+}
+
+/// A window that settled on the first column's own index before its declared index
+/// completed holds the whole scope. Nothing marks the completion, so the scan learns of it
+/// on its next full scan, and under a local overlay a CLEAN scan rescans whenever anything
+/// after it settles: a write to an include's inner table alone. That rescan flips to the
+/// window and reports every row past it removed, while the nodes between the scan and the
+/// include are clean. They must still take that delta (the input-emptiness rule of the settle
+/// skips, `graph/execute.rs`): a Sort that kept the scope would hold rows the window no longer
+/// reports, and serve one that has left the scope once the page grows to it. SQLite, a fill
+/// over several passes, a page with an include, a reader at a tier while own writes are
+/// pending (the app's read path).
+///
+/// With a second, empty branch the scans meet in a `Union` that sees one input change and the
+/// other not. `flips_back` then restarts the index, as another runtime over the same store
+/// does: the clean scan falls back to the whole chat and reports rows ADDED, and the page must
+/// still follow rows that leave. The page is checked after every row that leaves: a lost delta
+/// can heal before the last one.
+fn a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+    skips: Skips,
+    branches: Branches,
+    flips_back: bool,
+) {
+    let _precise = force_precise_dirty(true);
+    let _routing = force_include_routing(true);
+    let _empty_probe = force_include_empty_probe(true);
+    let _skips = match skips {
+        Skips::On => force_settle_skips(true),
+        Skips::Off => force_settle_skips(false),
+        Skips::Verify => force_settle_skips_verify(),
+    };
+    let mut qm = QueryManager::new(SyncManager::new());
+    qm.set_current_schema(flip_schema(), "dev", "main");
+    let mut storage = SqliteStorage::open(":memory:").expect("in-memory sqlite storage");
+    crate::test_support::persist_test_schema(&mut storage, &qm.schema_context().current_schema);
+
+    let (chat, other) = (ObjectId::new(), ObjectId::new());
+    let mut rows = seed(&mut qm, &mut storage, chat, other);
+    assert!(
+        !qm.pending_local_row_batches.is_empty(),
+        "fixture: the seeded rows are own writes nothing confirmed, so the overlay is in play"
+    );
+    let mut query = qm
+        .query("wmsgs")
+        .filter_eq("chat", Value::Uuid(chat))
+        .order_by_desc("at")
+        .limit(PAGE)
+        .with_array("reacts", |sub| {
+            sub.from("wreacts").correlate("msg", "wmsgs.id")
+        });
+    let (main, draft) = (get_branch(&qm), get_branch_for_user_branch(&qm, "draft"));
+    match branches {
+        Branches::Main => {}
+        Branches::MainThenDraft => query = query.branches(&[main.as_str(), draft.as_str()]),
+        Branches::DraftThenMain => query = query.branches(&[draft.as_str(), main.as_str()]),
+    }
+    let page = qm
+        .subscribe_with_sync(query.build(), None, Some(DurabilityTier::EdgeServer))
+        .expect("subscribe page");
+    qm.process(&mut storage);
+    let label = format!("({skips:?}, {branches:?}, flips back {flips_back})");
+    // A wrong skip under Verify panics only in a debug build; the count holds in any build.
+    let violations_before = settle_skip_violations_on_thread();
+    let check = |qm: &QueryManager, rows: &[Row], when: &str| -> usize {
+        let (got, scanned) = read(qm, page);
+        assert_eq!(got, expected_page(rows, chat), "the page {when} {label}");
+        assert_eq!(
+            settle_skip_violations_on_thread(),
+            violations_before,
+            "a settle skip was wrong {when} {label}"
+        );
+        scanned
+    };
+    // Only the include's inner table is written, so the scans stay clean: what this gate is
+    // about is a clean scan's rescan, not a marked one's.
+    let react_to_newest = |qm: &mut QueryManager, storage: &mut SqliteStorage, rows: &[Row]| {
+        let newest = expected_page(rows, chat)[0];
+        qm.insert(storage, "wreacts", &[Value::Uuid(newest)])
+            .expect("insert reaction");
+        assert!(
+            qm.subscriptions[&page]
+                .graph
+                .index_scans_hold_exact_baselines(),
+            "fixture: the page's scans are clean when they rescan under the overlay"
+        );
+        qm.process(storage);
+    };
+    check(&qm, &rows, "before the declaration");
+
+    qm.propose_index_declarations(wmsgs_index_declarations());
+    qm.process(&mut storage);
+    let scanned = check(&qm, &rows, "once declared");
+    assert!(
+        scanned >= CHAT_ROWS as usize,
+        "fixture: until the fill completes the window holds the chat, scanned {scanned}"
+    );
+    let mut steps = 0;
+    while qm.has_declared_index_work() {
+        steps += 1;
+        assert!(steps < 100, "the fill never completed");
+        qm.process(&mut storage);
+    }
+    assert!(
+        steps >= 2,
+        "fixture: the fill ran over several passes: {steps}"
+    );
+    let (_, scanned) = read(&qm, page);
+    assert!(
+        scanned >= CHAT_ROWS as usize,
+        "fixture: nothing marked the completion, so the window still holds the chat, \
+         scanned {scanned}"
+    );
+
+    react_to_newest(&mut qm, &mut storage, &rows);
+    let scanned = check(&qm, &rows, "after a reaction");
+    assert!(
+        scanned <= 3 * PAGE,
+        "precondition: the clean scan rescanned under the overlay and flipped to its \
+         window, scanned {scanned}"
+    );
+
+    if flips_back {
+        // Another runtime restarts the index; nothing here marks that either.
+        let mut record = load_record(&storage).expect("record");
+        let incarnation = record.next_incarnation;
+        record.next_incarnation += 1;
+        record.states.insert(
+            ("wmsgs".to_string(), "chat+at".to_string()),
+            IndexState {
+                incarnation,
+                phase: IndexPhase::Clearing { after: None },
+            },
+        );
+        crate::query_manager::declared_index::replace(&mut storage, &record).expect("restart");
+        react_to_newest(&mut qm, &mut storage, &rows);
+        let scanned = check(&qm, &rows, "after the index started over");
+        assert!(
+            scanned >= CHAT_ROWS as usize,
+            "precondition: the clean scan rescanned under the overlay and fell back to the \
+             whole chat, scanned {scanned}"
+        );
+    }
+
+    // A row past the window leaves the chat, then the newest rows do, one by one, until the
+    // page has grown past where that row stood.
+    let mut by_age: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].chat == chat).collect();
+    by_age.sort_by(|&left, &right| rows[right].at.cmp(&rows[left].at));
+    let mut left = 0;
+    let mut leave = |qm: &mut QueryManager, storage: &mut SqliteStorage, index: usize| {
+        rows[index].chat = other;
+        qm.update(storage, rows[index].id, &values(&rows[index]))
+            .expect("move the row out of the chat");
+        qm.process(storage);
+        left += 1;
+        check(qm, &rows, &format!("after {left} rows left the chat"));
+    };
+    leave(&mut qm, &mut storage, by_age[3 * PAGE]);
+    if flips_back {
+        assert!(
+            qm.has_declared_index_work(),
+            "fixture: rows leave while the restarted index is still filling {label}"
+        );
+    }
+    for &index in by_age.iter().take(3 * PAGE) {
+        leave(&mut qm, &mut storage, index);
+    }
+    let (got, _) = read(&qm, page);
+    let mut want: Vec<&Row> = rows.iter().filter(|row| row.chat == chat).collect();
+    want.sort_by(|left, right| right.at.cmp(&left.at));
+    let want: Vec<ObjectId> = want.into_iter().take(PAGE).map(|row| row.id).collect();
+    assert_eq!(
+        got, want,
+        "the page grown past a row that left the chat {label}"
+    );
+}
+
+#[test]
+fn a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows_with_skips() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::On,
+        Branches::Main,
+        false,
+    );
+}
+
+#[test]
+fn a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows_without_skips() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::Off,
+        Branches::Main,
+        false,
+    );
+}
+
+#[test]
+fn a_window_over_two_branches_that_flips_under_an_overlay_keeps_its_rows() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::On,
+        Branches::MainThenDraft,
+        false,
+    );
+}
+
+#[test]
+fn a_window_that_flips_back_when_its_index_starts_over_keeps_its_rows() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::On,
+        Branches::Main,
+        true,
+    );
+}
+
+#[test]
+fn a_window_that_flips_both_ways_over_two_branches_keeps_its_rows_without_skips() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::Off,
+        Branches::MainThenDraft,
+        true,
+    );
+}
+
+#[test]
+fn a_window_that_flips_both_ways_over_two_branches_skips_nothing_wrongly_under_verify() {
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::Verify,
+        Branches::MainThenDraft,
+        true,
+    );
+}
+
+#[test]
+fn a_window_that_flips_both_ways_over_two_branches_empty_first_skips_nothing_wrongly_under_verify()
+{
+    a_window_that_flips_to_its_declared_index_under_an_overlay_keeps_its_rows(
+        Skips::Verify,
+        Branches::DraftThenMain,
+        true,
+    );
 }

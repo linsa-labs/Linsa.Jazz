@@ -7,7 +7,10 @@ use crate::query_manager::types::{
     Row, RowDelta, RowDescriptor, Tuple, TupleDelta, TupleDescriptor, Value,
 };
 
-use super::{RowNode, tuple_delta::compute_tuple_delta};
+use super::{
+    RowNode,
+    tuple_delta::{compute_tuple_delta, has_tuple_content_changed},
+};
 
 /// Output mode for query results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +49,10 @@ pub struct OutputNode {
     /// True if subscriber has received initial snapshot.
     subscriber_initialized: bool,
     dirty: bool,
+    /// Passes this node took the in-place path in, for tests that must tell it from an
+    /// include instance's.
+    #[cfg(test)]
+    pub(crate) applied_in_place: usize,
 }
 
 impl OutputNode {
@@ -66,6 +73,8 @@ impl OutputNode {
             pending_tuple_deltas: Vec::new(),
             subscriber_initialized: false,
             dirty: true,
+            #[cfg(test)]
+            applied_in_place: 0,
         }
     }
 
@@ -100,6 +109,21 @@ impl OutputNode {
             .iter()
             .filter_map(|row| decode_row(&self.descriptor, &row.data).ok())
             .collect()
+    }
+
+    /// Whether this output has delivered its first list. Until it has, an
+    /// empty input delta is no proof the list is current (see
+    /// `query_manager::settle_skips`).
+    pub(crate) fn has_materialized(&self) -> bool {
+        self.subscriber_initialized
+    }
+
+    /// Whether this output's list can be updated in place: it has materialized, and it holds
+    /// no id twice. A duplicate is reported as moved by every rebuild (`compute_tuple_delta`
+    /// keeps the last position of an id), which no in-place update reproduces. The set is keyed
+    /// by ids, so it is shorter than the list exactly then.
+    pub(crate) fn can_update_in_place(&self) -> bool {
+        self.has_materialized() && self.current_tuples.len() == self.ordered_tuples.len()
     }
 
     /// Ordered tuples as received from upstream nodes.
@@ -147,8 +171,34 @@ impl OutputNode {
         }
     }
 
+    /// The update-only pass of `process_with_ordered_input` when the ordered input kept
+    /// the list's ids: replace the updated tuples where they stand.
+    pub(crate) fn apply_in_place(&mut self, updates: Vec<(usize, Tuple)>) -> TupleDelta {
+        #[cfg(test)]
+        {
+            self.applied_in_place += 1;
+        }
+        let mut delta = TupleDelta::new();
+        for (position, new) in updates {
+            let old = std::mem::replace(&mut self.ordered_tuples[position], new.clone());
+            self.current_tuples.replace(new.clone());
+            if has_tuple_content_changed(&old, &new) {
+                delta.updated.push((old, new));
+            }
+        }
+        self.apply_delta_to_scope(&delta);
+        self.dirty = false;
+        self.subscriber_initialized = true;
+        if !delta.is_empty() {
+            self.pending_tuple_deltas.push(delta.clone());
+        }
+        delta
+    }
+
     /// Rebuild ordered output from a full ordered upstream input.
     pub fn process_with_ordered_input(&mut self, ordered_tuples: &[Tuple]) -> TupleDelta {
+        #[cfg(test)]
+        crate::query_manager::ordered_in_place::note_rebuilt_tuples(ordered_tuples.len());
         let delta = if self.ordered_tuples.is_empty() {
             TupleDelta {
                 added: ordered_tuples.to_vec(),
@@ -323,6 +373,128 @@ mod tests {
         let deltas = node.take_tuple_deltas();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].added.len(), 1);
+    }
+
+    // Scenario: a list that holds one id twice (a join that emitted the same pair twice) is
+    // never updated in place: every rebuild reports the duplicate as moved.
+    #[test]
+    fn a_list_holding_one_id_twice_is_never_updated_in_place() {
+        let mut node = make_output_node(OutputMode::Delta);
+        let (a, b) = (ObjectId::new(), ObjectId::new());
+        node.process_with_ordered_input(&[make_tuple(a, 1, "Alice"), make_tuple(b, 2, "Bob")]);
+        assert!(
+            node.can_update_in_place(),
+            "fixture: a materialized list of distinct ids can"
+        );
+
+        node.process_with_ordered_input(&[
+            make_tuple(a, 1, "Alice"),
+            make_tuple(a, 1, "Alicia"),
+            make_tuple(b, 2, "Bob"),
+        ]);
+
+        assert!(!node.can_update_in_place());
+    }
+
+    // Scenario: an in-place pass replaces the tuples where they stand, in both of the
+    // node's views, and reports only the ones whose content changed.
+    //
+    // ASCII:
+    // ordered:   [id1 -> (1, "Alice"), id2 -> (2, "Bob")]
+    // in place:  [0 -> (1, "Alice") unchanged, 1 -> (2, "Robert")]
+    // delta:     updated [id2]
+    #[test]
+    fn in_place_updates_both_views_and_reports_only_changed_tuples() {
+        let mut node = make_output_node(OutputMode::Delta);
+        let (id1, id2) = (ObjectId::new(), ObjectId::new());
+        node.process_with_ordered_input(&[make_tuple(id1, 1, "Alice"), make_tuple(id2, 2, "Bob")]);
+        node.take_tuple_deltas();
+
+        let renamed = make_tuple(id2, 2, "Robert");
+        let delta =
+            node.apply_in_place(vec![(0, make_tuple(id1, 1, "Alice")), (1, renamed.clone())]);
+
+        assert!(delta.added.is_empty() && delta.removed.is_empty() && delta.moved.is_empty());
+        let updated: Vec<_> = delta
+            .updated
+            .iter()
+            .map(|(_, new)| new.first_id())
+            .collect();
+        assert_eq!(
+            updated,
+            vec![Some(id2)],
+            "only the renamed tuple is reported"
+        );
+        assert_eq!(
+            node.ordered_tuples()[1].get(0).and_then(|e| e.content()),
+            renamed.get(0).and_then(|e| e.content())
+        );
+        let held = node
+            .current_tuples()
+            .get(&renamed)
+            .expect("the renamed tuple is held");
+        assert_eq!(
+            held.get(0).and_then(|e| e.content()),
+            renamed.get(0).and_then(|e| e.content()),
+            "the unordered view holds the new content"
+        );
+        assert_eq!(node.take_tuple_deltas().len(), 1);
+    }
+
+    // Scenario: an in-place pass over a tuple whose data is as it was but whose provenance
+    // moved to another branch (a writer on a second live schema branch, its values lens-equal)
+    // reports it, and the sync scope follows it.
+    //
+    // ASCII:
+    // ordered:   [id -> (1, "Alice") from a]
+    // in place:  [0 -> (1, "Alice") from b]
+    // delta:     updated [id]; scope {(id, a)} -> {(id, b)}
+    #[test]
+    fn in_place_reports_a_provenance_only_change_and_moves_the_scope() {
+        let mut node = make_output_node(OutputMode::Delta);
+        let id = ObjectId::new();
+        let (a, b) = (BranchName::new("a"), BranchName::new("b"));
+        let from = |branch: BranchName| {
+            make_tuple(id, 1, "Alice").with_provenance([(id, branch)].into_iter().collect())
+        };
+        node.process_with_ordered_input(&[from(a)]);
+        node.take_tuple_deltas();
+        assert!(node.sync_scope().contains(&(id, a)), "fixture");
+
+        let delta = node.apply_in_place(vec![(0, from(b))]);
+
+        assert_eq!(
+            delta.updated.len(),
+            1,
+            "a provenance-only change is an update"
+        );
+        assert!(node.sync_scope().contains(&(id, b)));
+        assert!(!node.sync_scope().contains(&(id, a)));
+    }
+
+    // Scenario: an in-place pass over a tuple whose only change is its batch provenance (a
+    // nested row rewritten as it was) reports it.
+    #[test]
+    fn in_place_reports_a_batch_provenance_only_change() {
+        let mut node = make_output_node(OutputMode::Delta);
+        let id = ObjectId::new();
+        let in_batch = |byte: u8| {
+            make_tuple(id, 1, "Alice").with_batch_provenance(
+                [crate::row_histories::BatchId([byte; 16])]
+                    .into_iter()
+                    .collect(),
+            )
+        };
+        node.process_with_ordered_input(&[in_batch(1)]);
+        node.take_tuple_deltas();
+
+        let delta = node.apply_in_place(vec![(0, in_batch(2))]);
+
+        assert_eq!(delta.updated.len(), 1, "a batch-only change is an update");
+        assert_eq!(
+            node.ordered_tuples()[0].batch_provenance(),
+            in_batch(2).batch_provenance()
+        );
     }
 
     // Scenario: current rows decode to user values.

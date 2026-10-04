@@ -586,9 +586,9 @@ impl HotRow {
             RowProvenance::for_insert(AUTHOR.to_string(), ts)
         } else {
             RowProvenance {
-                created_by: AUTHOR.to_string(),
+                created_by: AUTHOR.into(),
                 created_at: 1_000,
-                updated_by: AUTHOR.to_string(),
+                updated_by: AUTHOR.into(),
                 updated_at: ts,
             }
         };
@@ -660,9 +660,9 @@ impl HotRow {
             RowProvenance::for_insert(AUTHOR.to_string(), ts)
         } else {
             RowProvenance {
-                created_by: AUTHOR.to_string(),
+                created_by: AUTHOR.into(),
                 created_at: 1_000,
-                updated_by: AUTHOR.to_string(),
+                updated_by: AUTHOR.into(),
                 updated_at: ts,
             }
         };

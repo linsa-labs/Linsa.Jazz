@@ -198,6 +198,11 @@ impl MagicColumnsNode {
         self.dependency_dirty = true;
     }
 
+    /// A dependency change waiting for the next run.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.dependency_dirty
+    }
+
     pub fn process_with_context(
         &mut self,
         input: TupleDelta,
@@ -388,9 +393,9 @@ impl MagicColumnsNode {
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     ) -> Value {
         match kind {
-            MagicColumnKind::CreatedBy => Value::Text(row.provenance.created_by.clone()),
+            MagicColumnKind::CreatedBy => Value::Text(row.provenance.created_by.to_string()),
             MagicColumnKind::CreatedAt => Value::Timestamp(row.provenance.created_at),
-            MagicColumnKind::UpdatedBy => Value::Text(row.provenance.updated_by.clone()),
+            MagicColumnKind::UpdatedBy => Value::Text(row.provenance.updated_by.to_string()),
             MagicColumnKind::UpdatedAt => Value::Timestamp(row.provenance.updated_at),
             MagicColumnKind::CanRead | MagicColumnKind::CanEdit | MagicColumnKind::CanDelete => {
                 let Some(session) = self.session.as_ref() else {

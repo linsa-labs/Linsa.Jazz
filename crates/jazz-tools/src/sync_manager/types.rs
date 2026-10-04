@@ -516,6 +516,21 @@ pub struct ClientState {
     pub sent_batch_ids: HashMap<(ObjectId, BranchName), SentBatchIds>,
     /// Row IDs for which we've sent metadata.
     pub sent_metadata: HashSet<ObjectId>,
+    /// Batches of rows that entered this client's scope with a settled fate, each with the
+    /// highest settlement target that fate meets (a rejection meets every target). The scope
+    /// prune reads this instead of loading the fate again when the rows leave, and takes the
+    /// entry out. Any later fate sent to the client for the same batch takes the entry out too:
+    /// the stored fate has moved since, and the prune reads it again.
+    ///
+    /// A cache, never the only record: a missing entry costs one fate load. So an entry the
+    /// prune could no longer reach goes as soon as it is unreachable: a row queued to the client
+    /// takes out the batches it supersedes, the same ones `SentBatchIds::record_delivery` drops
+    /// from the delivered frontier, and the batch of an unconfirmed offer it replaces (on the
+    /// durable stores, which load a row without its parents, that is the exit). Past
+    /// [`MAX_SETTLED_FATES_SENT`] the whole map is dropped.
+    ///
+    /// [`MAX_SETTLED_FATES_SENT`]: super::MAX_SETTLED_FATES_SENT
+    pub settled_fates_sent: HashMap<BatchId, DurabilityTier>,
     /// Whether this client confirms the rows it applies.
     ///
     /// Negotiated in the handshake, so it is known before the client subscribes. A client

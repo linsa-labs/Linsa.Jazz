@@ -191,9 +191,9 @@ fn add_row_commit(
         RowProvenance::for_insert(author.clone(), timestamp)
     } else {
         RowProvenance {
-            created_by: author.clone(),
+            created_by: author.clone().into(),
             created_at: 1_000,
-            updated_by: author.clone(),
+            updated_by: author.clone().into(),
             updated_at: timestamp,
         }
     };
