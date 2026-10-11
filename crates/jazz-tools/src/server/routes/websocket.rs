@@ -11,7 +11,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::middleware::auth::{extract_session, validate_admin_secret, validate_backend_secret};
+use crate::middleware::auth::{
+    KEYS_UNAVAILABLE_MESSAGE, SessionError, extract_session, validate_admin_secret,
+    validate_backend_secret,
+};
 use crate::server::{ConnectionState, ServerState};
 use crate::sync_manager::ClientId;
 
@@ -63,6 +66,23 @@ pub(super) enum WsClientSetup {
     Session(crate::query_manager::session::Session),
 }
 
+/// Why a WS handshake got no connection.
+#[derive(Debug)]
+pub(super) enum WsAuthError {
+    /// The credentials were refused. The client stops reconnecting until it is
+    /// handed new ones.
+    Refused(String),
+    /// The credentials could not be checked yet. Sent as a retryable error: a
+    /// refusal would park a client whose token is fine.
+    KeysUnavailable,
+}
+
+impl From<String> for WsAuthError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
 /// Authenticate a WebSocket `AuthHandshake`.
 ///
 /// Priority is:
@@ -70,13 +90,13 @@ pub(super) enum WsClientSetup {
 /// 2. `backend_secret` present + no session header → `WsClientSetup::Backend`
 /// 3. Otherwise → `extract_session` → `WsClientSetup::Session`
 ///
-/// Returns `Err(message)` on auth failure; the caller should send a
+/// Returns `Err` on auth failure; the caller should send a
 /// `ServerEvent::Error` frame before closing.
 pub(super) async fn authenticate_ws_handshake(
     handshake: &crate::transport_manager::AuthHandshake,
     request_headers: &HeaderMap,
     state: &Arc<ServerState>,
-) -> Result<WsClientSetup, String> {
+) -> Result<WsClientSetup, WsAuthError> {
     use axum::http::HeaderValue;
     use base64::Engine as _;
 
@@ -141,7 +161,12 @@ pub(super) async fn authenticate_ws_handshake(
         state.jwt_verifier.as_deref(),
     )
     .await
-    .map_err(|e| serde_json::to_string(&e).unwrap_or_else(|_| "authentication failed".into()))?;
+    .map_err(|error| match error {
+        SessionError::Unauthenticated(e) => WsAuthError::Refused(
+            serde_json::to_string(&e).unwrap_or_else(|_| "authentication failed".into()),
+        ),
+        SessionError::KeysUnavailable => WsAuthError::KeysUnavailable,
+    })?;
 
     let session =
         session.ok_or_else(|| "Session required. Provide JWT or backend secret.".to_string())?;
@@ -426,8 +451,18 @@ async fn handle_ws_connection(
     let setup = tokio::select! {
         auth = authenticate_ws_handshake(&handshake, &request_headers, &state) => match auth {
             Ok(s) => s,
-            Err(msg) => {
+            Err(WsAuthError::Refused(msg)) => {
                 send_ws_error(&mut socket, &msg).await;
+                let _ = socket.close().await;
+                return;
+            }
+            Err(WsAuthError::KeysUnavailable) => {
+                send_ws_error_with_code(
+                    &mut socket,
+                    crate::jazz_transport::ErrorCode::Internal,
+                    KEYS_UNAVAILABLE_MESSAGE,
+                )
+                .await;
                 let _ = socket.close().await;
                 return;
             }

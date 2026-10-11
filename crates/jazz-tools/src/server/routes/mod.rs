@@ -550,6 +550,9 @@ mod tests {
             .await
             .expect_err("deceptive localhost cookie auth should fail");
 
+        let WsAuthError::Refused(error) = error else {
+            panic!("cookie auth from a foreign origin must be refused, got {error:?}");
+        };
         assert!(error.to_lowercase().contains("origin"));
     }
 
@@ -594,6 +597,9 @@ mod tests {
             .await
             .expect_err("cross-origin cookie auth should fail");
 
+        let WsAuthError::Refused(error) = error else {
+            panic!("cookie auth from a foreign origin must be refused, got {error:?}");
+        };
         assert!(error.to_lowercase().contains("origin"));
     }
 

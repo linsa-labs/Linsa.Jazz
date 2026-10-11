@@ -58,6 +58,11 @@ const JWKS_FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 /// refused and the fetch error propagates.
 pub const JWKS_MAX_STALE: Duration = Duration::from_secs(300);
 
+/// How long a failed JWKS fetch answers for the fetches after it. While the
+/// endpoint is down every handshake asks for keys, and each fetch can wait out
+/// its own timeout.
+const JWKS_FAILED_FETCH_HOLD: Duration = Duration::from_secs(1);
+
 // ============================================================================
 // Auth Configuration
 // ============================================================================
@@ -209,6 +214,9 @@ pub enum JwtError {
     Expired,
     /// Invalid token format or signature.
     Invalid(String),
+    /// The keys that verify the token could not be fetched, so it was not
+    /// checked. Nothing is known to be wrong with it.
+    KeysUnavailable,
 }
 
 impl std::fmt::Display for JwtError {
@@ -217,6 +225,7 @@ impl std::fmt::Display for JwtError {
             JwtError::NoKeyConfigured => write!(f, "No JWT validation key configured"),
             JwtError::Expired => write!(f, "JWT has expired"),
             JwtError::Invalid(msg) => write!(f, "Invalid JWT: {}", msg),
+            JwtError::KeysUnavailable => write!(f, "JWT keys unavailable"),
         }
     }
 }
@@ -254,6 +263,18 @@ pub struct JwksCache {
     max_stale: Duration,
     cached: RwLock<Option<CachedJwksEntry>>,
     last_forced_refresh_us: AtomicU64,
+    /// Held while fetching, so one fetch runs at a time; holds the last failed
+    /// fetch for `JWKS_FAILED_FETCH_HOLD`.
+    fetching: tokio::sync::Mutex<Option<FailedFetch>>,
+    /// Counts the keysets stored, so a caller that waited for `fetching` can
+    /// tell whether another caller fetched meanwhile.
+    fetches: AtomicU64,
+}
+
+struct FailedFetch {
+    /// Monotonic: a wall clock stepped back must not stretch the hold.
+    at: std::time::Instant,
+    error: String,
 }
 
 impl JwksCache {
@@ -270,6 +291,8 @@ impl JwksCache {
             max_stale,
             cached: RwLock::new(None),
             last_forced_refresh_us: AtomicU64::new(0),
+            fetching: tokio::sync::Mutex::new(None),
+            fetches: AtomicU64::new(0),
         }
     }
 
@@ -288,6 +311,8 @@ impl JwksCache {
                 set: jwks,
             })),
             last_forced_refresh_us: AtomicU64::new(0),
+            fetching: tokio::sync::Mutex::new(None),
+            fetches: AtomicU64::new(0),
         }
     }
 
@@ -298,6 +323,9 @@ impl JwksCache {
     /// prevents unauthenticated callers from using fabricated key IDs to
     /// trigger unbounded outbound fetches.
     pub async fn load(&self, force_refresh: bool) -> Result<JwkSet, String> {
+        // Read before anything else: a fetch that lands after this point, even before
+        // the cache check below, is one this caller need not repeat.
+        let fetches_before = self.fetches.load(Ordering::SeqCst);
         let ttl_us = self.ttl.as_micros().min(u128::from(u64::MAX)) as u64;
         let cooldown_us = JWKS_FORCED_REFRESH_COOLDOWN
             .as_micros()
@@ -322,32 +350,36 @@ impl JwksCache {
             }
         }
 
-        let max_stale_us = (self.ttl + self.max_stale)
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
+        // One fetch at a time: a burst of handshakes while the endpoint is down
+        // would otherwise send one request each.
+        let mut failed = self.fetching.lock().await;
+        if self.fetches.load(Ordering::SeqCst) != fetches_before {
+            // Fetched while this caller waited.
+            let guard = self.cached.read().await;
+            if let Some(ref entry) = *guard
+                && entry.endpoint == self.endpoint
+            {
+                return Ok(entry.set.clone());
+            }
+        }
+        if let Some(ref failure) = *failed
+            && failure.at.elapsed() <= JWKS_FAILED_FETCH_HOLD
+        {
+            let error = failure.error.clone();
+            return self.stale_or(error).await;
+        }
 
         let jwks = match fetch_jwks(&self.http_client, &self.endpoint).await {
             Ok(jwks) => jwks,
             Err(e) => {
-                // Stale-if-error: serve the cached keyset if it's not too old.
-                let guard = self.cached.read().await;
-                if let Some(ref entry) = *guard {
-                    let age_us = now_timestamp_us().saturating_sub(entry.fetched_at_us);
-                    if age_us <= max_stale_us {
-                        warn!(
-                            error = %e,
-                            "JWKS fetch failed, serving stale cached keyset"
-                        );
-                        return Ok(entry.set.clone());
-                    }
-                    warn!(
-                        error = %e,
-                        "JWKS fetch failed and stale keyset has expired"
-                    );
-                }
-                return Err(e);
+                *failed = Some(FailedFetch {
+                    at: std::time::Instant::now(),
+                    error: e.clone(),
+                });
+                return self.stale_or(e).await;
             }
         };
+        *failed = None;
 
         let now = now_timestamp_us();
         if force_refresh {
@@ -359,8 +391,32 @@ impl JwksCache {
             fetched_at_us: now,
             set: jwks.clone(),
         });
+        self.fetches.fetch_add(1, Ordering::SeqCst);
 
         Ok(jwks)
+    }
+
+    /// Stale-if-error: the cached keyset if it is not too old, else the error.
+    async fn stale_or(&self, e: String) -> Result<JwkSet, String> {
+        let max_stale_us = (self.ttl + self.max_stale)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        let guard = self.cached.read().await;
+        if let Some(ref entry) = *guard {
+            let age_us = now_timestamp_us().saturating_sub(entry.fetched_at_us);
+            if age_us <= max_stale_us {
+                warn!(
+                    error = %e,
+                    "JWKS fetch failed, serving stale cached keyset"
+                );
+                return Ok(entry.set.clone());
+            }
+            warn!(
+                error = %e,
+                "JWKS fetch failed and stale keyset has expired"
+            );
+        }
+        Err(e)
     }
 }
 
@@ -588,6 +644,10 @@ impl FromRequestParts<Arc<ServerState>> for JwtAuth {
                 Err((StatusCode::UNAUTHORIZED, "JWT has expired".to_string()))
             }
             Err(JwtError::Invalid(message)) => Err((StatusCode::UNAUTHORIZED, message)),
+            Err(JwtError::KeysUnavailable) => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                KEYS_UNAVAILABLE_MESSAGE.to_string(),
+            )),
         }
     }
 }
@@ -658,7 +718,13 @@ impl FromRequestParts<Arc<ServerState>> for RequestSession {
             state.jwt_verifier.as_deref(),
         )
         .await
-        .map_err(|error| (StatusCode::UNAUTHORIZED, error.message))?;
+        .map_err(|error| match error {
+            SessionError::Unauthenticated(error) => (StatusCode::UNAUTHORIZED, error.message),
+            SessionError::KeysUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                KEYS_UNAVAILABLE_MESSAGE.to_string(),
+            ),
+        })?;
         Ok(RequestSession(session))
     }
 }
@@ -801,7 +867,7 @@ pub async fn validate_jwt_with_cache_at(
 ) -> Result<VerifiedJwt, JwtError> {
     let cached_jwks = cache.load(false).await.map_err(|e| {
         warn!(error = %e, "failed to load cached JWKS");
-        JwtError::Invalid("unable to load JWKS".to_string())
+        JwtError::KeysUnavailable
     })?;
 
     match verify_jwt_signature_with_jwks(token, &cached_jwks) {
@@ -818,9 +884,13 @@ pub async fn validate_jwt_with_cache_at(
         }
     }
 
+    // Not being able to fetch keys is not a refusal (`KeysUnavailable`) only when no
+    // usable keyset exists. A token signed with a key the server has not fetched yet
+    // (a rotation) is still refused as invalid while this refresh is held back by the
+    // cooldown or a failed fetch, or answered from a stale keyset.
     let refreshed_jwks = cache.load(true).await.map_err(|e| {
         warn!(error = %e, "failed to refresh JWKS");
-        JwtError::Invalid("unable to refresh JWKS".to_string())
+        JwtError::KeysUnavailable
     })?;
 
     match verify_jwt_signature_with_jwks(token, &refreshed_jwks) {
@@ -946,6 +1016,25 @@ fn is_jazz_self_signed_identity_proof(token: &str) -> Option<&'static str> {
     }
 }
 
+/// What an unauthenticated peer is told when its credentials could not be
+/// checked. Fixed: the fetch error names where the keys live.
+pub const KEYS_UNAVAILABLE_MESSAGE: &str = "credentials cannot be checked yet; retry";
+
+/// Why a request's credentials gave no session.
+#[derive(Debug)]
+pub enum SessionError {
+    /// They were checked and refused.
+    Unauthenticated(UnauthenticatedResponse),
+    /// They could not be checked: the keys that verify a JWT could not be
+    /// fetched. The same credentials may pass a moment later.
+    KeysUnavailable,
+}
+
+impl From<UnauthenticatedResponse> for SessionError {
+    fn from(error: UnauthenticatedResponse) -> Self {
+        Self::Unauthenticated(error)
+    }
+}
 /// Extract session from headers with priority resolution.
 ///
 /// Priority:
@@ -960,7 +1049,7 @@ pub async fn extract_session(
     app_id: AppId,
     config: &AuthConfig,
     jwt_verifier: Option<&JwtVerifier>,
-) -> Result<Option<Session>, UnauthenticatedResponse> {
+) -> Result<Option<Session>, SessionError> {
     // Priority 1: Backend impersonation
     if let Some(session_b64) = headers.get("X-Jazz-Session").and_then(|v| v.to_str().ok()) {
         let backend_secret = headers
@@ -974,17 +1063,18 @@ pub async fn extract_session(
                 return Ok(Some(session));
             }
             (Some(_), Some(_)) => {
-                return Err(UnauthenticatedResponse::invalid("Invalid backend secret"));
+                return Err(UnauthenticatedResponse::invalid("Invalid backend secret").into());
             }
             (Some(_), None) => {
                 return Err(UnauthenticatedResponse::invalid(
                     "Backend secret required for session impersonation",
-                ));
+                )
+                .into());
             }
             (None, Some(_)) => {
-                return Err(UnauthenticatedResponse::disabled(
-                    "Backend auth not configured",
-                ));
+                return Err(
+                    UnauthenticatedResponse::disabled("Backend auth not configured").into(),
+                );
             }
             (None, None) => {
                 // Session header without secret - ignore and fall through to JWT
@@ -995,14 +1085,14 @@ pub async fn extract_session(
     // Priority 2: JWT auth
     let token = if let Some(auth_value) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
         let Some(token) = auth_value.strip_prefix("Bearer ") else {
-            return Err(UnauthenticatedResponse::invalid(
-                "Invalid Authorization header format",
-            ));
+            return Err(
+                UnauthenticatedResponse::invalid("Invalid Authorization header format").into(),
+            );
         };
 
         let token = token.trim();
         if token.is_empty() {
-            return Err(UnauthenticatedResponse::invalid("Empty bearer token"));
+            return Err(UnauthenticatedResponse::invalid("Empty bearer token").into());
         }
         Some(token)
     } else {
@@ -1020,7 +1110,8 @@ pub async fn extract_session(
             if issuer == identity::LOCAL_FIRST_ISSUER && !config.allow_local_first_auth {
                 return Err(UnauthenticatedResponse::disabled(
                     "Local-first auth is not enabled for this app",
-                ));
+                )
+                .into());
             }
             let verified = identity::verify_jazz_self_signed_proof_at(
                 token,
@@ -1056,13 +1147,17 @@ pub async fn extract_session(
             Err(JwtError::NoKeyConfigured) => {
                 return Err(UnauthenticatedResponse::disabled(
                     "JWT auth is not enabled for this app",
-                ));
+                )
+                .into());
             }
             Err(JwtError::Expired) => {
-                return Err(UnauthenticatedResponse::expired("JWT has expired"));
+                return Err(UnauthenticatedResponse::expired("JWT has expired").into());
             }
             Err(JwtError::Invalid(message)) => {
-                return Err(UnauthenticatedResponse::invalid(message));
+                return Err(UnauthenticatedResponse::invalid(message).into());
+            }
+            Err(JwtError::KeysUnavailable) => {
+                return Err(SessionError::KeysUnavailable);
             }
         }
     }
@@ -1270,7 +1365,10 @@ mod tests {
 
         let result = extract_session(&headers, test_app_id(), &config, None).await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, UnauthenticatedCode::Invalid);
+        assert!(matches!(
+            result,
+            Err(SessionError::Unauthenticated(ref error)) if error.code == UnauthenticatedCode::Invalid
+        ));
     }
 
     #[tokio::test]
@@ -1577,7 +1675,10 @@ mod tests {
 
         let result = extract_session(&headers, app_id, &config, None).await;
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, UnauthenticatedCode::Expired);
+        assert!(matches!(
+            result,
+            Err(SessionError::Unauthenticated(ref error)) if error.code == UnauthenticatedCode::Expired
+        ));
     }
 
     #[tokio::test]
