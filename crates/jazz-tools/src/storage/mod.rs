@@ -3479,6 +3479,38 @@ pub(super) fn load_history_row_batch_row_bytes_with_storage<H: Storage + ?Sized>
     Ok(None)
 }
 
+/// [`Storage::load_history_row_batch`] on a backend that keeps rows in per-schema raw
+/// tables, together with the schema family whose raw table held the bytes.
+///
+/// That family is the layout the bytes were ENCODED in, whichever step found them: the
+/// locator's family, the batch's exact locator, or the ladder over every family of the
+/// table. A history write encodes into its own context's raw table, and nothing copies
+/// bytes between families. The row LOCATOR cannot stand in for it: it names whichever
+/// generation last moved a head, and after a deployment a batch on an older generation's
+/// branch sits in that generation's family, not the locator's.
+pub(super) fn load_history_row_batch_with_family_from_raw_tables<H: Storage + ?Sized>(
+    storage: &H,
+    table: &str,
+    branch: &str,
+    row_id: ObjectId,
+    batch_id: BatchId,
+) -> Result<Option<(StoredRowBatch, SchemaHash)>, StorageError> {
+    load_history_row_batch_row_bytes_with_storage(storage, table, branch, row_id, batch_id)?
+        .map(|row| {
+            let family = row.row_raw_table_id.schema_hash;
+            let user_descriptor = row.user_descriptor;
+            let row_codecs = crate::row_histories::flat_row_codecs(&user_descriptor);
+            let resolved = ResolvedRowTable {
+                row_raw_table: row.row_raw_table,
+                user_descriptor,
+                row_codecs,
+            };
+            decode_history_row_bytes_in_table(&resolved, row_id, branch, batch_id, &row.bytes)
+                .map(|batch| (batch, family))
+        })
+        .transpose()
+}
+
 pub(super) fn load_visible_region_row_bytes_with_storage<H: Storage + ?Sized>(
     storage: &H,
     table: &str,

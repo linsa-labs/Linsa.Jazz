@@ -1443,6 +1443,7 @@ fn remove_client_cleans_active_policy_checks() {
         old_content_schema_hash: None,
         new_content: None,
         operation: Operation::Insert,
+        old_row: Default::default(),
     };
 
     // Insert policy checks directly into the active_policy_checks map

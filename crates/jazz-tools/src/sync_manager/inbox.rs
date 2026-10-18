@@ -3,6 +3,7 @@ use crate::batch_fate::{BatchFate, BatchMode, SealedBatchSubmission};
 use crate::metadata::MetadataKey;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::policy::Operation;
+use crate::query_manager::types::SchemaHash;
 use crate::row_histories::{
     ApplyRowBatchWithContext, RowState, RowVisibilityChange, StoredRowBatch, apply_row_batch,
     apply_row_batch_with_context, patch_row_batch_state,
@@ -84,6 +85,43 @@ pub(crate) struct ParkedRowBatch {
     pub(super) fate_recording: AuthoritativeFateRecording,
     pub(super) source: ApplySource,
     pub(super) origin: RowApplyOrigin,
+}
+
+/// What the inbox found for the old row of an incoming batch.
+///
+/// Built once per incoming write and taken apart at once, never stored: boxing the row
+/// would add an allocation to every write and save nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub(super) enum PreBatchRow {
+    /// The version the batch was written over, read on its own branch, with the schema its
+    /// bytes are encoded in when the read could tell (`None`: the storage does not say —
+    /// see [`crate::storage::Storage::load_history_row_batch_with_family`]).
+    Row {
+        row: StoredRowBatch,
+        shape: Option<SchemaHash>,
+    },
+    /// No version before the batch, as far as its own branch and its ancestry say.
+    Absent,
+    /// No visible ancestor on the batch's branch, and history on another branch: the old
+    /// row is resolved at check time by the query layer ([`OldRowSource::AcrossBranches`]).
+    AcrossBranches,
+}
+
+/// The marker [`SyncManager::pre_batch_row_read`]'s body returns to defer the old row.
+struct AcrossBranches;
+
+/// A version read on the batch's own branch, with the schema its bytes are encoded in.
+type ShapedRow = (StoredRowBatch, Option<SchemaHash>);
+
+impl PreBatchRow {
+    fn from_branch_read(read: Result<Option<ShapedRow>, AcrossBranches>) -> Self {
+        match read {
+            Ok(Some((row, shape))) => Self::Row { row, shape },
+            Ok(None) => Self::Absent,
+            Err(AcrossBranches) => Self::AcrossBranches,
+        }
+    }
 }
 
 /// What one apply attempt did with a batch. `Dropped` is the terminal no — the batch is
@@ -435,12 +473,14 @@ impl SyncManager {
         storage: &H,
         table: &str,
         row: &StoredRowBatch,
-    ) -> Option<StoredRowBatch> {
-        self.pre_batch_visible_row_read(storage, table, row, true)
+    ) -> PreBatchRow {
+        self.pre_batch_row_read(storage, table, row, true)
     }
 
-    /// [`Self::pre_batch_visible_row`], with the read from the parents themselves
-    /// (`from_tips`) switched off for the tests that hold it to the walk's answer.
+    /// [`Self::pre_batch_visible_row`] as the row it found on the incoming batch's own
+    /// branch, with the read from the parents themselves (`from_tips`) switched off for the
+    /// tests that hold it to the walk's answer.
+    #[cfg(test)]
     pub(super) fn pre_batch_visible_row_read<H: Storage>(
         &self,
         storage: &H,
@@ -448,18 +488,58 @@ impl SyncManager {
         row: &StoredRowBatch,
         from_tips: bool,
     ) -> Option<StoredRowBatch> {
+        match self.pre_batch_row_read(storage, table, row, from_tips) {
+            PreBatchRow::Row { row, .. } => Some(row),
+            PreBatchRow::Absent | PreBatchRow::AcrossBranches => None,
+        }
+    }
+
+    pub(super) fn pre_batch_row_read<H: Storage>(
+        &self,
+        storage: &H,
+        table: &str,
+        row: &StoredRowBatch,
+        from_tips: bool,
+    ) -> PreBatchRow {
+        PreBatchRow::from_branch_read(self.pre_batch_row_on_branch(storage, table, row, from_tips))
+    }
+
+    /// The body of [`Self::pre_batch_row_read`]: `Ok(row)` is the answer read on the
+    /// incoming batch's branch, `Err(AcrossBranches)` defers it to the query layer.
+    fn pre_batch_row_on_branch<H: Storage>(
+        &self,
+        storage: &H,
+        table: &str,
+        row: &StoredRowBatch,
+        from_tips: bool,
+    ) -> Result<Option<ShapedRow>, AcrossBranches> {
         let row_locator = storage.load_row_locator(row.row_id).ok().flatten();
         if row.parents.is_empty() && row_locator.is_none() {
-            return None;
+            return Ok(None);
         }
-        // If the row has a single parent, we don't need any conflict resolution
+        // If the row has a single parent, we don't need any conflict resolution. The
+        // parent's shape is the family its bytes sit in, not the locator's: a client's
+        // delete after a deployment retires the row on every generation's branch, and on
+        // each older one its tombstone's single parent is that generation's head, in that
+        // generation's layout (local stack 2026-10-18 — first-generation bytes stamped as
+        // the second generation's decoded into the wrong owner, and the delete was refused).
         if let [parent_batch_id] = row.parents.as_slice() {
-            let parent_row = storage
-                .load_history_row_batch(table, row.branch.as_str(), row.row_id, *parent_batch_id)
+            let Some((parent_row, shape)) = storage
+                .load_history_row_batch_with_family(
+                    table,
+                    row.branch.as_str(),
+                    row.row_id,
+                    *parent_batch_id,
+                )
                 .ok()
-                .flatten()?;
-            return (parent_row.batch_id != row.batch_id && parent_row.state.is_visible())
-                .then_some(parent_row);
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            return Ok(
+                (parent_row.batch_id != row.batch_id && parent_row.state.is_visible())
+                    .then_some((parent_row, shape)),
+            );
         }
 
         // A batch with NO parents has no ancestry to resolve. The walk below
@@ -482,7 +562,7 @@ impl SyncManager {
         {
             // Every version this row has is on the incoming batch's branch, so
             // the walk below would disable its fallback and answer `None`.
-            return None;
+            return Ok(None);
         }
 
         let history_table = row_locator
@@ -512,13 +592,13 @@ impl SyncManager {
         // decides, as it did before the read from the parents existed.
         if from_tips
             && crate::row_histories::history_fastpath_enabled()
-            && let Some(answer) =
-                Self::pre_batch_visible_row_from_tips(storage, &history_table, row)
+            && let Some(answer) = Self::pre_batch_shaped_row_from_tips(storage, &history_table, row)
         {
-            return answer;
+            return Ok(answer);
         }
 
         let mut ancestors = Vec::new();
+        let mut shapes = HashMap::new();
         let mut seen = HashSet::new();
         let mut frontier = row.parents.clone();
         while let Some(batch_id) = frontier.pop() {
@@ -526,7 +606,12 @@ impl SyncManager {
                 continue;
             }
             let loaded = storage
-                .load_history_row_batch(&history_table, row.branch.as_str(), row.row_id, batch_id)
+                .load_history_row_batch_with_family(
+                    &history_table,
+                    row.branch.as_str(),
+                    row.row_id,
+                    batch_id,
+                )
                 .ok()
                 .flatten();
             // EXISTENCE, not visibility. `apply_row_batch_with_context` refuses on a parent
@@ -549,23 +634,59 @@ impl SyncManager {
                 // ALL branches, so it kept finding the row on the generation the client had
                 // moved off — and then the write was refused for the absent parent anyway.
                 // Settle passes of up to 51 seconds, `subscriptions=0`, `rows_emitted=0`.
-                return None;
+                return Ok(None);
             }
-            let Some(candidate) = loaded else {
+            let Some((candidate, shape)) = loaded else {
                 continue;
             };
             if candidate.batch_id != row.batch_id && candidate.state.is_visible() {
                 frontier.extend(candidate.parents.iter().copied());
+                shapes.insert(candidate.batch_id, shape);
                 ancestors.push(candidate);
             }
+        }
+
+        if ancestors.is_empty() {
+            // No declared ancestor resolves to a visible version — either the batch has no
+            // parents, or it names parents this authority does not hold, or a migrated
+            // branch dropped the link. The answer turns on one fact: does this row exist on
+            // another branch at all. If not, there is no old row; asking directly costs a
+            // probe per branch instead of the read it used to cost.
+            //
+            // If it does, this is the first write after a schema deployment: the client's
+            // update is a copy-on-write onto its generation's branch, with no parents, over a
+            // row whose history sits on older generations' branches. Its old row is the one
+            // readers serve across those branches — one head per branch, each in its own
+            // generation's shape — and only the query layer knows which branches readers see
+            // and how each generation's bytes are shaped. So it is deferred, not merged here.
+            // Merging every branch's tips as one frontier decoded them all with ONE
+            // descriptor; an older shape failed to decode, the failure read as "no old row",
+            // and every presence beat on `users` was refused as an insert for a week (local
+            // stack 2026-10-18).
+            //
+            // A probe that fails defers as well: the query layer reads what readers read,
+            // and a store error here must not decide that the row does not exist.
+            return match crate::storage::row_has_history_on_another_branch(
+                storage,
+                &history_table,
+                row.row_id,
+                row.branch.as_str(),
+            ) {
+                Ok(false) => Ok(None),
+                Ok(true) | Err(_) => Err(AcrossBranches),
+            };
         }
 
         // Resolved AFTER the walk, not before: the walk needs only `history_table`, and a
         // batch refused for an absent parent leaves above without ever reaching the one
         // consumer of this context. Paying for it first would make the refusal cost a read
-        // it has no use for.
-        let context =
-            crate::storage::resolve_history_row_write_context(storage, &history_table, row).ok()?;
+        // it has no use for. Nor does a deferred write need it: its old row is read in each
+        // generation's own shape, and this context is a guess at ONE shape.
+        let Ok(context) =
+            crate::storage::resolve_history_row_write_context(storage, &history_table, row)
+        else {
+            return Ok(None);
+        };
 
         // The sieve handed its rows over sorted; a depth-first pop order is not
         // obviously equivalent for a consumer that turns out to care, and the
@@ -578,54 +699,37 @@ impl SyncManager {
             ))
         });
 
-        let pre_batch_rows = if ancestors.is_empty() {
-            // No declared ancestor resolves to a visible version — either the
-            // batch has no parents, or it names parents this authority does not
-            // hold, or a migrated branch dropped the link. The walk answers that
-            // case from one fact: does this row exist on another branch at all.
-            // If not, its answer is `None`, and asking directly costs a probe
-            // per branch instead of the read it used to cost.
-            if !crate::storage::row_has_history_on_another_branch(
-                storage,
-                &history_table,
-                row.row_id,
-                row.branch.as_str(),
-            )
-            .ok()?
-            {
-                return None;
-            }
-            let visible_rows = storage
-                .scan_history_row_batches(&history_table, row.row_id)
-                .ok()?
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.batch_id != row.batch_id && candidate.state.is_visible()
-                })
-                .collect::<Vec<_>>();
-            // Recomputed, not assumed. The probe above asks whether ANY history
-            // row sits on another branch; this asks whether any VISIBLE one
-            // does, which is the question the answer actually turns on. They
-            // differ exactly when another branch holds only rejected,
-            // superseded or staged versions — and passing `true` there would
-            // hand the policy check an `old_content` of `Some(...)` where this
-            // function used to answer `None`, turning an insert into an update.
-            // The probe is a cost optimisation; it must not become an input.
-            let only_incoming_branch = visible_rows
-                .iter()
-                .all(|candidate| candidate.branch.as_str() == row.branch.as_str());
-            Self::history_rows_visible_before_batch(row, visible_rows, !only_incoming_branch)?
-        } else {
-            ancestors
-        };
-
-        crate::row_histories::visible_row_preview_from_history_rows(
+        let Some(preview) = crate::row_histories::visible_row_preview_from_history_rows(
             context.user_descriptor().as_ref(),
-            &pre_batch_rows,
+            &ancestors,
             None,
         )
         .ok()
-        .flatten()
+        .flatten() else {
+            return Ok(None);
+        };
+        // The shape is the layout the returned bytes are encoded in. A single tip comes back
+        // as it was loaded, in its own family. A merge of several is re-encoded with the
+        // context's descriptor, itself a guess at one shape for every tip; it keeps the stamp
+        // it always had (the locator's) until the merge reads each tip in its own family — a
+        // separate defect, and not one this write path's symptom showed.
+        let shape = ancestors
+            .iter()
+            .find(|ancestor| ancestor.batch_id == preview.batch_id && ancestor.data == preview.data)
+            .and_then(|ancestor| shapes.get(&ancestor.batch_id).copied().flatten());
+        Ok(Some((preview, shape)))
+    }
+
+    /// [`Self::pre_batch_shaped_row_from_tips`] without the schema, for the tests that pin
+    /// its answers.
+    #[cfg(test)]
+    pub(super) fn pre_batch_visible_row_from_tips<H: Storage>(
+        storage: &H,
+        history_table: &str,
+        row: &StoredRowBatch,
+    ) -> Option<Option<StoredRowBatch>> {
+        Self::pre_batch_shaped_row_from_tips(storage, history_table, row)
+            .map(|answer| answer.map(|(row, _shape)| row))
     }
 
     /// What a write naming several parents was written over, read from the parents
@@ -655,23 +759,36 @@ impl SyncManager {
     ///
     /// A delete naming a parent that is not held, and a parent this store holds but does
     /// not show, are left to the walk: it has rules for both.
-    pub(super) fn pre_batch_visible_row_from_tips<H: Storage>(
+    ///
+    /// The answer carries the schema its bytes are encoded in: a parent standing above the
+    /// rest is returned as loaded, in its own family; the visible entry's merged row does
+    /// not say.
+    fn pre_batch_shaped_row_from_tips<H: Storage>(
         storage: &H,
         history_table: &str,
         row: &StoredRowBatch,
-    ) -> Option<Option<StoredRowBatch>> {
+    ) -> Option<Option<ShapedRow>> {
         if row.parents.len() < 2 {
             return None;
         }
         let mut parents = Vec::with_capacity(row.parents.len());
+        let mut shapes = HashMap::with_capacity(row.parents.len());
         let mut absent = false;
         for parent in &row.parents {
             match storage
-                .load_history_row_batch(history_table, row.branch.as_str(), row.row_id, *parent)
+                .load_history_row_batch_with_family(
+                    history_table,
+                    row.branch.as_str(),
+                    row.row_id,
+                    *parent,
+                )
                 .ok()
                 .flatten()
             {
-                Some(parent) => parents.push(parent),
+                Some((parent, shape)) => {
+                    shapes.insert(parent.batch_id, shape);
+                    parents.push(parent);
+                }
                 None => absent = true,
             }
         }
@@ -701,7 +818,8 @@ impl SyncManager {
         if let (Some(top), None) = (tops.next(), tops.next()) {
             #[cfg(test)]
             note_pre_write_row_from_tips(0);
-            return Some(Some(top.clone()));
+            let shape = shapes.get(&top.batch_id).copied().flatten();
+            return Some(Some((top.clone(), shape)));
         }
 
         let entry = storage
@@ -719,62 +837,8 @@ impl SyncManager {
             .then(|| {
                 #[cfg(test)]
                 note_pre_write_row_from_tips(1);
-                Some(entry.current_row)
+                Some((entry.current_row, None))
             })
-    }
-
-    pub(super) fn history_rows_visible_before_batch(
-        row: &StoredRowBatch,
-        mut visible_rows: Vec<StoredRowBatch>,
-        allow_unresolved_fallback: bool,
-    ) -> Option<Vec<StoredRowBatch>> {
-        if row.parents.is_empty() {
-            return allow_unresolved_fallback.then_some(visible_rows);
-        }
-
-        // Resolve the ancestor set by REFERENCE, then narrow the caller's own
-        // vector in place. Nothing here copies a row.
-        //
-        // It used to copy every visible row twice — once to index them by
-        // batch id, once to collect the selection — though the walk reads
-        // nothing but each candidate's parents, and the selection is a subset
-        // of a vector we already own. On a row whose history is long that cost
-        // tracked the history, not the change: production 2026-08-10, a
-        // presence row at 2541 entries taking ~52 unappliable writes a second
-        // meant a quarter of a million row copies a second, payloads and
-        // parent vectors included, and a core pinned doing it. A linear
-        // history makes every entry an ancestor, so trimming the index alone
-        // would only have halved it.
-        let included_batch_ids = {
-            let visible_rows_by_batch = visible_rows
-                .iter()
-                .map(|candidate| (candidate.batch_id(), candidate))
-                .collect::<HashMap<_, _>>();
-
-            let mut included_batch_ids = HashSet::new();
-            let mut frontier = row.parents.iter().copied().collect::<Vec<_>>();
-            while let Some(batch_id) = frontier.pop() {
-                if !included_batch_ids.insert(batch_id) {
-                    continue;
-                }
-                if let Some(parent_row) = visible_rows_by_batch.get(&batch_id) {
-                    frontier.extend(parent_row.parents.iter().copied());
-                }
-            }
-            included_batch_ids
-        };
-
-        if !visible_rows
-            .iter()
-            .any(|candidate| included_batch_ids.contains(&candidate.batch_id()))
-        {
-            // A migrated branch may not carry parents from the old schema
-            // branch, so its first write must still consider all visible rows.
-            return allow_unresolved_fallback.then_some(visible_rows);
-        }
-
-        visible_rows.retain(|candidate| included_batch_ids.contains(&candidate.batch_id()));
-        Some(visible_rows)
     }
 
     /// One apply attempt, no recovery. Callers outside the recovery machinery
@@ -2851,9 +2915,20 @@ impl SyncManager {
                             .as_ref()
                             .map(|meta| meta.metadata.clone())
                             .unwrap_or_default();
-                        let pre_batch_visible_row = stored_metadata
+                        let pre_batch_row = stored_metadata
                             .get(MetadataKey::Table.as_str())
-                            .and_then(|table| self.pre_batch_visible_row(storage, table, row));
+                            .map_or(PreBatchRow::Absent, |table| {
+                                self.pre_batch_visible_row(storage, table, row)
+                            });
+                        let (pre_batch_visible_row, old_row_shape, old_row) = match pre_batch_row {
+                            PreBatchRow::Row { row, shape } => {
+                                (Some(row), shape, OldRowSource::Inline)
+                            }
+                            PreBatchRow::Absent => (None, None, OldRowSource::Inline),
+                            PreBatchRow::AcrossBranches => {
+                                (None, None, OldRowSource::AcrossBranches)
+                            }
+                        };
 
                         let old_content = pre_batch_visible_row
                             .as_ref()
@@ -2864,22 +2939,35 @@ impl SyncManager {
                             stored_metadata
                         };
                         let new_content = (!row.is_deleted).then_some(row.data.clone());
+                        // A deferred old row is queued as an UPDATE: the query layer lowers
+                        // a parentless write to an insert only once it has read that no row
+                        // exists where readers look. Queued as an insert, a check that ever
+                        // escaped that read would meet the insert policy, which is broader
+                        // than the update policy wherever this defect bit.
                         let operation = if row.is_deleted {
                             Operation::Delete
-                        } else if old_content.is_some() || !row.parents.is_empty() {
+                        } else if old_content.is_some()
+                            || !row.parents.is_empty()
+                            || old_row == OldRowSource::AcrossBranches
+                        {
                             Operation::Update
                         } else {
                             Operation::Insert
                         };
-                        // The shape rides with the bytes: the old content was
-                        // authored under the schema the LOCATOR names, which
-                        // after a schema deployment is not the schema the
-                        // incoming write's branch names.
-                        let old_content_schema_hash = storage
-                            .load_row_locator(row.row_id)
-                            .ok()
-                            .flatten()
-                            .and_then(|locator| locator.origin_schema_hash);
+                        // The shape rides with the bytes: the schema the old content is
+                        // encoded in, as the read that returned it found it. Only where the
+                        // storage cannot say does the row LOCATOR stand in — and it is a
+                        // guess: it names whichever generation last moved a head, so after
+                        // a deployment it is not the generation an older branch's version
+                        // was written in. A deferred old row is stamped by the query layer,
+                        // from the branch its winner is read on.
+                        let old_content_schema_hash = old_row_shape.or_else(|| {
+                            storage
+                                .load_row_locator(row.row_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|locator| locator.origin_schema_hash)
+                        });
                         self.queue_for_permission_check(
                             client_id,
                             payload,
@@ -2889,6 +2977,7 @@ impl SyncManager {
                             old_content_schema_hash,
                             new_content.map(|content| content.to_vec()),
                             operation,
+                            old_row,
                         );
                     }
                 }

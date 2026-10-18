@@ -2371,6 +2371,7 @@ mod incremental_scan;
 mod install_transport_tests;
 mod kept_verdict_differential;
 mod locator_ladder_heal;
+mod migrated_write_policy;
 mod overlay_release;
 mod policy_dependency_differential;
 mod policy_dependency_rejection;
@@ -3408,98 +3409,6 @@ fn a_parentless_write_does_not_read_the_whole_row_history_when_the_store_has_two
     );
 }
 
-/// The cheap answer must stay the true answer.
-///
-/// The gate above would also pass if the parentless path simply returned `None`
-/// and stopped asking. It must not: when the row genuinely has versions on
-/// another branch, the walk is what resolves what was visible before the batch,
-/// and skipping it would hand the permission check a wrong `old_content`.
-#[test]
-fn a_parentless_write_still_resolves_a_row_that_spans_branches() {
-    let schema = test_schema();
-    let mut server = create_runtime_with_schema(schema, "parentless-spanning-row");
-    let client_id = ClientId::new();
-    server.add_client(client_id, Some(Session::new("writer")));
-
-    let row_id = ObjectId::new();
-    let ((server_row_id, _), _) = insert_and_wait_for_batch(
-        &mut server,
-        "users",
-        HashMap::from([
-            ("id".to_string(), Value::Uuid(row_id)),
-            ("name".to_string(), Value::Text("v0".to_string())),
-        ]),
-        None,
-        DurabilityTier::Local,
-    )
-    .expect("seed the row");
-    server.batched_tick();
-    server.immediate_tick();
-
-    let live_branch = crate::storage::sole_branch_name(server.storage())
-        .expect("branch registry readable")
-        .expect("the seeded row registered a branch");
-
-    // THIS row also exists on another branch.
-    let other_branch = BranchName::new("dev-ffffffffffff-main");
-    server
-        .storage_mut()
-        .resolve_or_alloc_branch_ord(other_branch)
-        .expect("register the other branch");
-    server
-        .storage_mut()
-        .append_history_region_rows(
-            "users",
-            std::slice::from_ref(&crate::row_histories::StoredRowBatch::new(
-                server_row_id,
-                other_branch.as_str(),
-                Vec::<crate::row_histories::BatchId>::new(),
-                encode_row(
-                    &test_schema()[&TableName::new("users")].columns,
-                    &user_row_values(server_row_id, "the same row, elsewhere"),
-                )
-                .expect("row encodes"),
-                crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 2_000),
-                HashMap::new(),
-                crate::row_histories::RowState::VisibleDirect,
-                None,
-            )),
-        )
-        .expect("the row also has a version on the other branch");
-
-    let parentless = crate::row_histories::StoredRowBatch::new(
-        server_row_id,
-        live_branch.as_str(),
-        Vec::<crate::row_histories::BatchId>::new(),
-        encode_row(
-            &test_schema()[&TableName::new("users")].columns,
-            &user_row_values(server_row_id, "from a diverged client"),
-        )
-        .expect("row encodes"),
-        crate::metadata::RowProvenance::for_insert(server_row_id.to_string(), 9_999),
-        HashMap::new(),
-        crate::row_histories::RowState::VisibleDirect,
-        None,
-    );
-
-    server.storage().reset_history_scans();
-    server.park_sync_message(InboxEntry {
-        source: Source::Client(client_id),
-        payload: SyncPayload::RowBatchCreated {
-            metadata: None,
-            row: parentless,
-        },
-    });
-    server.batched_tick();
-    server.immediate_tick();
-
-    assert!(
-        server.storage().history_scans() > 0,
-        "a row that really does span branches must still be resolved by the walk; answering \
-         `None` without asking would feed the permission check a wrong previous value"
-    );
-}
-
 /// A batch whose parents this authority does not hold must cost nothing to refuse.
 ///
 /// `apply_row_batch` refuses such a batch with `ParentNotFound` — it checks every
@@ -4390,10 +4299,13 @@ fn a_write_onto_an_old_shelf_row_is_permission_checked_as_an_update() {
          wrong policy evaluates and old content is invisible to it",
         check.operation
     );
-    assert!(
-        check.old_content.is_some(),
-        "the permission check sees no previous content for a row that has 1 visible \
-         version on the old shelf"
+    // The old row itself is read at check time, as readers read it across the
+    // generations' branches; the queue carries the deferral, not a guess.
+    assert_eq!(
+        check.old_row,
+        crate::sync_manager::OldRowSource::AcrossBranches,
+        "the permission check was not told that the previous content of a row with 1 \
+         visible version on the old shelf lives on another branch"
     );
 }
 

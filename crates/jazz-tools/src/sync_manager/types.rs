@@ -1047,6 +1047,33 @@ pub struct PendingPermissionCheck {
     pub new_content: Option<Vec<u8>>,
     /// Inferred operation type.
     pub operation: Operation,
+    /// Where the old row comes from; see [`OldRowSource`].
+    pub old_row: OldRowSource,
+}
+
+/// Where a pending check's old row comes from.
+///
+/// The inbox reads the old row from the incoming batch's own branch: its parents, or the
+/// visible version they descend from. A write that reaches no visible ancestor there, on a
+/// row with history on ANOTHER branch, is the first write a client makes after a schema
+/// deployment — a copy-on-write onto the new generation's branch, with no parents. Its
+/// old row is the row readers serve across the generations' branches: one head per
+/// branch, each in its own generation's shape, the reader's winner among them. Only the
+/// query layer knows which branches readers see and how each generation's bytes are
+/// shaped, so the inbox defers it.
+///
+/// The inbox used to merge every branch's tips as one frontier, decoded with ONE
+/// descriptor. Tips of an older shape failed to decode, the error read as "no old row",
+/// and the update was judged an insert: local stack 2026-10-18, every presence beat on
+/// `users` refused with `Insert denied by policy` for a week after a deployment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OldRowSource {
+    /// `old_content` is the inbox's answer, read from the incoming batch's branch.
+    #[default]
+    Inline,
+    /// No visible ancestor on the incoming branch, and history on another branch: the
+    /// query layer resolves the old row at check time, through the reader.
+    AcrossBranches,
 }
 
 #[cfg(test)]

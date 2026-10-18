@@ -109,6 +109,7 @@ fn memory_size_separates_sync_state_buckets() {
         old_content_schema_hash: None,
         new_content: Some(b"alice".to_vec()),
         operation: crate::query_manager::policy::Operation::Insert,
+        old_row: Default::default(),
     });
 
     let (catalogue, connections, subscriptions, queues, total) = sm.memory_size();

@@ -3485,7 +3485,7 @@ impl QueryManager {
         )
     }
 
-    fn branch_schema_hash_for_visible_load(
+    pub(super) fn branch_schema_hash_for_visible_load(
         branch: &str,
         schema_context: &SchemaContext,
         branch_schema_map: &HashMap<String, SchemaHash>,

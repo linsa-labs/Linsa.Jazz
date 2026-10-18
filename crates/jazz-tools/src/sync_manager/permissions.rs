@@ -128,6 +128,7 @@ impl SyncManager {
         old_content_schema_hash: Option<crate::query_manager::types::branch::SchemaHash>,
         new_content: Option<Vec<u8>>,
         operation: Operation,
+        old_row: OldRowSource,
     ) -> PendingUpdateId {
         let id = PendingUpdateId(self.next_pending_id);
         self.next_pending_id += 1;
@@ -142,6 +143,7 @@ impl SyncManager {
             old_content_schema_hash,
             new_content,
             operation,
+            old_row,
         });
         id
     }

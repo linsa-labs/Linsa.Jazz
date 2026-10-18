@@ -10,7 +10,7 @@ use crate::row_histories::BatchId;
 use crate::schema_manager::{LensTransformer, transformer::translate_table_name_from_schema};
 use crate::storage::Storage;
 use crate::sync_manager::{
-    ClientId, ClientRole, DurabilityTier, PendingPermissionCheck, SyncPayload,
+    ClientId, ClientRole, DurabilityTier, OldRowSource, PendingPermissionCheck, SyncPayload,
 };
 
 use super::authz_cache::{AuthzMarker, AuthzScope, AuthzSessionKey};
@@ -120,6 +120,9 @@ struct UpdatePermissionRequest<'a> {
     branch_table_schema: &'a TableSchema,
     auth_schema: &'a Schema,
     auth_context: &'a crate::schema_manager::SchemaContext,
+    /// The old row's provenance, when the check already read it (the reader's winner of a
+    /// cross-branch old row); otherwise the arm looks it up.
+    old_provenance: Option<RowProvenance>,
 }
 
 // Branch-schema maps built on this thread; lets a test see work a settle pass does for
@@ -2468,7 +2471,9 @@ impl QueryManager {
             }
         };
 
-        if check.operation == Operation::Insert
+        // A deferred old row may lower the check to an insert further down, and the
+        // insert arm validates nothing itself, so a deferred check is validated here too.
+        if (check.operation == Operation::Insert || check.old_row == OldRowSource::AcrossBranches)
             && let Some(new_content) = check.new_content.as_ref()
             && let Err(err) =
                 self.validate_json_for_content(&branch_table_schema.columns, new_content)
@@ -2547,6 +2552,21 @@ impl QueryManager {
             return;
         };
 
+        // Read only now, after every wait above: the reader needs the writer's auth
+        // context, and a check that waited for its schema must see the store as it is
+        // when the wait ends.
+        let old_provenance = if check.old_row == OldRowSource::AcrossBranches {
+            self.resolve_old_row_across_branches(
+                storage,
+                &mut check,
+                object_id,
+                branch_name,
+                &auth_context,
+            )
+        } else {
+            None
+        };
+
         if check.operation == Operation::Update {
             self.evaluate_update_permission(
                 storage,
@@ -2559,6 +2579,7 @@ impl QueryManager {
                     branch_table_schema: &branch_table_schema,
                     auth_schema: &auth_schema,
                     auth_context: &auth_context,
+                    old_provenance,
                 },
             );
             return;
@@ -2624,12 +2645,14 @@ impl QueryManager {
         };
         let provenance = match check.operation {
             Operation::Insert => Self::payload_row_provenance(&check.payload),
-            Operation::Delete => self.current_row_provenance(
-                storage,
-                object_id,
-                branch_name,
-                Some(&write_table_name),
-            ),
+            Operation::Delete => old_provenance.or_else(|| {
+                self.current_row_provenance(
+                    storage,
+                    object_id,
+                    branch_name,
+                    Some(&write_table_name),
+                )
+            }),
             Operation::Update | Operation::Select => None,
         };
         let Some(provenance) = provenance else {
@@ -2680,6 +2703,103 @@ impl QueryManager {
         self.sync_manager.approve_permission_check(storage, check);
     }
 
+    /// The old row of a check the inbox deferred ([`OldRowSource::AcrossBranches`]): the row
+    /// READERS of the writer's world serve, read with the reader itself over the writer's
+    /// auth context — every live generation's branch of its `(env, user_branch)`, each head
+    /// in its own generation's shape, table names translated across generations, a
+    /// tombstone first, then the newest `(updated_at, batch_id)`.
+    ///
+    /// With a winner the check carries the winner's bytes, the shape readers give them (the
+    /// generation of the branch it was served from), and the operation it is — an update, or
+    /// the delete it already was. The winner's provenance is returned for the arm, which
+    /// would otherwise scan the row's whole history for it: the incoming branch holds no
+    /// version yet. A parentless write looks for its old row outside the incoming branch
+    /// first; a write that names parents competes with the incoming branch's head from the
+    /// start. With no winner a parentless write is lowered to the insert it is; a write
+    /// with parents stays the update or delete the inbox queued, with no old content.
+    fn resolve_old_row_across_branches(
+        &self,
+        storage: &dyn Storage,
+        check: &mut PendingPermissionCheck,
+        object_id: ObjectId,
+        branch_name: BranchName,
+        auth_context: &crate::schema_manager::SchemaContext,
+    ) -> Option<RowProvenance> {
+        let (incoming_batch, parentless) = match &check.payload {
+            SyncPayload::RowBatchCreated { row, .. } | SyncPayload::RowBatchNeeded { row, .. } => {
+                (row.batch_id, row.parents.is_empty())
+            }
+            _ => return None,
+        };
+        let elsewhere: Vec<String> = auth_context
+            .all_branch_names()
+            .into_iter()
+            .filter(|branch| *branch != branch_name)
+            .map(|branch| branch.as_str().to_string())
+            .collect();
+        let branch_schema_map = Self::branch_schema_map_for_context(auth_context);
+        let read = |branches: &[String]| {
+            Self::load_best_visible_row_batch_with_hint_or_locator(
+                storage,
+                object_id,
+                None,
+                branches,
+                None,
+                auth_context,
+                &branch_schema_map,
+            )
+        };
+
+        // The incoming branch's own head competes under the readers' rule — unless that
+        // head is this very batch (a correction of it), which cannot be its own old row.
+        let mut everywhere = elsewhere.clone();
+        everywhere.push(branch_name.as_str().to_string());
+        let read_everywhere = || match read(&everywhere) {
+            Some((_, row)) if row.batch_id == incoming_batch => read(&elsewhere),
+            found => found,
+        };
+        // A parentless write must find the row where readers look OTHER than the incoming
+        // branch: a row with visible versions on the incoming branch alone is the
+        // single-branch case, which this does not change. A write that names parents is
+        // an update or a delete of a version its writer saw; it reached here because none
+        // of those parents is a visible version this server holds, and readers would serve
+        // whatever wins across every branch, the incoming one included — which is all a
+        // tombstone whose parents have not arrived has to be judged against before it parks.
+        let winner = if parentless {
+            read(&elsewhere).and_then(|_| read_everywhere())
+        } else {
+            read_everywhere()
+        };
+
+        let Some((_, row)) = winner else {
+            tracing::debug!(
+                %object_id,
+                branch = %branch_name,
+                "no old row where readers look; a parentless write is an insert"
+            );
+            if parentless && check.operation == Operation::Update {
+                check.operation = Operation::Insert;
+            }
+            return None;
+        };
+        tracing::debug!(
+            %object_id,
+            branch = %branch_name,
+            winner_branch = %row.branch,
+            "old row of a cross-branch write resolved by the reader"
+        );
+        if check.operation == Operation::Insert {
+            check.operation = Operation::Update;
+        }
+        check.old_content = Some(row.data.to_vec());
+        check.old_content_schema_hash = Self::branch_schema_hash_for_visible_load(
+            row.branch.as_str(),
+            auth_context,
+            &branch_schema_map,
+        );
+        Some(row.row_provenance())
+    }
+
     /// Evaluate UPDATE permission with both USING (old row) and WITH CHECK (new row).
     ///
     /// For UPDATE, we need to check:
@@ -2701,6 +2821,7 @@ impl QueryManager {
             branch_table_schema,
             auth_schema,
             auth_context,
+            old_provenance,
         } = request;
 
         if let Some(new_content) = check.new_content.as_ref()
@@ -2712,10 +2833,15 @@ impl QueryManager {
             return;
         }
 
-        if check
-            .old_content
-            .as_ref()
-            .is_none_or(|content| content.is_empty())
+        // Not over a cross-branch old row the reader already resolved: that IS the row
+        // readers serve, and this fill reads one branch of it.
+        let resolved_across_branches =
+            check.old_row == OldRowSource::AcrossBranches && old_provenance.is_some();
+        if !resolved_across_branches
+            && check
+                .old_content
+                .as_ref()
+                .is_none_or(|content| content.is_empty())
             && let Ok(Some(previous_row)) = storage.load_visible_region_row(
                 write_table_name.as_str(),
                 branch_name.as_str(),
@@ -2749,8 +2875,9 @@ impl QueryManager {
         let using_policy = table_schema.policies.update_using_policy();
         let check_policy = table_schema.policies.update_check_policy();
         let source_branch_schema_map = self.branch_schema_map.clone();
-        let old_provenance =
-            self.current_row_provenance(storage, object_id, branch_name, Some(&write_table_name));
+        let old_provenance = old_provenance.or_else(|| {
+            self.current_row_provenance(storage, object_id, branch_name, Some(&write_table_name))
+        });
         let new_provenance = Self::payload_row_provenance(&check.payload);
 
         if using_policy.is_none() && check_policy.is_none() {

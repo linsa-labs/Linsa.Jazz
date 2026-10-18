@@ -1494,6 +1494,11 @@ macro_rules! storage_conformance_tests {
             }
 
             #[test]
+            fn history_row_batch_family_is_the_table_that_holds_it() {
+                conformance::test_history_row_batch_family_is_the_table_that_holds_it(&$factory);
+            }
+
+            #[test]
             fn raw_table_scan_range() {
                 conformance::test_raw_table_scan_range(&$factory);
             }
@@ -1779,6 +1784,134 @@ pub fn test_history_row_exists_on_branch(factory: &dyn Fn() -> Box<dyn Storage>)
                 .unwrap(),
             scanned,
             "the fast answer and the scan disagree about what lies outside {branch}"
+        );
+    }
+}
+
+/// The family `load_history_row_batch_with_family` names is the raw table that HOLDS the
+/// batch, whichever step of the history ladder found it. Asked through `Box<dyn Storage>`,
+/// the shape every server and client holds its store in: a backend override the box does
+/// not forward would answer `None` there and nowhere a concrete store is tested.
+///
+/// A permission check decodes a write's old row with this family. The row locator is no
+/// substitute: it names whichever generation last moved a head, and after a deployment a
+/// batch on an older generation's branch sits in that generation's family (local stack
+/// 2026-10-18: a delete's tombstone on the first generation's branch was judged against
+/// first-generation bytes read as the second generation's, and refused).
+///
+/// A backend that keeps no families — the bytes are not in any family's raw table — may
+/// answer `None`; one that keeps them must name the table they are in.
+pub fn test_history_row_batch_family_is_the_table_that_holds_it(
+    factory: &dyn Fn() -> Box<dyn Storage>,
+) {
+    let mut storage = factory();
+    let first = seed_row_history_table(storage.as_mut(), "users");
+    let second = persist_test_schema(
+        storage.as_mut(),
+        &SchemaBuilder::new()
+            .table(
+                TableSchema::builder("users")
+                    .column("value", ColumnType::Text)
+                    .column("note", ColumnType::Text),
+            )
+            .build(),
+    );
+    assert_ne!(
+        first, second,
+        "control: the two generations must be distinct"
+    );
+    let row_id = ObjectId::new();
+    seed_row_history_locator(storage.as_mut(), "users", row_id, first);
+    let batch = make_row_batch(row_id, "dev/main", 10, "alice");
+    storage
+        .append_history_region_rows("users", std::slice::from_ref(&batch))
+        .unwrap();
+
+    let first_table = RowRawTableId::new(RowRawTableKind::History, "users", first)
+        .raw_table_name()
+        .to_string();
+    let key = super::key_codec::history_row_raw_table_key(row_id, "dev/main", batch.batch_id());
+    // Where the bytes physically are: every history family of the table, probed for the key.
+    // A backend that keeps no families holds them in none, and may answer `None`.
+    let holding: Vec<SchemaHash> =
+        super::row_raw_table_ids_for_table(storage.as_ref(), RowRawTableKind::History, "users")
+            .unwrap()
+            .into_iter()
+            .filter(|id| {
+                storage
+                    .raw_table_get(id.raw_table_name(), &key)
+                    .unwrap()
+                    .is_some()
+            })
+            .map(|id| id.schema_hash)
+            .collect();
+    assert!(
+        holding.len() <= 1,
+        "a batch is held in one family: {holding:?}"
+    );
+    let expected = holding.first().copied();
+    if let Some(family) = expected {
+        assert_eq!(
+            family, first,
+            "control: appended while the locator named the first generation, the batch is in \
+             the first generation's family"
+        );
+    }
+
+    // Generic over the storage, and handed the BOX: `H = Box<dyn Storage>` dispatches
+    // through `impl Storage for Box<T>`, as the server's generic code does. Handing it
+    // `storage.as_ref()` would call the backend directly and never meet the forward.
+    fn family_of<H: Storage + ?Sized>(
+        storage: &H,
+        row_id: ObjectId,
+        batch_id: BatchId,
+    ) -> Option<SchemaHash> {
+        let (row, family) = storage
+            .load_history_row_batch_with_family("users", "dev/main", row_id, batch_id)
+            .unwrap()
+            .expect("the batch must load");
+        assert_eq!(
+            Some(row),
+            storage
+                .load_history_row_batch("users", "dev/main", row_id, batch_id)
+                .unwrap(),
+            "the row must be the one `load_history_row_batch` returns"
+        );
+        family
+    }
+
+    assert_eq!(
+        family_of(&storage, row_id, batch.batch_id()),
+        expected,
+        "the locator names the family that holds the batch: that family"
+    );
+
+    // The next generation moves the row's head, and with it the locator. The batch did
+    // not move: the history ladder finds it in its own family.
+    seed_row_history_locator(storage.as_mut(), "users", row_id, second);
+    assert_eq!(
+        family_of(&storage, row_id, batch.batch_id()),
+        expected,
+        "the locator names another generation: the family is still the one holding the batch"
+    );
+
+    if expected.is_some() {
+        storage
+            .put_history_row_batch_table_locator(
+                "dev/main",
+                row_id,
+                batch.batch_id(),
+                Some(&super::ExactRowTableLocator {
+                    row_raw_table: first_table.clone().into(),
+                    table_name: "users".into(),
+                    schema_hash: first,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            family_of(&storage, row_id, batch.batch_id()),
+            Some(first),
+            "the batch's exact locator names its family: that family"
         );
     }
 }

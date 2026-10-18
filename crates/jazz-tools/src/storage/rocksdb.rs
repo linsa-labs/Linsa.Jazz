@@ -1624,6 +1624,25 @@ impl Storage for RocksDBStorage {
         .map(|row| row.bytes))
     }
 
+    fn load_history_row_batch_with_family(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+        batch_id: crate::row_histories::BatchId,
+    ) -> Result<
+        Option<(
+            crate::row_histories::StoredRowBatch,
+            Option<crate::query_manager::types::SchemaHash>,
+        )>,
+        StorageError,
+    > {
+        Ok(super::load_history_row_batch_with_family_from_raw_tables(
+            self, table, branch, row_id, batch_id,
+        )?
+        .map(|(row, family)| (row, Some(family))))
+    }
+
     fn scan_history_region_bytes(
         &self,
         table: &str,

@@ -1520,18 +1520,33 @@ pub trait Storage {
         row_id: ObjectId,
         batch_id: BatchId,
     ) -> Result<Option<StoredRowBatch>, StorageError> {
-        load_history_row_batch_row_bytes_with_storage(self, table, branch, row_id, batch_id)?
-            .map(|row| {
-                let user_descriptor = row.user_descriptor;
-                let row_codecs = crate::row_histories::flat_row_codecs(&user_descriptor);
-                let resolved = ResolvedRowTable {
-                    row_raw_table: row.row_raw_table,
-                    user_descriptor,
-                    row_codecs,
-                };
-                decode_history_row_bytes_in_table(&resolved, row_id, branch, batch_id, &row.bytes)
-            })
-            .transpose()
+        Ok(load_history_row_batch_with_family_from_raw_tables(
+            self, table, branch, row_id, batch_id,
+        )?
+        .map(|(row, _family)| row))
+    }
+
+    /// [`Self::load_history_row_batch`], together with the schema family whose layout
+    /// the returned bytes are encoded in — what a reader of those bytes must decode them
+    /// with.
+    ///
+    /// `None` for the family means this storage does not say: it keeps no families
+    /// (`MemoryStorage` holds rows as received), or it wraps one and forwards only
+    /// `load_history_row_batch`. Callers fall back to what they used before. The default
+    /// delegates for exactly that reason: a wrapper that injects failures into, or counts,
+    /// `load_history_row_batch` keeps doing so for this call too. Backends that keep rows
+    /// in per-family raw tables override it, and `Box<T>` forwards it — without that
+    /// forward every production store, which is boxed, would answer `None` here.
+    fn load_history_row_batch_with_family(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+        batch_id: BatchId,
+    ) -> Result<Option<(StoredRowBatch, Option<SchemaHash>)>, StorageError> {
+        Ok(self
+            .load_history_row_batch(table, branch, row_id, batch_id)?
+            .map(|row| (row, None)))
     }
 
     fn load_history_row_batch_for_schema_hash(
@@ -2631,6 +2646,16 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         batch_id: BatchId,
     ) -> Result<Option<StoredRowBatch>, StorageError> {
         (**self).load_history_row_batch(table, branch, row_id, batch_id)
+    }
+
+    fn load_history_row_batch_with_family(
+        &self,
+        table: &str,
+        branch: &str,
+        row_id: ObjectId,
+        batch_id: BatchId,
+    ) -> Result<Option<(StoredRowBatch, Option<SchemaHash>)>, StorageError> {
+        (**self).load_history_row_batch_with_family(table, branch, row_id, batch_id)
     }
 
     fn load_history_row_batch_for_schema_hash(

@@ -465,6 +465,7 @@ mod dropped_payload;
 mod elided_copy_of_a_held_batch;
 mod forwarding_recursion;
 mod frontier_pruning;
+mod migrated_write_over_generations;
 // The whole module runs on `SqliteStorage`: `MemoryStorage` overrides the visible-row
 // reads and never executes the locator ladder, so the cross-generation raw-table family
 // this gates is invisible to it.
@@ -483,5 +484,4 @@ mod settlements;
 mod subscriptions;
 mod transaction_sealing;
 mod unappliable_row_notices;
-mod visible_ancestor_cost;
 mod wedged_row_recovery;
