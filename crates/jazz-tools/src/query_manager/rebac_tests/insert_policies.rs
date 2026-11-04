@@ -21,12 +21,12 @@ fn rebac_insert_denied_by_current_permissions_in_server_mode_known_schema() {
     // enforce the latest authorization schema.
     let sync_manager = SyncManager::new();
     let mut qm = QueryManager::new(sync_manager);
+    let mut storage = MemoryStorage::new();
+    catalogue_schema(&mut storage, &schema);
     let mut known_schemas = HashMap::new();
     known_schemas.insert(schema_hash, schema);
     qm.set_known_schemas(Arc::new(known_schemas));
     qm.set_authorization_schema(authorization_schema);
-
-    let mut storage = MemoryStorage::new();
 
     let client_id = ClientId::new();
     connect_client(&mut qm, &storage, client_id);
@@ -97,11 +97,11 @@ fn rebac_insert_denied_for_new_object_uses_payload_metadata_in_server_mode() {
     // Server mode: no current schema, schema available via known_schemas.
     let sync_manager = SyncManager::new();
     let mut qm = QueryManager::new(sync_manager);
+    let mut storage = MemoryStorage::new();
+    catalogue_schema(&mut storage, &schema);
     let mut known_schemas = HashMap::new();
     known_schemas.insert(schema_hash, schema);
     qm.set_known_schemas(Arc::new(known_schemas));
-
-    let mut storage = MemoryStorage::new();
 
     let client_id = ClientId::new();
     connect_client(&mut qm, &storage, client_id);
@@ -223,6 +223,7 @@ fn rebac_insert_waits_for_schema_then_denies_for_composed_branch() {
         "Deferred insert must not be applied before the schema is known"
     );
 
+    catalogue_schema(&mut storage, &schema);
     let mut known_schemas = HashMap::new();
     known_schemas.insert(schema_hash, schema);
     qm.set_known_schemas(Arc::new(known_schemas));
@@ -489,8 +490,9 @@ fn a_write_waiting_for_its_schema_holds_the_same_clients_later_writes() {
         .to_string();
 
     let mut qm = QueryManager::new(SyncManager::new());
-    qm.set_known_schemas(Arc::new(HashMap::from([(known_hash, schema)])));
     let mut storage = MemoryStorage::new();
+    catalogue_schema(&mut storage, &schema);
+    qm.set_known_schemas(Arc::new(HashMap::from([(known_hash, schema)])));
     let alice = ClientId::new();
     let bob = ClientId::new();
     for (client, user) in [(alice, "alice"), (bob, "bob")] {
@@ -558,6 +560,7 @@ fn a_write_waiting_for_its_schema_holds_the_same_clients_later_writes() {
     qm.sync_manager_mut()
         .requeue_pending_permission_checks(pending);
 
+    catalogue_schema(&mut storage, &later);
     qm.set_known_schemas(Arc::new(HashMap::from([
         (known_hash, rebac_test_schema()),
         (later_hash, later),
@@ -569,4 +572,23 @@ fn a_write_waiting_for_its_schema_holds_the_same_clients_later_writes() {
             && client_write_was_rejected(&outbox, alice, behind_batch),
         "once the schema arrives, both are decided"
     );
+}
+
+/// The store's catalogue entry for `schema`, which a server receives along with the schema
+/// itself: rows are placed by it.
+fn catalogue_schema(storage: &mut MemoryStorage, schema: &Schema) {
+    let schema_hash = SchemaHash::compute(schema);
+    storage
+        .upsert_catalogue_entry(&crate::catalogue::CatalogueEntry {
+            object_id: schema_hash.to_object_id(),
+            metadata: HashMap::from([
+                (
+                    MetadataKey::Type.to_string(),
+                    crate::metadata::ObjectType::CatalogueSchema.to_string(),
+                ),
+                (MetadataKey::SchemaHash.to_string(), schema_hash.to_string()),
+            ]),
+            content: crate::schema_manager::encoding::encode_schema(schema),
+        })
+        .expect("the schema is catalogued");
 }

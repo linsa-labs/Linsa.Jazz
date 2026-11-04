@@ -55,6 +55,26 @@ impl SyncManager {
         }
     }
 
+    /// Drop a pending permission check and ask the client for its batch again.
+    ///
+    /// For a row the server cannot place yet: the client's retransmit carries the
+    /// row's metadata, and is checked as any first send is. Budgeted like every
+    /// other `Missing`.
+    pub fn ask_again_for_permission_check(&mut self, check: PendingPermissionCheck) {
+        let batch_id = match &check.payload {
+            SyncPayload::RowBatchCreated { row, .. } | SyncPayload::RowBatchNeeded { row, .. } => {
+                row.batch_id
+            }
+            _ => return,
+        };
+        if self.may_tell_client_a_batch_is_missing(check.client_id, batch_id) {
+            self.queue_batch_fate_to_client_unfiltered(
+                check.client_id,
+                BatchFate::Missing { batch_id },
+            );
+        }
+    }
+
     /// Reject a pending permission check, sending error back to client.
     ///
     /// This takes the full PendingPermissionCheck since it was already taken

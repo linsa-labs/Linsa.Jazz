@@ -433,20 +433,41 @@ impl SyncManager {
     ) -> Option<(RowLocator, PreparedRowWriteContext)> {
         let row_locator = row_locator_from_metadata(metadata)?;
         let schema_hash = row_locator.origin_schema_hash?;
-        let table = row_locator.table.to_string();
-        let cache_key = (table.clone(), schema_hash);
-        let table_context = if let Some(context) = self.replay_table_contexts.get(&cache_key) {
-            context.clone()
-        } else {
-            let context =
-                prepared_row_table_context_for_schema_hash(storage, &table, schema_hash).ok()?;
-            self.replay_table_contexts
-                .insert(cache_key, context.clone());
-            context
-        };
+        let table_context =
+            self.row_table_context(storage, row_locator.table.as_str(), schema_hash)?;
         let write_context =
             prepared_row_write_context_from_table_context(table_context, needs_exact_locator);
         Some((row_locator, write_context))
+    }
+
+    fn row_table_context<H: Storage>(
+        &mut self,
+        storage: &H,
+        table: &str,
+        schema_hash: SchemaHash,
+    ) -> Option<std::sync::Arc<crate::storage::PreparedRowTableContext>> {
+        let cache_key = (table.to_string(), schema_hash);
+        if let Some(context) = self.replay_table_contexts.get(&cache_key) {
+            return Some(context.clone());
+        }
+        let context =
+            prepared_row_table_context_for_schema_hash(storage, table, schema_hash).ok()?;
+        self.replay_table_contexts
+            .insert(cache_key, context.clone());
+        Some(context)
+    }
+
+    /// Whether a row whose metadata names `(table, schema_hash)` is written into that
+    /// table. When it is not, the apply places the row by its locator instead, so a
+    /// check that judged the row under `table` must not approve it.
+    pub(crate) fn places_row_in<H: Storage>(
+        &mut self,
+        storage: &H,
+        table: &str,
+        schema_hash: SchemaHash,
+    ) -> bool {
+        self.row_table_context(storage, table, schema_hash)
+            .is_some()
     }
 
     fn matches_replayed_row_batch(existing: &StoredRowBatch, incoming: &StoredRowBatch) -> bool {
@@ -2086,7 +2107,7 @@ impl SyncManager {
         );
     }
 
-    fn may_tell_client_a_batch_is_missing(
+    pub(super) fn may_tell_client_a_batch_is_missing(
         &mut self,
         client_id: ClientId,
         batch_id: crate::row_histories::BatchId,

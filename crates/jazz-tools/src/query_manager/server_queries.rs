@@ -7,7 +7,13 @@ use crate::metadata::{MetadataKey, RowProvenance};
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::graph_nodes::policy_eval::PolicyContextEvaluator;
 use crate::row_histories::BatchId;
-use crate::schema_manager::{LensTransformer, transformer::translate_table_name_from_schema};
+use crate::schema_manager::{
+    LensTransformer,
+    transformer::{
+        origin_schema_hash_from_metadata, translate_table_name_from_schema,
+        translate_table_name_to_schema,
+    },
+};
 use crate::storage::Storage;
 use crate::sync_manager::{
     ClientId, ClientRole, DurabilityTier, OldRowSource, PendingPermissionCheck, SyncPayload,
@@ -40,7 +46,8 @@ pub(super) enum WriteCheckOutcome {
 }
 
 enum WriteSchemaResolution {
-    Resolved(Box<TableSchema>),
+    /// The table as the branch's schema has it, and that schema's hash.
+    Resolved(Box<TableSchema>, SchemaHash),
     PendingSchema,
     Unresolved,
 }
@@ -536,6 +543,96 @@ impl QueryManager {
 
         translate_table_name_from_schema(auth_context, write_table_name.as_str(), &source_hash)
             .map(TableName::new)
+    }
+
+    /// Whether the id a write names already holds a row of another table.
+    ///
+    /// An id is a row of one table: a reader of the row on a branch takes its visible head
+    /// from whichever family the row's pointers name, whatever table it asked for. A write
+    /// to another table at a taken id would be served as the row it lands on.
+    ///
+    /// Every branch a reader fans out over is read, through the ladder readers use, under
+    /// the name the write gives the table and under the name the row was first written
+    /// with; the family each head is found in is translated into the permissions' schema
+    /// and compared there. A family that does not translate forward is compared backward,
+    /// the write's table translated into the family's generation, and by name only when
+    /// neither direction translates. A store that cannot be read counts as taken.
+    fn id_holds_a_row_of_another_table(
+        &self,
+        storage: &dyn Storage,
+        object_id: ObjectId,
+        write: (TableName, BranchName),
+        auth_table_name: TableName,
+        auth_context: &crate::schema_manager::SchemaContext,
+    ) -> bool {
+        let (write_table_name, write_branch) = write;
+        let locator = match storage.load_row_locator(object_id) {
+            Ok(Some(locator)) => locator,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(?object_id, %error, "write refused: the row's locator cannot be read");
+                return true;
+            }
+        };
+        let mut hints = vec![write_table_name.as_str()];
+        if locator.table.as_str() != write_table_name.as_str() {
+            hints.push(locator.table.as_str());
+        }
+        let branches: HashSet<BranchName> = auth_context
+            .all_branch_names()
+            .into_iter()
+            .chain(
+                self.schema_context
+                    .is_initialized()
+                    .then(|| self.schema_context.all_branch_names())
+                    .into_iter()
+                    .flatten(),
+            )
+            .chain([write_branch])
+            .collect();
+        for branch in &branches {
+            for hint in &hints {
+                let head = match crate::storage::load_visible_region_row_bytes_with_storage(
+                    storage,
+                    hint,
+                    branch.as_str(),
+                    object_id,
+                ) {
+                    Ok(Some(head)) => head,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            ?object_id,
+                            %branch,
+                            table = %hint,
+                            %error,
+                            "write refused: a head of the row cannot be read"
+                        );
+                        return true;
+                    }
+                };
+                let family = head.row_raw_table_id;
+                let same_table = match translate_table_name_from_schema(
+                    auth_context,
+                    family.table_name.as_str(),
+                    &family.schema_hash,
+                ) {
+                    Some(auth_name) => auth_name == auth_table_name.as_str(),
+                    None => match translate_table_name_to_schema(
+                        auth_context,
+                        auth_table_name.as_str(),
+                        &family.schema_hash,
+                    ) {
+                        Some(family_name) => family_name == family.table_name.as_str(),
+                        None => family.table_name.as_str() == write_table_name.as_str(),
+                    },
+                };
+                if !same_table {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn load_row_for_authorization_context(
@@ -2382,8 +2479,7 @@ impl QueryManager {
             return schema
                 .get(&table_name)
                 .cloned()
-                .map(Box::new)
-                .map(WriteSchemaResolution::Resolved)
+                .map(|table| WriteSchemaResolution::Resolved(Box::new(table), schema_hash))
                 .unwrap_or(WriteSchemaResolution::Unresolved);
         }
 
@@ -2391,24 +2487,28 @@ impl QueryManager {
         if self.schema_context.is_initialized()
             && branch_name.as_str() == self.schema_context.branch_name().as_str()
         {
+            let schema_hash = self.schema_context.current_hash;
             return self
                 .schema
                 .get(&table_name)
                 .cloned()
-                .map(Box::new)
-                .map(WriteSchemaResolution::Resolved)
+                .map(|table| WriteSchemaResolution::Resolved(Box::new(table), schema_hash))
                 .unwrap_or(WriteSchemaResolution::Unresolved);
         }
 
         // In pure local/client mode (no server-known schemas and a non-empty current schema),
-        // self.schema is still authoritative.
+        // self.schema is still authoritative. It is only ever set together with the schema
+        // context, which then names its hash.
         if self.known_schemas.is_empty() && !self.schema.is_empty() {
+            if !self.schema_context.is_initialized() {
+                return WriteSchemaResolution::Unresolved;
+            }
+            let schema_hash = self.schema_context.current_hash;
             return self
                 .schema
                 .get(&table_name)
                 .cloned()
-                .map(Box::new)
-                .map(WriteSchemaResolution::Resolved)
+                .map(|table| WriteSchemaResolution::Resolved(Box::new(table), schema_hash))
                 .unwrap_or(WriteSchemaResolution::Unresolved);
         }
 
@@ -2428,12 +2528,19 @@ impl QueryManager {
         let write_table_name = match check.metadata.get(MetadataKey::Table.as_str()) {
             Some(t) => TableName::new(t),
             None => {
-                tracing::trace!(
-                    operation = ?check.operation,
-                    metadata_keys = ?check.metadata.keys().collect::<Vec<_>>(),
-                    "allowing write with no table metadata (non-row object)"
-                );
-                self.sync_manager.approve_permission_check(storage, check);
+                // Every check is a client's row write, and a row is judged by the rules
+                // of its table, so a check that names none is never approved: applied, it
+                // would land in whatever table the row is found in by then. A client that
+                // sent no metadata had sent it before, to a store that no longer places
+                // the row; asked again, it resends the row with it. Metadata that names no
+                // table, no client sends.
+                if sent_row_metadata(&mut check.payload).is_some() {
+                    let reason = format!("{:?} denied - the write names no table", check.operation);
+                    self.sync_manager
+                        .reject_permission_check(storage, check, reason);
+                } else {
+                    self.sync_manager.ask_again_for_permission_check(check);
+                }
                 return WriteCheckOutcome::Decided;
             }
         };
@@ -2444,10 +2551,43 @@ impl QueryManager {
             .unwrap_or_else(|| BranchName::new(self.current_branch()));
         let object_id = check.payload.object_id().unwrap_or_default();
 
-        let branch_table_schema = match self
-            .resolve_write_table_schema(write_table_name, branch_name)
+        let mut resolution = self.resolve_write_table_schema(write_table_name, branch_name);
+        // The generation a row sent with metadata is in, when it is not its branch's.
+        let mut sent_generation = None;
+        if let WriteSchemaResolution::Resolved(_, branch_hash) = resolution
+            && sent_row_metadata(&mut check.payload).is_some()
         {
-            WriteSchemaResolution::Resolved(schema) => *schema,
+            // The apply writes a row sent with metadata into the table and generation that
+            // metadata names, where they place it; anywhere else it follows the locator,
+            // into a table this check never judged. A row that names no generation is in
+            // its branch's. One that names a generation this store cannot place yet waits
+            // for it as for a schema that has not arrived, and is denied if it never does;
+            // one whose generation cannot even be read is denied at once, since no store
+            // will ever place it.
+            match sent_row_generation(&mut check, branch_hash) {
+                Some(row_hash)
+                    if self.sync_manager.places_row_in(
+                        storage,
+                        write_table_name.as_str(),
+                        row_hash,
+                    ) =>
+                {
+                    sent_generation = (row_hash != branch_hash).then_some(row_hash);
+                }
+                Some(_) => resolution = WriteSchemaResolution::PendingSchema,
+                None => {
+                    let reason = format!(
+                        "{:?} denied on table {} - the row names a schema hash that cannot be read",
+                        check.operation, write_table_name.0
+                    );
+                    self.sync_manager
+                        .reject_permission_check(storage, check, reason);
+                    return WriteCheckOutcome::Decided;
+                }
+            }
+        }
+        let branch_table_schema = match resolution {
+            WriteSchemaResolution::Resolved(schema, _) => *schema,
             WriteSchemaResolution::PendingSchema => {
                 let wait_started_at = check
                     .schema_wait_started_at
@@ -2583,6 +2723,60 @@ impl QueryManager {
                 .reject_permission_check(storage, check, reason);
             return WriteCheckOutcome::Decided;
         };
+        // A row in another generation than its branch's is stored in that generation's
+        // table and read in its branch's, which the check judges it in: the two must be
+        // one table, and what the row says must be the same in both. Only a delete
+        // carries bytes no reader serves: the row it removes, as written.
+        if let Some(row_hash) = sent_generation {
+            let one_table = translate_table_name_from_schema(
+                &auth_context,
+                write_table_name.as_str(),
+                &row_hash,
+            )
+            .as_deref()
+                == Some(auth_table_name.as_str());
+            let says_the_same = check.operation == Operation::Delete
+                || check.new_content.as_deref().is_some_and(|content| {
+                    let content = crate::query_manager::types::RowBytes::from(content);
+                    let in_generation = |hash| {
+                        self.transform_content_to_authorization_schema(
+                            auth_table_name.as_str(),
+                            &content,
+                            BatchId([0; 16]),
+                            branch_name,
+                            &source_branch_schema_map,
+                            &auth_context,
+                            hash,
+                        )
+                    };
+                    let as_sent = in_generation(Some(row_hash));
+                    as_sent.is_some() && as_sent == in_generation(None)
+                });
+            if !one_table || !says_the_same {
+                let reason = format!(
+                    "{:?} denied on table {} - the row does not read the same in the generation it was sent in",
+                    check.operation, write_table_name.0
+                );
+                self.sync_manager
+                    .reject_permission_check(storage, check, reason);
+                return WriteCheckOutcome::Decided;
+            }
+        }
+        if self.id_holds_a_row_of_another_table(
+            storage,
+            object_id,
+            (write_table_name, branch_name),
+            auth_table_name,
+            &auth_context,
+        ) {
+            let reason = format!(
+                "{:?} denied on table {} - the id is not available to this table",
+                check.operation, write_table_name.0
+            );
+            self.sync_manager
+                .reject_permission_check(storage, check, reason);
+            return WriteCheckOutcome::Decided;
+        }
 
         // Read only now, after every wait above: the reader needs the writer's auth
         // context, and a check that waited for its schema must see the store as it is
@@ -3265,4 +3459,43 @@ impl QueryManager {
             }
         }
     }
+}
+
+/// The metadata a client sent with its row; the apply places the row by it.
+fn sent_row_metadata(payload: &mut SyncPayload) -> Option<&mut HashMap<String, String>> {
+    match payload {
+        SyncPayload::RowBatchCreated {
+            metadata: Some(sent),
+            ..
+        }
+        | SyncPayload::RowBatchNeeded {
+            metadata: Some(sent),
+            ..
+        } => Some(&mut sent.metadata),
+        _ => None,
+    }
+}
+
+/// The generation a row sent with metadata is applied in: the one its metadata names, or
+/// its branch's when it names none, which is then written into the metadata the apply
+/// reads and into the check's own. `None` when the hash it names cannot be read.
+///
+/// A hash the client gave is never replaced: an honest client deleting a row written in
+/// an older generation sends that generation's bytes under that generation's hash.
+fn sent_row_generation(
+    check: &mut PendingPermissionCheck,
+    branch_hash: SchemaHash,
+) -> Option<SchemaHash> {
+    let Some(sent) = sent_row_metadata(&mut check.payload) else {
+        return Some(branch_hash);
+    };
+    if sent.contains_key(MetadataKey::OriginSchemaHash.as_str()) {
+        return origin_schema_hash_from_metadata(sent);
+    }
+    let filled = branch_hash.to_string();
+    sent.insert(MetadataKey::OriginSchemaHash.to_string(), filled.clone());
+    check
+        .metadata
+        .insert(MetadataKey::OriginSchemaHash.to_string(), filled);
+    Some(branch_hash)
 }

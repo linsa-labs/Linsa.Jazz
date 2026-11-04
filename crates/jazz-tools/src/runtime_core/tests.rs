@@ -2385,6 +2385,7 @@ mod settle_skips_tiered;
 mod subscription_fanout_cost;
 mod subscription_registration_cost;
 mod sync_replay;
+mod table_rename_write;
 mod unappliable_row_logging;
 mod write_batch;
 
