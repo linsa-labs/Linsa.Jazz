@@ -340,7 +340,7 @@ struct SubscriptionVisibilityEffect {
 }
 
 #[derive(Debug, Default)]
-struct BatchedSubscriptionVisibilityEffects {
+pub(super) struct BatchedSubscriptionVisibilityEffects {
     remote_dirty_tables: HashSet<String>,
     local_dirty_tables: HashSet<String>,
     remote_updated: HashMap<String, ahash::AHashSet<ObjectId>>,
@@ -2992,13 +2992,34 @@ impl QueryManager {
         self.apply_batched_subscription_visibility_effects(effects);
     }
 
+    /// Index the rows the sync manager made visible since the last drain, now, and keep
+    /// their subscription effects in `effects` for one later
+    /// [`Self::apply_batched_subscription_visibility_effects`].
+    ///
+    /// The permission-check loop calls this after every decision: a policy `exists` reads
+    /// the id index, so a row approved earlier in the loop is invisible to the checks after
+    /// it until its index entries are written, and a child checked in the same pass as its
+    /// parent was denied for good.
+    pub(super) fn index_new_row_visibility(
+        &mut self,
+        storage: &mut dyn Storage,
+        effects: &mut BatchedSubscriptionVisibilityEffects,
+    ) {
+        for update in self.sync_manager.take_pending_row_visibility_changes() {
+            if let Some(effect) = self.prepare_row_update_with_origin(storage, update, false, true)
+            {
+                effects.push(effect);
+            }
+        }
+    }
+
     fn apply_subscription_visibility_effect(&mut self, effect: SubscriptionVisibilityEffect) {
         let mut effects = BatchedSubscriptionVisibilityEffects::default();
         effects.push(effect);
         self.apply_batched_subscription_visibility_effects(effects);
     }
 
-    fn apply_batched_subscription_visibility_effects(
+    pub(super) fn apply_batched_subscription_visibility_effects(
         &mut self,
         effects: BatchedSubscriptionVisibilityEffects,
     ) {

@@ -461,3 +461,112 @@ fn rebac_insert_denied_when_stale_self_schema_would_otherwise_allow() {
         "Denied insert should not be applied when stale self.schema fallback is unsafe"
     );
 }
+
+/// A client's writes are decided in its order: while one waits for its schema, the writes
+/// the same client made after it wait behind it — any of them may depend on it — and
+/// another client's writes go on.
+#[test]
+fn a_write_waiting_for_its_schema_holds_the_same_clients_later_writes() {
+    let schema = rebac_test_schema();
+    let known_hash = SchemaHash::compute(&schema);
+    let known_branch = ComposedBranchName::new("dev", known_hash, "main")
+        .to_branch_name()
+        .as_str()
+        .to_string();
+    // A later generation of the app the server has not learned yet.
+    let mut later = schema.clone();
+    let mut notes = later
+        .get(&TableName::new("documents"))
+        .expect("documents table")
+        .clone();
+    notes.policies = Default::default();
+    later.insert(TableName::new("notes"), notes);
+    let later_hash = SchemaHash::compute(&later);
+    assert_ne!(later_hash, known_hash);
+    let later_branch = ComposedBranchName::new("dev", later_hash, "main")
+        .to_branch_name()
+        .as_str()
+        .to_string();
+
+    let mut qm = QueryManager::new(SyncManager::new());
+    qm.set_known_schemas(Arc::new(HashMap::from([(known_hash, schema)])));
+    let mut storage = MemoryStorage::new();
+    let alice = ClientId::new();
+    let bob = ClientId::new();
+    for (client, user) in [(alice, "alice"), (bob, "bob")] {
+        connect_client(&mut qm, &storage, client);
+        qm.sync_manager_mut()
+            .set_client_session(client, Session::new(user));
+    }
+
+    // Every write below is someone else's document, so each is refused once decided.
+    let write = |branch: &str| {
+        let object_id = ObjectId::new();
+        let commit = stored_row_commit(
+            smallvec![],
+            encode_document("carol", "not mine", None),
+            1000,
+            ObjectId::new().to_string(),
+            None,
+        );
+        let batch = row_batch_id_for_commit(object_id, branch, &commit);
+        let payload = row_batch_created_payload(
+            object_id,
+            branch,
+            Some(RowMetadata {
+                id: object_id,
+                metadata: document_metadata(),
+            }),
+            &commit,
+        );
+        (payload, batch)
+    };
+    let (waits, waits_batch) = write(&later_branch);
+    let (behind, behind_batch) = write(&known_branch);
+    let (other, other_batch) = write(&known_branch);
+    for (client, payload) in [(alice, waits), (alice, behind), (bob, other)] {
+        qm.sync_manager_mut().push_inbox(InboxEntry {
+            source: Source::Client(client),
+            payload,
+        });
+    }
+
+    qm.process(&mut storage);
+    let outbox = qm.sync_manager_mut().take_outbox();
+    assert!(
+        client_write_was_rejected(&outbox, bob, other_batch),
+        "another client's write is decided at once"
+    );
+    assert!(
+        !client_write_was_rejected(&outbox, alice, waits_batch)
+            && !client_write_was_rejected(&outbox, alice, behind_batch),
+        "the waiting write and the one written after it stay undecided"
+    );
+    let pending = qm.sync_manager_mut().take_pending_permission_checks();
+    let pending_batches: Vec<_> = pending
+        .iter()
+        .filter_map(|check| match &check.payload {
+            SyncPayload::RowBatchCreated { row, .. } => Some(row.batch_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pending_batches,
+        vec![waits_batch, behind_batch],
+        "both wait, in the client's order"
+    );
+    qm.sync_manager_mut()
+        .requeue_pending_permission_checks(pending);
+
+    qm.set_known_schemas(Arc::new(HashMap::from([
+        (known_hash, rebac_test_schema()),
+        (later_hash, later),
+    ])));
+    qm.process(&mut storage);
+    let outbox = qm.sync_manager_mut().take_outbox();
+    assert!(
+        client_write_was_rejected(&outbox, alice, waits_batch)
+            && client_write_was_rejected(&outbox, alice, behind_batch),
+        "once the schema arrives, both are decided"
+    );
+}

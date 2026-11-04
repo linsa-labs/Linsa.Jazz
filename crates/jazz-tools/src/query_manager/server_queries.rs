@@ -15,7 +15,10 @@ use crate::sync_manager::{
 
 use super::authz_cache::{AuthzMarker, AuthzScope, AuthzSessionKey};
 use super::graph::IncludePlacement;
-use super::manager::{QueryManager, SchemaWarningAccumulator, ServerQuerySubscription};
+use super::manager::{
+    BatchedSubscriptionVisibilityEffects, QueryManager, SchemaWarningAccumulator,
+    ServerQuerySubscription,
+};
 use super::policy::{ComplexClause, Operation, PolicyExpr};
 use super::policy_graph::{PolicyGraph, PolicyGraphBuildOptions};
 use super::session::Session;
@@ -26,6 +29,15 @@ use super::types::{
 };
 
 const MAX_INITIAL_QUERY_REPLAY_OUTBOX_PER_PASS: usize = 32;
+
+/// What became of a write check: decided (approved or rejected), or put back on the queue
+/// because the schema or permissions it needs are not available yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(super) enum WriteCheckOutcome {
+    Decided,
+    Deferred,
+}
 
 enum WriteSchemaResolution {
     Resolved(Box<TableSchema>),
@@ -2309,9 +2321,28 @@ impl QueryManager {
     pub(super) fn pick_up_pending_permission_checks<H: Storage>(&mut self, storage: &mut H) {
         let pending = self.sync_manager.take_pending_permission_checks();
 
-        for check in pending {
-            self.evaluate_write_permission(storage, check);
+        // A client's writes are decided in the client's order: once one of them waits for
+        // its schema, the ones it wrote after it wait behind it, since any of them may
+        // depend on it. The wait clock starts for them too, so the queue behind a check
+        // that never resolves runs out together with it, not one timeout after another.
+        let mut waiting_clients = HashSet::new();
+        let mut effects = BatchedSubscriptionVisibilityEffects::default();
+        for mut check in pending {
+            if waiting_clients.contains(&check.client_id) {
+                check
+                    .schema_wait_started_at
+                    .get_or_insert_with(Instant::now);
+                self.sync_manager
+                    .requeue_pending_permission_checks(vec![check]);
+                continue;
+            }
+            let client_id = check.client_id;
+            if self.evaluate_write_permission(storage, check) == WriteCheckOutcome::Deferred {
+                waiting_clients.insert(client_id);
+            }
+            self.index_new_row_visibility(storage, &mut effects);
         }
+        self.apply_batched_subscription_visibility_effects(effects);
     }
 
     fn schema_for_write_hash(&self, schema_hash: super::types::SchemaHash) -> Option<&Schema> {
@@ -2393,7 +2424,7 @@ impl QueryManager {
         &mut self,
         storage: &mut H,
         mut check: PendingPermissionCheck,
-    ) {
+    ) -> WriteCheckOutcome {
         let write_table_name = match check.metadata.get(MetadataKey::Table.as_str()) {
             Some(t) => TableName::new(t),
             None => {
@@ -2403,7 +2434,7 @@ impl QueryManager {
                     "allowing write with no table metadata (non-row object)"
                 );
                 self.sync_manager.approve_permission_check(storage, check);
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
 
@@ -2440,7 +2471,7 @@ impl QueryManager {
                     );
                     self.sync_manager
                         .reject_permission_check(storage, check, reason);
-                    return;
+                    return WriteCheckOutcome::Decided;
                 }
 
                 tracing::debug!(
@@ -2452,7 +2483,7 @@ impl QueryManager {
                 );
                 self.sync_manager
                     .requeue_pending_permission_checks(vec![check]);
-                return;
+                return WriteCheckOutcome::Deferred;
             }
             WriteSchemaResolution::Unresolved => {
                 tracing::warn!(
@@ -2467,7 +2498,7 @@ impl QueryManager {
                 );
                 self.sync_manager
                     .reject_permission_check(storage, check, reason);
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
 
@@ -2480,7 +2511,7 @@ impl QueryManager {
         {
             self.sync_manager
                 .reject_permission_check(storage, check, err.to_string());
-            return;
+            return WriteCheckOutcome::Decided;
         }
 
         let (auth_schema, auth_context) = match self.authorization_schema_for_branch(&branch_name) {
@@ -2488,7 +2519,7 @@ impl QueryManager {
             None => {
                 if !self.authorization_schema_required {
                     self.sync_manager.approve_permission_check(storage, check);
-                    return;
+                    return WriteCheckOutcome::Decided;
                 }
                 if self.authorization_schema.is_none() {
                     let reason = format!(
@@ -2503,7 +2534,7 @@ impl QueryManager {
                         "permissions_head_missing".to_string(),
                         reason,
                     );
-                    return;
+                    return WriteCheckOutcome::Decided;
                 }
                 let wait_started_at = check
                     .schema_wait_started_at
@@ -2523,8 +2554,9 @@ impl QueryManager {
                 } else {
                     self.sync_manager
                         .requeue_pending_permission_checks(vec![check]);
+                    return WriteCheckOutcome::Deferred;
                 }
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
         let source_branch_schema_map = self.branch_schema_map.clone();
@@ -2540,7 +2572,7 @@ impl QueryManager {
             );
             self.sync_manager
                 .reject_permission_check(storage, check, reason);
-            return;
+            return WriteCheckOutcome::Decided;
         };
         let Some(auth_table_schema) = auth_schema.get(&auth_table_name) else {
             let reason = format!(
@@ -2549,7 +2581,7 @@ impl QueryManager {
             );
             self.sync_manager
                 .reject_permission_check(storage, check, reason);
-            return;
+            return WriteCheckOutcome::Decided;
         };
 
         // Read only now, after every wait above: the reader needs the writer's auth
@@ -2582,7 +2614,20 @@ impl QueryManager {
                     old_provenance,
                 },
             );
-            return;
+            return WriteCheckOutcome::Decided;
+        }
+
+        // A delete of a row written earlier in the same pass was queued before that row
+        // was applied, so it carries no old row yet; the update arm fills its own.
+        if check.operation == Operation::Delete {
+            Self::refill_old_content(
+                storage,
+                &mut check,
+                object_id,
+                branch_name,
+                write_table_name,
+                old_provenance.is_some(),
+            );
         }
 
         let policy = match check.operation {
@@ -2591,7 +2636,7 @@ impl QueryManager {
             Operation::Delete => auth_table_schema.policies.effective_delete_using(),
             Operation::Select => {
                 self.sync_manager.approve_permission_check(storage, check);
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
 
@@ -2608,7 +2653,7 @@ impl QueryManager {
                 } else {
                     self.sync_manager.approve_permission_check(storage, check);
                 }
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
 
@@ -2618,7 +2663,7 @@ impl QueryManager {
             Operation::Delete => check.old_content.as_ref(),
             Operation::Select => {
                 self.sync_manager.approve_permission_check(storage, check);
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
 
@@ -2631,7 +2676,7 @@ impl QueryManager {
                 );
                 self.sync_manager
                     .reject_permission_check(storage, check, reason);
-                return;
+                return WriteCheckOutcome::Decided;
             }
             Some(_) => {
                 let reason = format!(
@@ -2640,7 +2685,7 @@ impl QueryManager {
                 );
                 self.sync_manager
                     .reject_permission_check(storage, check, reason);
-                return;
+                return WriteCheckOutcome::Decided;
             }
         };
         let provenance = match check.operation {
@@ -2662,7 +2707,7 @@ impl QueryManager {
             );
             self.sync_manager
                 .reject_permission_check(storage, check, reason);
-            return;
+            return WriteCheckOutcome::Decided;
         };
 
         if !self.evaluate_authorization_policy(
@@ -2697,10 +2742,11 @@ impl QueryManager {
             );
             self.sync_manager
                 .reject_permission_check(storage, check, reason);
-            return;
+            return WriteCheckOutcome::Decided;
         }
 
         self.sync_manager.approve_permission_check(storage, check);
+        WriteCheckOutcome::Decided
     }
 
     /// The old row of a check the inbox deferred ([`OldRowSource::AcrossBranches`]): the row
@@ -2807,6 +2853,46 @@ impl QueryManager {
     /// 2. WITH CHECK policy against new_content - is the resulting row valid?
     ///
     /// Both must pass for the update to be allowed.
+    /// Fill a check's old row from the store as it is NOW, where the queue-time read found
+    /// none: that read runs when the write arrives, before an earlier write of the same pass
+    /// — its parent — is applied.
+    fn refill_old_content<H: Storage>(
+        storage: &H,
+        check: &mut PendingPermissionCheck,
+        object_id: ObjectId,
+        branch_name: BranchName,
+        write_table_name: TableName,
+        old_resolved_across_branches: bool,
+    ) {
+        // Not over a cross-branch old row the reader already resolved: that IS the row
+        // readers serve, and this fill reads one branch of it.
+        let resolved_across_branches =
+            check.old_row == OldRowSource::AcrossBranches && old_resolved_across_branches;
+        if !resolved_across_branches
+            && check
+                .old_content
+                .as_ref()
+                .is_none_or(|content| content.is_empty())
+            && let Ok(Some(previous_row)) = storage.load_visible_region_row(
+                write_table_name.as_str(),
+                branch_name.as_str(),
+                object_id,
+            )
+        {
+            check.old_content = Some(previous_row.data.to_vec());
+            // The bytes were just REPLACED, so the shape stamped at queue time
+            // no longer describes them. A stamped-but-stale hash is worse than
+            // no hash: the transform trusts it over the branch derivation and
+            // lenses bytes that never needed lensing. Re-stamp from the same
+            // source the queue-time fill uses.
+            check.old_content_schema_hash = storage
+                .load_row_locator(object_id)
+                .ok()
+                .flatten()
+                .and_then(|locator| locator.origin_schema_hash);
+        }
+    }
+
     fn evaluate_update_permission<H: Storage>(
         &mut self,
         storage: &mut H,
@@ -2833,33 +2919,14 @@ impl QueryManager {
             return;
         }
 
-        // Not over a cross-branch old row the reader already resolved: that IS the row
-        // readers serve, and this fill reads one branch of it.
-        let resolved_across_branches =
-            check.old_row == OldRowSource::AcrossBranches && old_provenance.is_some();
-        if !resolved_across_branches
-            && check
-                .old_content
-                .as_ref()
-                .is_none_or(|content| content.is_empty())
-            && let Ok(Some(previous_row)) = storage.load_visible_region_row(
-                write_table_name.as_str(),
-                branch_name.as_str(),
-                object_id,
-            )
-        {
-            check.old_content = Some(previous_row.data.to_vec());
-            // The bytes were just REPLACED, so the shape stamped at queue time
-            // no longer describes them. A stamped-but-stale hash is worse than
-            // no hash: the transform trusts it over the branch derivation and
-            // lenses bytes that never needed lensing. Re-stamp from the same
-            // source the queue-time fill uses.
-            check.old_content_schema_hash = storage
-                .load_row_locator(object_id)
-                .ok()
-                .flatten()
-                .and_then(|locator| locator.origin_schema_hash);
-        }
+        Self::refill_old_content(
+            storage,
+            &mut check,
+            object_id,
+            branch_name,
+            write_table_name,
+            old_provenance.is_some(),
+        );
 
         let Some(table_schema) = auth_schema.get(&auth_table_name) else {
             self.sync_manager.reject_permission_check(

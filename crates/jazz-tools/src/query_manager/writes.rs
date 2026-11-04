@@ -139,6 +139,7 @@ impl QueryManager {
     fn resolve_insert_object_id<H: Storage>(
         &self,
         storage: &H,
+        table: &str,
         external_object_id: Option<ObjectId>,
     ) -> Result<ObjectId, QueryError> {
         if let Some(object_id) = external_object_id {
@@ -147,6 +148,9 @@ impl QueryManager {
                 .map_err(|err| QueryError::EncodingError(format!("load row locator: {err}")))?
                 .is_some()
             {
+                if self.only_rejected_inserts_hold_id(storage, table, object_id) {
+                    return Ok(object_id);
+                }
                 if let Some(table) = self.load_row_table_name(storage, object_id) {
                     let branch = self.current_branch();
                     if self.row_is_deleted_on_branch(storage, &table, &branch, object_id)
@@ -165,6 +169,36 @@ impl QueryManager {
         }
 
         Ok(ObjectId::new())
+    }
+
+    /// Whether every version this store holds of `object_id` in `table` was rejected and
+    /// none is visible on any branch: the row never existed anywhere, and its id is free.
+    ///
+    /// A rejected write keeps its versions, marked `Rejected`, for the rejection's replay to
+    /// the app; they hold the row's locator, and without this a retry at the same id — the
+    /// write a client makes once the rule admits it — failed as a duplicate of a row that
+    /// the server never had.
+    fn only_rejected_inserts_hold_id<H: Storage>(
+        &self,
+        storage: &H,
+        table: &str,
+        object_id: ObjectId,
+    ) -> bool {
+        if self.load_row_table_name(storage, object_id).as_deref() != Some(table) {
+            return false;
+        }
+        let Ok(versions) = storage.scan_history_row_batches(table, object_id) else {
+            return false;
+        };
+        !versions.is_empty()
+            && versions
+                .iter()
+                .all(|version| version.state == RowState::Rejected)
+            && versions.iter().all(|version| {
+                storage
+                    .load_visible_region_entry(table, version.branch.as_str(), object_id)
+                    .is_ok_and(|entry| entry.is_none())
+            })
     }
 
     fn resolve_write_author(write_context: Option<&WriteContext>) -> String {
@@ -1142,7 +1176,7 @@ impl QueryManager {
 
         let data =
             encode_row(descriptor, values).map_err(|e| QueryError::EncodingError(e.to_string()))?;
-        let object_id = self.resolve_insert_object_id(storage, external_object_id)?;
+        let object_id = self.resolve_insert_object_id(storage, table, external_object_id)?;
         let timestamp = self.resolve_update_timestamp(write_context);
         let provenance = self.row_provenance_for_insert(write_context, timestamp);
 

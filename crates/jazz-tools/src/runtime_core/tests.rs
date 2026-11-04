@@ -2358,6 +2358,7 @@ mod authz_cache_runtime;
 mod basic;
 mod batch_fate_offer_differential;
 mod batched_tick_parked_drain;
+mod causal_chain_policy;
 mod cold_boot_generation_universe;
 mod cross_generation_backref_read;
 mod cross_generation_differential;
