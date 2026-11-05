@@ -46,11 +46,12 @@ pub(crate) struct OverlayMember {
 /// The approved, declared rows of one batch, for the re-evaluation of one of its parked
 /// checks: never the evaluated row itself.
 ///
-/// The evaluated row is a member only when the same content is both stored and parked: it
-/// was approved in a fixed point that ended waiting on a check deferred for its schema,
-/// and was sent again in another state. Shown to its own check, an `idIsFree` would find
-/// the row itself and refuse an honest batch; leaving it out reads its id as it was before
-/// the batch.
+/// The evaluated row is a member only when it is already one of the batch's rows: on the
+/// server, when the same content is both stored and parked (it was approved in a fixed
+/// point that ended waiting on a check deferred for its schema, and was sent again in
+/// another state); on a client, whenever its write rewrites a row the batch wrote before.
+/// Shown to its own check, an `idIsFree` would find the row itself and refuse an honest
+/// batch; leaving it out reads its id as it was before the batch.
 #[derive(Debug, Clone)]
 pub(crate) struct BatchOverlay {
     pub(crate) batch_id: BatchId,
@@ -119,7 +120,7 @@ pub(crate) fn policy_reads_through_batch_overlay(
 /// A re-evaluation runs all the policies of the write, not only the one that denied: an
 /// update denied by its USING is judged by its WITH CHECK too, and a check queued as an
 /// insert can be judged as an update once the old row is found.
-fn write_policies_read_through_batch_overlay(
+pub(super) fn write_policies_read_through_batch_overlay(
     denying: &PolicyExpr,
     own_table: TableName,
     schema: &Schema,
@@ -138,6 +139,51 @@ fn write_policies_read_through_batch_overlay(
     .into_iter()
     .flatten()
     .all(|policy| policy_reads_through_batch_overlay(policy, own_table, schema))
+}
+
+/// The rows a client has written to its open batch on `branch`, as the batch overlay reads
+/// them for the next write's check.
+pub(super) fn written_batch_members<H: Storage>(
+    storage: &H,
+    batch_id: BatchId,
+    branch: &str,
+) -> HashMap<ObjectId, OverlayMember> {
+    storage
+        .load_local_batch_row_index(batch_id)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|member| member.branch_name.as_str() == branch)
+        .filter(|member| {
+            storage
+                .load_history_row_batch_for_schema_hash(
+                    member.table_name.as_str(),
+                    member.schema_hash,
+                    member.branch_name.as_str(),
+                    member.object_id,
+                    batch_id,
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|row| {
+                    matches!(
+                        row.state,
+                        RowState::StagingPending | RowState::VisibleDirect
+                    )
+                })
+        })
+        .map(|member| {
+            (
+                member.object_id,
+                OverlayMember {
+                    table_name: member.table_name,
+                    schema_hash: member.schema_hash,
+                    branch_name: member.branch_name,
+                },
+            )
+        })
+        .collect()
 }
 
 fn covered(

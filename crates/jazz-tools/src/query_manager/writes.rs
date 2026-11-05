@@ -832,8 +832,9 @@ impl QueryManager {
                 }
 
                 if let Some(policy) = auth_table_schema.policies.update_using_policy()
-                    && !self.evaluate_current_authorization_policy_for_content(
+                    && !self.evaluate_local_write_policy(
                         storage,
+                        write_context,
                         id,
                         branch,
                         table_name,
@@ -853,8 +854,9 @@ impl QueryManager {
                 }
 
                 if let Some(policy) = auth_table_schema.policies.update_check_policy()
-                    && !self.evaluate_current_authorization_policy_for_content(
+                    && !self.evaluate_local_write_policy(
                         storage,
+                        write_context,
                         id,
                         branch,
                         table_name,
@@ -1199,8 +1201,9 @@ impl QueryManager {
                     .get(&table_name)
                     .and_then(|table_schema| table_schema.policies.insert_policy())
                     .map(|policy| {
-                        self.evaluate_current_authorization_policy_for_content(
+                        self.evaluate_local_write_policy(
                             storage,
+                            write_context,
                             object_id,
                             branch,
                             table_name,
@@ -1463,6 +1466,82 @@ impl QueryManager {
                 policy_branches: None,
             },
         )
+    }
+
+    /// A client's own write, checked before it is sent. Alone first; then, for a write in
+    /// an open batch whose every write policy can read the batch, again with the rows
+    /// already written to the batch visible, as the server judges a row that waits for its
+    /// batch (`decide_parked_batch`). Refused here, such a write would never be sent.
+    ///
+    /// Each row of the batch was checked when it was written, against the rows written
+    /// before it, so a row is allowed only by rows already allowed: never by rows that
+    /// vouch for each other. A row leaning on one its batch writes after it is refused
+    /// here, though the server, taking the batch in id order, would accept it: a parent
+    /// is written before its child.
+    ///
+    /// The server stays the judge. It decides a batch as it ends, the client as it is
+    /// written so far: a row leaning on a row its batch later updates or deletes passes
+    /// here and is decided there on the final rows, and so are rows the server checks
+    /// under another session, or past its bounds on a batch's passes and parked rows. In
+    /// each the client lets the write through and the server's verdict stands.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_local_write_policy<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        write_context: Option<&WriteContext>,
+        object_id: ObjectId,
+        branch: &str,
+        table_name: TableName,
+        policy: &crate::query_manager::policy::PolicyExpr,
+        content: &[u8],
+        provenance: &RowProvenance,
+        session: &Session,
+        operation: Operation,
+        auth_schema: &Schema,
+        auth_context: &crate::schema_manager::SchemaContext,
+    ) -> bool {
+        let evaluate = |manager: &mut Self, storage: &mut H| {
+            manager.evaluate_current_authorization_policy_for_content(
+                storage,
+                object_id,
+                branch,
+                table_name,
+                policy,
+                content,
+                provenance,
+                session,
+                operation,
+                auth_schema,
+                auth_context,
+            )
+        };
+        if evaluate(self, storage) {
+            return true;
+        }
+        let Some(batch_id) = write_context.and_then(WriteContext::batch_id) else {
+            return false;
+        };
+        if !super::batch_siblings::write_policies_read_through_batch_overlay(
+            policy,
+            table_name,
+            auth_schema,
+        ) {
+            return false;
+        }
+        let members = super::batch_siblings::written_batch_members(storage, batch_id, branch);
+        if members.is_empty() {
+            return false;
+        }
+        let previous = self
+            .write_check_overlay
+            .replace(super::batch_siblings::BatchOverlay {
+                batch_id,
+                members,
+                evaluated: object_id,
+            });
+        let allowed = evaluate(self, storage);
+        self.write_check_overlay = previous;
+        allowed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2173,8 +2252,9 @@ impl QueryManager {
                 }
 
                 if let Some(policy) = auth_table_schema.policies.effective_delete_using()
-                    && !self.evaluate_current_authorization_policy_for_content(
+                    && !self.evaluate_local_write_policy(
                         storage,
+                        write_context,
                         id,
                         branch,
                         table_name,
