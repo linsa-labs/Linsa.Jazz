@@ -478,6 +478,7 @@ mod pre_write_row_from_tips;
 mod query_scope;
 mod round2_cross_generation_review;
 mod scope_withdrawal;
+mod self_accepted_transaction;
 mod server_origin_seal;
 mod server_sync;
 mod settlements;
