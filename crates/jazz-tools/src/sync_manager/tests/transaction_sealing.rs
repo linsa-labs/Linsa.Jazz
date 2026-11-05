@@ -2719,6 +2719,59 @@ fn an_edge_forwards_only_a_reseal_it_would_settle() {
     );
 }
 
+/// A denied row from anyone but the batch's writer is denied alone, even when its check
+/// reaches the decision without the inbox's refusal: only the writer's denied row decides
+/// the batch.
+#[test]
+fn a_denied_row_from_anyone_but_the_writer_is_denied_alone() {
+    let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::GlobalServer);
+    let mut io = MemoryStorage::new();
+    let (_alice, batch_id, row) = alices_direct_row(&mut sm, &mut io);
+    let mallory = user_client(&mut sm, &io, "mallory");
+    sm.take_outbox();
+
+    // Queued directly, which no inbox path does for a stranger, so the decision is what
+    // is tested.
+    let denied = users_row_of_batch(batch_id, "mallory");
+    sm.queue_for_permission_check(
+        mallory,
+        row_payload(&denied),
+        Session::new("mallory"),
+        std::collections::HashMap::new(),
+        None,
+        None,
+        None,
+        crate::query_manager::policy::Operation::Insert,
+        Default::default(),
+    );
+    for check in sm.take_pending_permission_checks() {
+        sm.reject_permission_check(&mut io, check, "denied".to_string());
+    }
+
+    assert_eq!(
+        io.load_authoritative_batch_fate(batch_id).unwrap(),
+        None,
+        "the batch is still undecided"
+    );
+    assert!(
+        io.load_visible_region_row("users", "main", row.row_id)
+            .unwrap()
+            .is_some(),
+        "alice's row is still served"
+    );
+    let outbox = sm.take_outbox();
+    assert!(
+        outbox.iter().any(|entry| matches!(
+            entry,
+            OutboxEntry {
+                destination: Destination::Client(id),
+                payload: SyncPayload::Error(SyncError::PermissionDenied { object_id, .. }),
+            } if *id == mallory && *object_id == denied.row_id
+        )),
+        "mallory's row is denied on its own: {outbox:?}"
+    );
+}
+
 // ---- Random interleavings of writers and strangers, against a model of the rules.
 
 mod batch_writer_differential {
