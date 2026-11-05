@@ -37,8 +37,12 @@ impl SyncManager {
             }
             _ => None,
         };
+        // A row of a batch decided while it waited for its check is answered with the
+        // decision, never applied over the rows it settled: a client that accepted its own
+        // transaction sends its rows again in the same exchange, and the decision can come
+        // between their arrival and their check.
         if let Some(batch_id) = batch_id
-            && let Some(fate) = self.load_rejected_batch_fate(storage, batch_id)
+            && let Some(fate) = self.load_decided_transaction_fate(storage, batch_id)
         {
             self.queue_batch_fate_to_client(check.client_id, fate);
             return;
@@ -177,13 +181,15 @@ impl SyncManager {
         id
     }
 
-    fn load_rejected_batch_fate<H: Storage>(
+    fn load_decided_transaction_fate<H: Storage>(
         &self,
         storage: &H,
         batch_id: BatchId,
     ) -> Option<BatchFate> {
         match storage.load_authoritative_batch_fate(batch_id) {
-            Ok(Some(fate @ BatchFate::Rejected { .. })) => Some(fate),
+            Ok(Some(
+                fate @ (BatchFate::Rejected { .. } | BatchFate::AcceptedTransaction { .. }),
+            )) => Some(fate),
             _ => None,
         }
     }

@@ -3051,12 +3051,33 @@ impl SyncManager {
                             })
                             .unwrap_or_else(|| (HashMap::new(), None));
 
+                        // A client that is its own authority at a lower tier (an app's
+                        // client, at `Local`) accepts its sealed transaction there and sends
+                        // the rows again, accepted. That acceptance is the client's own: the
+                        // batch is still this server's to decide, so the row is taken as the
+                        // staged row it was. Stored as sent, it was served before its batch
+                        // was decided, and its seal was refused for holding a row neither
+                        // direct nor staged, with nobody told.
+                        let staged = (row.state == RowState::VisibleTransactional).then(|| {
+                            let mut staged = row.clone();
+                            staged.state = RowState::StagingPending;
+                            staged.confirmed_tier = None;
+                            staged
+                        });
+
                         // Idempotent replay short-circuit: reconnect replays row
                         // history, so only an exact stored row-batch match counts as
                         // a true no-op. Same-batch corrections must still flow
                         // through permission evaluation.
+                        //
+                        // A row resent accepted is a replay as sent, when this server
+                        // accepted its batch and stored it so, or as the staged row it
+                        // stands for, when the batch is still undecided here.
                         if let Some(existing_history_row) = existing_history_row.as_ref()
-                            && Self::matches_replayed_row_batch(existing_history_row, row)
+                            && (Self::matches_replayed_row_batch(existing_history_row, row)
+                                || staged.as_ref().is_some_and(|staged| {
+                                    Self::matches_replayed_row_batch(existing_history_row, staged)
+                                }))
                         {
                             self.row_batch_interest
                                 .insert(RowBatchKey::from_row(row), client_id);
@@ -3073,6 +3094,7 @@ impl SyncManager {
                         }
 
                         // Not a replay: now pay for the policy check's inputs.
+                        let row = staged.as_ref().unwrap_or(row);
                         let payload_metadata = metadata
                             .as_ref()
                             .map(|meta| meta.metadata.clone())
@@ -3130,6 +3152,15 @@ impl SyncManager {
                                 .flatten()
                                 .and_then(|locator| locator.origin_schema_hash)
                         });
+                        let payload = match (payload, staged) {
+                            (SyncPayload::RowBatchCreated { metadata, .. }, Some(row)) => {
+                                SyncPayload::RowBatchCreated { metadata, row }
+                            }
+                            (SyncPayload::RowBatchNeeded { metadata, .. }, Some(row)) => {
+                                SyncPayload::RowBatchNeeded { metadata, row }
+                            }
+                            (payload, _) => payload,
+                        };
                         self.queue_for_permission_check(
                             client_id,
                             payload,
