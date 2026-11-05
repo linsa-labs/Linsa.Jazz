@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::batch_fate::BatchFate;
+use crate::batch_fate::{BatchFate, BatchMode};
 use crate::runtime_core::ticks::LocalBatchLookup;
 use crate::sync_manager::SyncManager;
 
@@ -100,13 +100,32 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         // retire.
         let had_cached_record = self.local_batch_record_cache.remove(&batch_id).is_some();
         let should_delete_row_index = confirmed_tier >= DurabilityTier::GlobalServer;
+        // A transaction's seal stays until a global server confirms the batch, as its row
+        // index does (`SyncManager::batch_fate_lets_seal_go`). Only what is deleted counts
+        // as bookkeeping: a kept seal must not cost a flush per fate the batch receives.
+        let should_delete_seal = self
+            .storage
+            .load_sealed_batch_submission(batch_id)
+            .ok()
+            .flatten()
+            .is_some_and(|seal| {
+                let fate = match seal.mode {
+                    BatchMode::Direct => BatchFate::DurableDirect {
+                        batch_id,
+                        confirmed_tier,
+                    },
+                    BatchMode::Transactional => BatchFate::AcceptedTransaction {
+                        batch_id,
+                        confirmed_tier,
+                    },
+                };
+                self.schema_manager
+                    .query_manager()
+                    .sync_manager()
+                    .batch_fate_lets_seal_go(seal.mode, &fate)
+            });
         let has_stored_bookkeeping = had_cached_record
-            || self
-                .storage
-                .load_sealed_batch_submission(batch_id)
-                .ok()
-                .flatten()
-                .is_some()
+            || should_delete_seal
             || self
                 .storage
                 .load_local_batch_record(batch_id)
@@ -124,7 +143,9 @@ impl<S: Storage, Sch: Scheduler> RuntimeCore<S, Sch> {
         if !has_stored_bookkeeping {
             return;
         }
-        if let Err(error) = self.storage.delete_sealed_batch_submission(batch_id) {
+        if should_delete_seal
+            && let Err(error) = self.storage.delete_sealed_batch_submission(batch_id)
+        {
             tracing::warn!(?batch_id, %error, "failed to retire sealed batch submission");
         }
         if let Err(error) = self.storage.delete_local_batch_record(batch_id) {

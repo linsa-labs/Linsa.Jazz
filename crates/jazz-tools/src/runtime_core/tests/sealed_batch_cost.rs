@@ -550,12 +550,14 @@ fn a_tiered_node_settles_its_own_transactional_write_at_commit() {
         "a committed transactional write on a node that is its own authority must be \
          accepted by the tick that commit ends in"
     );
-    assert_eq!(
+    // The seal stays: a transaction settled below `GlobalServer` keeps it for the global
+    // server this node may reach later (`SyncManager::batch_fate_lets_seal_go`).
+    assert!(
         core.storage()
             .load_sealed_batch_submission(batch_id)
-            .unwrap(),
-        None,
-        "a settled seal must retire its submission"
+            .unwrap()
+            .is_some(),
+        "a transaction accepted at Local keeps its submission until a global server settles it"
     );
 }
 
@@ -927,12 +929,14 @@ fn a_seal_whose_fate_write_failed_is_settled_by_the_tick_after_the_store_recover
         "the store took the write on the next tick: a fate write that failed must put the \
          batch back in front of the sweep"
     );
-    assert_eq!(
+    // The seal stays: a transaction settled below `GlobalServer` keeps it for the global
+    // server this node may reach later (`SyncManager::batch_fate_lets_seal_go`).
+    assert!(
         core.storage()
             .load_sealed_batch_submission(batch_id)
-            .unwrap(),
-        None,
-        "a completed seal must retire its submission"
+            .unwrap()
+            .is_some(),
+        "a transaction accepted at Local keeps its submission until a global server settles it"
     );
 }
 

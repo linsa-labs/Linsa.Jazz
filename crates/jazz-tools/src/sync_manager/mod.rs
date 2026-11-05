@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-use crate::batch_fate::{BatchFate, SealedBatchSubmission};
+use crate::batch_fate::{BatchFate, BatchMode, SealedBatchSubmission};
 use crate::catalogue::CatalogueEntry;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::query::Query;
@@ -687,6 +687,24 @@ impl SyncManager {
     /// [`Self::fate_settled_at`] against this node's settlement target.
     pub fn batch_fate_is_settled(&self, fate: &BatchFate) -> bool {
         Self::fate_settled_at(fate, self.settlement_target())
+    }
+
+    /// Whether `fate` lets go the seal of a batch written in `mode`, at every place a seal is
+    /// deleted. A transaction's seal stays until a global server has settled the batch, as
+    /// its row index does (`RuntimeCore::retire_settled_batch`): a node that settles its own
+    /// transaction with no server to ask keeps the seal for the server it reaches later,
+    /// which cannot decide the batch without it, and a seal rebuilt from rows cannot tell
+    /// the node's own batch from another writer's whose rows it was sent. The seal's own
+    /// mode decides, not the fate's kind, so a fate of the wrong kind cannot drop it early.
+    /// A direct batch's seal goes once its fate is settled here. An authority keeps none: a
+    /// server with no upstream runs at `GlobalServer`. A node that never reaches one keeps
+    /// every transaction's seal for its life; nothing is offered while its target is
+    /// `Local` (`fate_needs_settlement_at`), and the seals are read whole only on connect.
+    pub(crate) fn batch_fate_lets_seal_go(&self, mode: BatchMode, fate: &BatchFate) -> bool {
+        match mode {
+            BatchMode::Transactional => Self::fate_settled_at(fate, DurabilityTier::GlobalServer),
+            BatchMode::Direct => self.batch_fate_is_settled(fate),
+        }
     }
 
     /// Call after relaying `fate` to the interested clients. A settled fate is the last one the

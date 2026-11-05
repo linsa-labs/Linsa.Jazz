@@ -9,9 +9,11 @@
 //! Two things are checked after every op:
 //!
 //! - **Liveness.** Every submission that is completable — sealed, all declared rows on
-//!   disk, no fate yet — has been completed: the fate the model expects is stored, and the
-//!   submission is retired. The node under test has no upstream, so its settlement target
-//!   is `Local` and every fate it writes is terminal. Completion is owed by the end of any
+//!   disk, no fate yet — has been completed: the fate the model expects is stored, and a
+//!   direct batch's submission is retired. A transaction's stays until a global server
+//!   settles the batch (`SyncManager::batch_fate_lets_seal_go`), which on this node is
+//!   never. The node under test has no upstream, so its settlement target is `Local` and
+//!   every fate it writes is terminal. Completion is owed by the end of any
 //!   op that ends in a tick whose storage reads were not failing.
 //! - **Cost.** On the memory arm, whose storage counts reads: after the opening walk, a tick
 //!   reads fates in proportion to the batches touched since the previous tick, never in
@@ -394,13 +396,14 @@ impl Harness {
         let mut completed_now = BTreeSet::new();
         let batch_ids: Vec<BatchId> = self.order.clone();
         for batch_id in batch_ids {
-            let (expected_fate, completable, complete, sealed) = {
+            let (expected_fate, completable, complete, sealed, mode) = {
                 let batch = &self.model[&batch_id];
                 (
                     batch.expected_fate(batch_id),
                     batch.completable(),
                     batch.complete,
                     batch.sealed,
+                    batch.mode,
                 )
             };
             let stored_fate = self
@@ -425,10 +428,13 @@ impl Harness {
                      looked at again is exactly what a sweep that reads only what changed \
                      can get wrong. Sealed={sealed} completable={completable} settles={settles}"
                 );
-                assert!(
-                    !stored_seal,
+                assert_eq!(
+                    stored_seal,
+                    mode == BatchMode::Transactional,
                     "seed {seed:#x} op {op_index} ({op}): batch {batch_id:?} is complete at \
-                     this node's settlement target and its submission must be retired"
+                     this node's settlement target. A direct batch's submission must be \
+                     retired there; a transaction's must stay until a global server settles \
+                     it, and this node has none"
                 );
                 if !complete {
                     completed_now.insert(batch_id);

@@ -1713,11 +1713,13 @@ fn rc_restart_accepts_stale_unrelated_family_frontier_sealed_batch_from_storage(
             .state,
         crate::row_histories::RowState::VisibleTransactional
     );
-    assert_eq!(
+    // The seal stays: a transaction settled below `GlobalServer` keeps it for the global
+    // server this node may reach later (`SyncManager::batch_fate_lets_seal_go`).
+    assert!(
         restarted
             .storage()
             .load_sealed_batch_submission(batch_id)
-            .unwrap(),
-        None
+            .unwrap()
+            .is_some()
     );
 }

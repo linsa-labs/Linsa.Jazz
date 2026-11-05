@@ -29,9 +29,12 @@
 //!   rows. Row history is never deleted here, so `rows_present` stays true past
 //!   every retirement; only the bookkeeping around it goes.
 //! * `has_submission` / `has_record` / `has_row_index` — the retained
-//!   bookkeeping. `retire_settled_batch` drops the submission and the record at
-//!   any tier and the row index only from `GlobalServer` up, which is exactly
-//!   the state the production store was in.
+//!   bookkeeping. `retire_settled_batch` drops the record at any tier and the
+//!   row index only from `GlobalServer` up, which is exactly the state the
+//!   production store was in. The submission follows
+//!   `SyncManager::batch_fate_lets_seal_go`: a direct batch's goes once its
+//!   tier reaches the settlement target, a transaction's only from
+//!   `GlobalServer` up, like the row index.
 //! * `connected` — one upstream server or none. It is not decoration: it moves
 //!   `settlement_target()` between `GlobalServer` and `Local`, and a
 //!   `DurableDirect{Local}` is terminal at one and unsettled at the other.
@@ -169,6 +172,9 @@ struct ModelBatch {
     rows_present: bool,
     /// Retained sealed submission. Asserted against storage.
     has_submission: bool,
+    /// Written in a transaction. A transaction's seal outlives a settlement
+    /// below `GlobalServer`; a direct batch's does not.
+    transactional: bool,
     /// The runtime can still find the batch's local record — cache OR storage.
     /// Deliberately a union rather than two fields: the only thing it gates is
     /// whether `commit_batch` finds a record to seal, and that lookup consults
@@ -373,12 +379,21 @@ impl<S: Storage> Harness<S> {
         true
     }
 
-    /// `retire_settled_batch`: submission and record go at any tier, the row
-    /// index only from `GlobalServer` up. Row history is untouched — which is
-    /// the whole reason a stranded batch is recoverable at all.
+    /// `retire_settled_batch`: the record goes at any tier, the row index only
+    /// from `GlobalServer` up, and the submission as `batch_fate_lets_seal_go`
+    /// says. Row history is untouched — which is the whole reason a stranded
+    /// batch is recoverable at all.
     fn model_retire(&mut self, batch_id: BatchId, confirmed_tier: DurabilityTier) {
+        let target = self.target();
         if let Some(batch) = self.model.get_mut(&batch_id) {
-            batch.has_submission = false;
+            let seal_goes = if batch.transactional {
+                confirmed_tier >= DurabilityTier::GlobalServer
+            } else {
+                confirmed_tier >= target
+            };
+            if seal_goes {
+                batch.has_submission = false;
+            }
             batch.has_record = false;
             if confirmed_tier >= DurabilityTier::GlobalServer {
                 batch.has_row_index = false;
@@ -408,6 +423,7 @@ impl<S: Storage> Harness<S> {
                 // ran: submission and record gone, row index kept. That is the
                 // production shape the defect needed.
                 has_submission: !settled_at_commit,
+                transactional: false,
                 has_record: true,
                 has_row_index: true,
             },
@@ -442,6 +458,7 @@ impl<S: Storage> Harness<S> {
                 sealed: false,
                 rows_present: true,
                 has_submission: false,
+                transactional: true,
                 has_record: true,
                 has_row_index: true,
             },

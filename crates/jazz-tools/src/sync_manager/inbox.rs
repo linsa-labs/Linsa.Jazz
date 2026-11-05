@@ -2156,7 +2156,7 @@ impl SyncManager {
             }
         };
 
-        if self.batch_fate_is_settled(&fate)
+        if self.batch_fate_lets_seal_go(submission.mode, &fate)
             && let Err(error) = storage.delete_sealed_batch_submission(batch_id)
         {
             tracing::warn!(?batch_id, %error, "failed to delete sealed batch submission");
@@ -2384,7 +2384,8 @@ impl SyncManager {
                     // Continue into seal validation so this authority can promote a
                     // previously local direct fate to its own durability tier.
                 } else {
-                    let should_prune_submission = self.batch_fate_is_settled(&fate);
+                    let should_prune_submission =
+                        self.batch_fate_lets_seal_go(submission.mode, &fate);
                     let prune_result = if should_prune_submission {
                         storage.delete_sealed_batch_submission(batch_id)
                     } else {
