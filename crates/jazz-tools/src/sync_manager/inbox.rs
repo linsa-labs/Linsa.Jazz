@@ -20,6 +20,9 @@ struct AppliedRowBatch {
     metadata: HashMap<String, String>,
     row: StoredRowBatch,
     visibility_change: Option<RowVisibilityChange>,
+    /// `ApplyRowBatchResult::replaced_batch_version`: what a relay to this node's servers
+    /// needs to know to send it on.
+    replaced_batch_version: bool,
 }
 
 /// Whether applying a visible row should also record this server's
@@ -991,7 +994,7 @@ impl SyncManager {
         let (is_newly_located_object, needs_exact_locator) =
             self.ensure_object_metadata(storage, row.row_id, metadata.clone());
         let branch_name = BranchName::new(&row.branch);
-        let visibility_change =
+        let (visibility_change, replaced_batch_version) =
             match self.row_context_from_metadata(storage, &metadata, needs_exact_locator) {
                 Some((row_locator, context)) => {
                     let table = row_locator.table.to_string();
@@ -1010,7 +1013,7 @@ impl SyncManager {
                             is_known_new_object: is_newly_located_object && row.parents.is_empty(),
                         },
                     ) {
-                        Ok(applied) => applied.visibility_change,
+                        Ok(applied) => (applied.visibility_change, applied.replaced_batch_version),
                         Err(err) => {
                             let (speak, attempts, stuck_for) = self.note_unappliable_row(
                                 (row.row_id, branch_name),
@@ -1044,7 +1047,7 @@ impl SyncManager {
                 }
                 None => {
                     match apply_row_batch(storage, row.row_id, &branch_name, row.clone(), &[]) {
-                        Ok(applied) => applied.visibility_change,
+                        Ok(applied) => (applied.visibility_change, applied.replaced_batch_version),
                         Err(err) => {
                             let (speak, attempts, stuck_for) = self.note_unappliable_row(
                                 (row.row_id, branch_name),
@@ -1112,6 +1115,7 @@ impl SyncManager {
             metadata,
             row,
             visibility_change,
+            replaced_batch_version,
         }))
     }
 
@@ -1390,6 +1394,7 @@ impl SyncManager {
                     object_id,
                     applied.metadata.clone(),
                     parked.row.clone(),
+                    applied.replaced_batch_version,
                 );
                 if !matches!(
                     applied.row.state,
@@ -3522,6 +3527,7 @@ impl SyncManager {
                         object_id,
                         applied.metadata.clone(),
                         row,
+                        applied.replaced_batch_version,
                     );
                     if !matches!(
                         applied.row.state,

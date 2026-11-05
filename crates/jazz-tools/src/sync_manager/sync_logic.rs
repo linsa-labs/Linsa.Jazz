@@ -278,6 +278,9 @@ impl SyncManager {
         }
     }
 
+    /// Queue `row` to `server_id` unless its batch was queued there already and nothing
+    /// says the server lacks it. Returns whether the row is on its way: queued now, or one
+    /// that never syncs (`NoSync`).
     pub(super) fn queue_row_to_server_with_metadata(
         &mut self,
         server_id: ServerId,
@@ -285,20 +288,20 @@ impl SyncManager {
         metadata: &HashMap<String, String>,
         row: StoredRowBatch,
         include_metadata: bool,
-    ) {
+    ) -> bool {
         if metadata
             .get(crate::metadata::MetadataKey::NoSync.as_str())
             .map(|v| v == "true")
             .unwrap_or(false)
         {
-            return;
+            return true;
         }
 
         let branch_name = BranchName::new(&row.branch);
         let batch_id = row.batch_id;
         let batch_already_sent = {
             let Some(server) = self.servers.get(&server_id) else {
-                return;
+                return false;
             };
             server
                 .sent_batch_ids
@@ -307,11 +310,11 @@ impl SyncManager {
         };
 
         if batch_already_sent && !include_metadata {
-            return;
+            return false;
         }
 
         let Some(server) = self.servers.get_mut(&server_id) else {
-            return;
+            return false;
         };
         if include_metadata {
             server.sent_metadata.insert(object_id);
@@ -332,6 +335,7 @@ impl SyncManager {
                 row,
             },
         });
+        true
     }
 
     pub(super) fn queue_initial_row_to_client_with_storage<H: Storage + ?Sized>(

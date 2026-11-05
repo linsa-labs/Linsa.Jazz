@@ -144,6 +144,10 @@ pub struct ApplyRowBatchResult {
     pub batch_id: BatchId,
     pub row_locator: RowLocator,
     pub visibility_change: Option<RowVisibilityChange>,
+    /// The store held another version of this row in this batch, written at another time
+    /// or with other data, and this one took its place. A change of state or tier alone is
+    /// not one.
+    pub replaced_batch_version: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

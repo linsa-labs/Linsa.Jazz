@@ -95,11 +95,11 @@ impl SyncManager {
         object_id: ObjectId,
         metadata: &HashMap<String, String>,
         row: StoredRowBatch,
-    ) {
+    ) -> bool {
         let branch_name = BranchName::new(&row.branch);
         let include_metadata = {
             let Some(server) = self.servers.get(&server_id) else {
-                return;
+                return false;
             };
             let metadata_already_sent = server.sent_metadata.contains(&object_id);
             if !metadata_already_sent {
@@ -114,7 +114,7 @@ impl SyncManager {
             metadata,
             row,
             include_metadata,
-        );
+        )
     }
 
     pub(super) fn load_current_row_from_storage<H: crate::storage::Storage + ?Sized>(
@@ -238,6 +238,7 @@ impl SyncManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn forward_row_batch_to_servers_with_storage<H: Storage>(
         &mut self,
         storage: &H,
@@ -245,6 +246,41 @@ impl SyncManager {
         object_id: ObjectId,
         metadata: HashMap<String, String>,
         row: StoredRowBatch,
+    ) {
+        self.forward_row_version_to_servers(storage, table, object_id, metadata, row, false);
+    }
+
+    /// Forwards `row` with its parent closure to every server, for a version that this node's
+    /// store has just taken in place of another one of the same batch: written again here, or
+    /// relayed from a client that wrote it again.
+    ///
+    /// A server's sent set holds batches, not versions, and a batch is in it from the moment
+    /// its row is queued (`SentBatchIds::record_delivery`). For a row the server has confirmed
+    /// the set is the whole dedup (`queue_row_to_server_with_metadata`), so the later version
+    /// would never go, while the batch's seal declares it: the server asks for the batch
+    /// (`Missing`), and judges whatever the writer wrote over the row meanwhile against a row
+    /// lacking it. So the claim that the batch reached each server is taken back first, as
+    /// `force_row_batch_to_servers` does, and only for the batch itself: its ancestors are
+    /// the earlier version's, which a rewrite keeps (`parent_ids_for_write`).
+    pub(crate) fn forward_new_row_version_to_servers_with_storage<H: Storage>(
+        &mut self,
+        storage: &H,
+        table: &str,
+        object_id: ObjectId,
+        metadata: HashMap<String, String>,
+        row: StoredRowBatch,
+    ) {
+        self.forward_row_version_to_servers(storage, table, object_id, metadata, row, true);
+    }
+
+    fn forward_row_version_to_servers<H: Storage>(
+        &mut self,
+        storage: &H,
+        table: &str,
+        object_id: ObjectId,
+        metadata: HashMap<String, String>,
+        row: StoredRowBatch,
+        new_version: bool,
     ) {
         let server_ids: Vec<ServerId> = self.servers.keys().copied().collect();
         if !server_ids.is_empty() {
@@ -257,7 +293,10 @@ impl SyncManager {
         }
 
         for server_id in server_ids {
-            self.queue_row_to_server_with_missing_parents(
+            if new_version {
+                self.unclaim_batch_sent_to_server(server_id, object_id, &row);
+            }
+            let tip_queued = self.queue_row_to_server_with_missing_parents(
                 storage,
                 table,
                 server_id,
@@ -265,6 +304,31 @@ impl SyncManager {
                 row.clone(),
                 None,
             );
+            debug_assert!(
+                !new_version || tip_queued,
+                "a new version of row {object_id} left for no server {server_id}: its batch \
+                 was taken back from the sent set, so nothing may skip it"
+            );
+        }
+    }
+
+    /// Take back the claim that `row`'s batch reached `server_id`. Pruning the sent set only
+    /// ever under-claims (`SentBatchIds::record_delivery`), so the worst this costs is a
+    /// copy the server already holds, which it takes as a no-op.
+    fn unclaim_batch_sent_to_server(
+        &mut self,
+        server_id: ServerId,
+        object_id: ObjectId,
+        row: &StoredRowBatch,
+    ) {
+        let branch_name = BranchName::new(&row.branch);
+        if let Some(server) = self.servers.get_mut(&server_id)
+            && let Some(sent_batches) = server.sent_batch_ids.get_mut(&(object_id, branch_name))
+        {
+            sent_batches.remove(&row.batch_id);
+            if sent_batches.is_empty() {
+                server.sent_batch_ids.remove(&(object_id, branch_name));
+            }
         }
     }
 
@@ -286,11 +350,14 @@ impl SyncManager {
         metadata: &HashMap<String, String>,
         row: StoredRowBatch,
         authoritative_fates: Option<&HashMap<BatchId, BatchFate>>,
-    ) {
+    ) -> bool {
         let object_id = row.row_id;
         let branch_name = BranchName::new(&row.branch);
         let tip_batch_id = row.batch_id;
         let tip_was_queued = std::cell::Cell::new(false);
+        // Whether the tip went, as opposed to the walk reaching it: the dedup in
+        // `queue_row_to_server_with_metadata` may still skip it there.
+        let mut tip_on_its_way = false;
         #[cfg(debug_assertions)]
         let _tip_guard = TipMustBeQueued {
             queued: &tip_was_queued,
@@ -413,21 +480,31 @@ impl SyncManager {
             }
 
             let (current, _) = stack.pop().expect("stack is non-empty");
-            if current.batch_id == tip_batch_id {
+            let is_tip = current.batch_id == tip_batch_id;
+            if is_tip {
                 tip_was_queued.set(true);
             }
-            self.queue_row_to_server_with_storage(
+            let queued = self.queue_row_to_server_with_storage(
                 storage, table, server_id, object_id, metadata, current,
             );
+            if is_tip {
+                tip_on_its_way = queued;
+            }
         }
+        tip_on_its_way
     }
 
+    /// Relay a row a client sent on to this node's servers. `new_version` says the store
+    /// took it in place of another version of its batch
+    /// (`ApplyRowBatchResult::replaced_batch_version`); see
+    /// [`Self::forward_new_row_version_to_servers_with_storage`].
     pub(crate) fn forward_row_batch_to_servers<H: Storage>(
         &mut self,
         storage: &H,
         object_id: ObjectId,
         metadata: HashMap<String, String>,
         row: StoredRowBatch,
+        new_version: bool,
     ) {
         let table = metadata
             .get(crate::metadata::MetadataKey::Table.as_str())
@@ -441,12 +518,13 @@ impl SyncManager {
             });
 
         if let Some(table) = table {
-            self.forward_row_batch_to_servers_with_storage(
+            self.forward_row_version_to_servers(
                 storage,
                 table.as_str(),
                 object_id,
                 metadata,
                 row,
+                new_version,
             );
             return;
         }
@@ -462,6 +540,9 @@ impl SyncManager {
         }
 
         for server_id in server_ids {
+            if new_version {
+                self.unclaim_batch_sent_to_server(server_id, object_id, &row);
+            }
             let include_metadata = self
                 .servers
                 .get(&server_id)
@@ -482,21 +563,13 @@ impl SyncManager {
         metadata: HashMap<String, String>,
         row: StoredRowBatch,
     ) {
-        let branch_name = BranchName::new(&row.branch);
-        let batch_id = row.batch_id;
         let server_ids: Vec<ServerId> = self.servers.keys().copied().collect();
 
         for server_id in server_ids {
             if let Some(server) = self.servers.get_mut(&server_id) {
                 server.sent_metadata.remove(&object_id);
-                if let Some(sent_batches) = server.sent_batch_ids.get_mut(&(object_id, branch_name))
-                {
-                    sent_batches.remove(&batch_id);
-                    if sent_batches.is_empty() {
-                        server.sent_batch_ids.remove(&(object_id, branch_name));
-                    }
-                }
             }
+            self.unclaim_batch_sent_to_server(server_id, object_id, &row);
 
             self.queue_row_to_server_with_metadata(
                 server_id,

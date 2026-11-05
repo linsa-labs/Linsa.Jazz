@@ -276,6 +276,7 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
         }
     }
 
+    let mut replaced_batch_version = false;
     let current_entry = if is_known_new_object {
         visible_entry_from_history_rows(
             context.user_descriptor().as_ref(),
@@ -314,8 +315,12 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
                 batch_id,
                 row_locator,
                 visibility_change: None,
+                replaced_batch_version: false,
             });
         }
+        replaced_batch_version = existing_row.as_ref().is_some_and(|existing| {
+            existing.updated_at != row.updated_at || existing.data != row.data
+        });
 
         let fast_entry = match existing_row.as_ref() {
             // Brand-new batch: the serial-append fast path, and for a row with more
@@ -453,6 +458,7 @@ pub(crate) fn apply_row_batch_with_context<H: Storage>(
         batch_id,
         row_locator,
         visibility_change: visibility_change_from_applied(object_id, applied),
+        replaced_batch_version,
     })
 }
 

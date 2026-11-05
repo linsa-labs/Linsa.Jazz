@@ -508,13 +508,16 @@ impl QueryManager {
         forwarded_row: StoredRowBatch,
         applied: ApplyRowBatchResult,
     ) -> Result<(BatchId, Option<RowVisibilityChange>), QueryError> {
-        self.sync_manager.forward_row_batch_to_servers_with_storage(
-            storage,
-            table,
-            row_id,
-            metadata_from_row_locator(&applied.row_locator),
-            forwarded_row,
-        );
+        // Every local write is a version written here and now; when its batch already had
+        // one of this row on its way, the later one has to go too.
+        self.sync_manager
+            .forward_new_row_version_to_servers_with_storage(
+                storage,
+                table,
+                row_id,
+                metadata_from_row_locator(&applied.row_locator),
+                forwarded_row,
+            );
 
         let batch_id = applied.batch_id;
         Ok((batch_id, applied.visibility_change))
