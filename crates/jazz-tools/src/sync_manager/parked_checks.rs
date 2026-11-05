@@ -524,27 +524,40 @@ impl SyncManager {
 
     /// The checks a pass took from the queue and has not evaluated yet. They are on their
     /// way as much as the queued ones: the approval of the first row of a drain must not
-    /// ask for the second.
+    /// ask for the second. Counted, because each version of a row its batch wrote more than
+    /// once is a check of its own: the first one to leave must not take the row's place
+    /// from the version still on its way, which is the one the seal declares.
     pub(crate) fn note_checks_in_flight(&mut self, checks: &[PendingPermissionCheck]) {
-        self.checks_in_flight = checks
-            .iter()
-            .filter_map(|check| match &check.payload {
-                SyncPayload::RowBatchCreated { row, .. }
-                | SyncPayload::RowBatchNeeded { row, .. } => {
-                    Some((check.client_id, row.batch_id, row.row_id))
-                }
-                _ => None,
-            })
-            .collect();
+        self.checks_in_flight.clear();
+        for check in checks {
+            if let SyncPayload::RowBatchCreated { row, .. }
+            | SyncPayload::RowBatchNeeded { row, .. } = &check.payload
+            {
+                *self
+                    .checks_in_flight
+                    .entry((check.client_id, row.batch_id, row.row_id))
+                    .or_insert(0) += 1;
+            }
+        }
     }
 
     pub(crate) fn check_leaves_flight(&mut self, check: &PendingPermissionCheck) {
         if let SyncPayload::RowBatchCreated { row, .. } | SyncPayload::RowBatchNeeded { row, .. } =
             &check.payload
         {
-            self.checks_in_flight
-                .remove(&(check.client_id, row.batch_id, row.row_id));
+            let key = (check.client_id, row.batch_id, row.row_id);
+            if let Some(count) = self.checks_in_flight.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.checks_in_flight.remove(&key);
+                }
+            }
         }
+    }
+
+    /// Whether every check a pass noted has left it.
+    pub(crate) fn no_checks_in_flight(&self) -> bool {
+        self.checks_in_flight.is_empty()
     }
 
     /// Whether rows of `batch_id` from this client are here and not decided yet: queued,
@@ -553,7 +566,7 @@ impl SyncManager {
         self.has_parked_batch(batch_id)
             || self
                 .checks_in_flight
-                .iter()
+                .keys()
                 .any(|(client, batch, _)| *client == client_id && *batch == batch_id)
             || self.pending_permission_checks.iter().any(|pending| {
                 pending.client_id == client_id
@@ -580,7 +593,7 @@ impl SyncManager {
                 self.is_parked(batch_id, *object_id)
                     || self
                         .checks_in_flight
-                        .contains(&(client_id, batch_id, *object_id))
+                        .contains_key(&(client_id, batch_id, *object_id))
                     || self.pending_permission_checks.iter().any(|pending| {
                         pending.client_id == client_id
                             && matches!(

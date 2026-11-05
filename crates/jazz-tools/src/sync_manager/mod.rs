@@ -305,7 +305,9 @@ pub struct SyncManager {
     pub(super) parked_checks: HashMap<parked_checks::ParkingWriter, parked_checks::ParkedWriter>,
     pub(super) parked_batch_owners: HashMap<BatchId, parked_checks::ParkingWriter>,
     pub(super) parking_bounds: parked_checks::ParkingBounds,
-    pub(super) checks_in_flight: HashSet<(ClientId, BatchId, ObjectId)>,
+    /// How many checks of the pass under way are on their way for each row of a batch: a
+    /// batch that writes a row more than once sends a check for each version of it.
+    pub(super) checks_in_flight: HashMap<(ClientId, BatchId, ObjectId), usize>,
     /// Pending query subscriptions awaiting QueryGraph building by QueryManager.
     pub(super) pending_query_subscriptions: Vec<PendingQuerySubscription>,
     /// Pending query unsubscriptions awaiting cleanup by QueryManager.
@@ -534,7 +536,7 @@ impl SyncManager {
             parked_checks: HashMap::new(),
             parked_batch_owners: HashMap::new(),
             parking_bounds: Default::default(),
-            checks_in_flight: HashSet::new(),
+            checks_in_flight: HashMap::new(),
             pending_query_subscriptions: Vec::new(),
             pending_query_unsubscriptions: Vec::new(),
             pending_row_visibility_changes: Vec::new(),

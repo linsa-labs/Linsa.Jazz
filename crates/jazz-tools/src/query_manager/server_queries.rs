@@ -2553,6 +2553,10 @@ impl QueryManager {
             }
             self.index_new_row_visibility(storage, &mut effects);
         }
+        debug_assert!(
+            self.sync_manager.no_checks_in_flight(),
+            "every check the pass noted has left it"
+        );
         self.decide_parked_batches(storage, now, &mut effects);
         self.apply_batched_subscription_visibility_effects(effects);
     }
