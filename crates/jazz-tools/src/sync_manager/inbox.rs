@@ -1811,13 +1811,24 @@ impl SyncManager {
             BatchFate::Missing { .. } => return,
         }
 
-        if matches!(fate, BatchFate::DurableDirect { .. }) {
+        // A direct fate is told by `settle_sealed_batch`, an upstream one by the handler that
+        // received it.
+        if matches!(fate, BatchFate::DurableDirect { .. }) || origin_server_id.is_some() {
             return;
         }
 
+        // Decided here, with a client's frame or by the sweep with none: everyone waiting on
+        // the batch is told, its writer among them. The sweep's decisions were told to nobody,
+        // and a writer whose batch it rejected waited for ever.
+        let mut interested_clients = self.interested_clients_for_batch_fate(fate);
         if let Some(client_id) = origin_client_id {
             self.queue_batch_fate_to_client_unfiltered(client_id, fate.clone());
+            interested_clients.remove(&client_id);
         }
+        for client_id in interested_clients {
+            self.queue_batch_fate_to_client(client_id, fate.clone());
+        }
+        self.retire_batch_fate_interest_if_settled(fate);
     }
 
     fn apply_authoritative_transaction_fate_for_row<H: Storage>(
