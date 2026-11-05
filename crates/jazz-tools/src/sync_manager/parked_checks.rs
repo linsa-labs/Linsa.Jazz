@@ -153,6 +153,13 @@ impl SyncManager {
         self.parking_bounds = bounds;
     }
 
+    /// Takes a trusted writer's rows in as sent, as an engine from before
+    /// `trusted_client_row_payload` did, or as this one does once upgraded.
+    #[cfg(test)]
+    pub(crate) fn take_trusted_rows_as_sent(&mut self, as_sent: bool) {
+        self.trusted_rows_as_sent = as_sent;
+    }
+
     /// As if every `Missing` this node sent was sent longer ago than its rate limit.
     #[cfg(test)]
     pub(crate) fn forget_missing_answers(&mut self) {

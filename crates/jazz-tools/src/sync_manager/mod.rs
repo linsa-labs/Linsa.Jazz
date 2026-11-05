@@ -223,6 +223,10 @@ pub struct SyncManager {
     pub(super) clock: MonotonicClock,
     pub(super) catalogue_entries: HashMap<ObjectId, CatalogueEntry>,
     pub(super) allow_unprivileged_schema_catalogue_writes: bool,
+    /// As an engine from before `trusted_client_row_payload`: a trusted writer's rows are
+    /// taken in as sent.
+    #[cfg(test)]
+    pub(super) trusted_rows_as_sent: bool,
 
     pub(super) servers: HashMap<ServerId, ServerState>,
     pub(super) pending_servers: HashMap<ServerId, Instant>,
@@ -509,6 +513,8 @@ impl SyncManager {
             clock: MonotonicClock::new(),
             catalogue_entries: HashMap::new(),
             allow_unprivileged_schema_catalogue_writes: false,
+            #[cfg(test)]
+            trusted_rows_as_sent: false,
             servers: HashMap::new(),
             pending_servers: HashMap::new(),
             pending_server_query_subscriptions: HashSet::new(),

@@ -488,6 +488,78 @@ impl SyncManager {
             && existing.metadata == incoming.metadata
     }
 
+    /// A trusted writer's row as this server takes it in, or `None` for a copy it holds
+    /// already or one the batch's stored fate leaves nothing to do for. A trusted writer that
+    /// is its own authority at a lower tier (an app's backend, at `Local`) sends the rows of
+    /// a transaction it accepted again, accepted, as a user's client does (the User arm): the
+    /// batch is still this server's to decide, so they are taken as the staged rows they
+    /// stand for. Stored as sent, they were served before the batch was decided, and its seal
+    /// was then refused for holding rows neither direct nor staged and every row withdrawn.
+    fn trusted_client_row_payload<H: Storage>(
+        &mut self,
+        storage: &mut H,
+        client_id: ClientId,
+        payload: SyncPayload,
+    ) -> Option<SyncPayload> {
+        let (metadata, row, needed) = match payload {
+            SyncPayload::RowBatchCreated { metadata, row } => (metadata, row, false),
+            SyncPayload::RowBatchNeeded { metadata, row } => (metadata, row, true),
+            payload => return Some(payload),
+        };
+        let rebuilt = |metadata, row| {
+            if needed {
+                SyncPayload::RowBatchNeeded { metadata, row }
+            } else {
+                SyncPayload::RowBatchCreated { metadata, row }
+            }
+        };
+        #[cfg(test)]
+        if self.trusted_rows_as_sent {
+            return Some(rebuilt(metadata, row));
+        }
+        if row.state != RowState::VisibleTransactional {
+            return Some(rebuilt(metadata, row));
+        }
+        let mut staged = row.clone();
+        staged.state = RowState::StagingPending;
+        staged.confirmed_tier = None;
+
+        // A replay as sent, when the server accepted the batch, or holds the row visible
+        // from before it took such rows as staged; or as the staged row it stands for. Taken
+        // again as staged, a row the server serves would leave its history staged under it.
+        let existing_history_row = self
+            .row_metadata_from_payload(storage, &row, metadata.as_ref())
+            .and_then(|stored_metadata| {
+                let table = stored_metadata.get(MetadataKey::Table.as_str())?.clone();
+                storage
+                    .load_history_row_batch(&table, &row.branch, row.row_id, row.batch_id)
+                    .ok()
+                    .flatten()
+            });
+        let replay = existing_history_row.as_ref().is_some_and(|existing| {
+            Self::matches_replayed_row_batch(existing, &row)
+                || Self::matches_replayed_row_batch(existing, &staged)
+        });
+        let decided = || {
+            storage
+                .load_authoritative_batch_fate(row.batch_id)
+                .ok()
+                .flatten()
+                .is_some_and(|fate| !matches!(fate, BatchFate::Missing { .. }))
+        };
+        if replay || decided() {
+            self.row_batch_interest
+                .insert(RowBatchKey::from_row(&row), client_id);
+            self.try_accept_completed_sealed_batch_from_client(storage, client_id, row.batch_id);
+            self.pending_client_batch_fates
+                .entry(client_id)
+                .or_default()
+                .insert(row.batch_id);
+            return None;
+        }
+        Some(rebuilt(metadata, staged))
+    }
+
     /// Returns the row's visible content immediately before the incoming batch
     /// This "old" content is used to permission-check the change as an operation
     /// from old content to new content
@@ -2935,6 +3007,11 @@ impl SyncManager {
                         );
                     }
                     ClientRole::Admin => {
+                        let Some(payload) =
+                            self.trusted_client_row_payload(storage, client_id, payload)
+                        else {
+                            return;
+                        };
                         self.apply_payload_from_client(
                             storage,
                             client_id,
@@ -2954,6 +3031,11 @@ impl SyncManager {
                             });
                             return;
                         }
+                        let Some(payload) =
+                            self.trusted_client_row_payload(storage, client_id, payload)
+                        else {
+                            return;
+                        };
                         self.apply_payload_from_client(
                             storage,
                             client_id,
