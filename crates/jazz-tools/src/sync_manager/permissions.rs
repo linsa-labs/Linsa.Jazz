@@ -43,6 +43,7 @@ impl SyncManager {
             self.queue_batch_fate_to_client(check.client_id, fate);
             return;
         }
+        self.note_parked_batch_row_approved(&check);
         self.apply_payload_from_client(
             storage,
             check.client_id,
@@ -273,6 +274,7 @@ impl SyncManager {
         }
 
         let _ = storage.delete_sealed_batch_submission(batch_id);
+        self.drop_parked_batch(batch_id);
         self.pending_permission_checks.retain(|pending| {
             !matches!(
                 &pending.payload,

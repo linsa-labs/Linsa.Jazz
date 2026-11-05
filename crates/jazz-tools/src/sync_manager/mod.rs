@@ -17,6 +17,7 @@ mod batch_writers;
 pub mod clock;
 pub mod forwarding;
 pub mod inbox;
+pub(crate) mod parked_checks;
 pub mod permissions;
 pub mod sync_logic;
 pub mod sync_tracer;
@@ -295,6 +296,12 @@ pub struct SyncManager {
     pub(super) upstream_supports_delivery_acks: bool,
     /// Pending permission checks awaiting policy evaluation.
     pub(super) pending_permission_checks: Vec<PendingPermissionCheck>,
+    /// Checks denied for want of a row of their own batch, waiting for the batch to be
+    /// complete (see [`parked_checks`]).
+    pub(super) parked_checks: HashMap<parked_checks::ParkingWriter, parked_checks::ParkedWriter>,
+    pub(super) parked_batch_owners: HashMap<BatchId, parked_checks::ParkingWriter>,
+    pub(super) parking_bounds: parked_checks::ParkingBounds,
+    pub(super) checks_in_flight: HashSet<(ClientId, BatchId, ObjectId)>,
     /// Pending query subscriptions awaiting QueryGraph building by QueryManager.
     pub(super) pending_query_subscriptions: Vec<PendingQuerySubscription>,
     /// Pending query unsubscriptions awaiting cleanup by QueryManager.
@@ -395,6 +402,7 @@ impl std::fmt::Debug for SyncManager {
             .field("inbox", &self.inbox)
             .field("outbox", &self.outbox)
             .field("pending_permission_checks", &self.pending_permission_checks)
+            .field("parked_checks", &self.parked_checks)
             .field(
                 "pending_query_subscriptions",
                 &self.pending_query_subscriptions,
@@ -517,6 +525,10 @@ impl SyncManager {
             applied_rows_to_confirm: Vec::new(),
             upstream_supports_delivery_acks: false,
             pending_permission_checks: Vec::new(),
+            parked_checks: HashMap::new(),
+            parked_batch_owners: HashMap::new(),
+            parking_bounds: Default::default(),
+            checks_in_flight: HashSet::new(),
             pending_query_subscriptions: Vec::new(),
             pending_query_unsubscriptions: Vec::new(),
             pending_row_visibility_changes: Vec::new(),
@@ -976,6 +988,7 @@ impl SyncManager {
         // Clean up pending queues
         self.pending_permission_checks
             .retain(|c| c.client_id != client_id);
+        self.drop_parked_checks_of_client(client_id);
         self.pending_query_subscriptions
             .retain(|s| s.client_id != client_id);
         self.pending_query_unsubscriptions

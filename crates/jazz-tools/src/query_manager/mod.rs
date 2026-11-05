@@ -1,4 +1,5 @@
 pub mod authz_cache;
+mod batch_siblings;
 pub mod bindings;
 pub(crate) mod composite_index;
 pub(crate) mod declared_index;

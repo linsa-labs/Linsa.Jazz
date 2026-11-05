@@ -733,6 +733,11 @@ pub struct QueryManager {
     /// shared-borrow closures built during settle.
     pub(super) row_bytes_dedup: std::cell::RefCell<super::row_bytes_dedup::RowBytesDedup>,
 
+    /// Set only while a parked write check is evaluated again: the approved rows of its
+    /// batch, which its policy reads as if they were stored visibly
+    /// (see [`super::batch_siblings`]).
+    pub(super) write_check_overlay: Option<super::batch_siblings::BatchOverlay>,
+
     /// Test hook: overrides the predicted `IncludePlacement` of server subscriptions, so
     /// a test can reach the case the prediction misses — a root row the scope denies for
     /// a reason no policy shows — without building one.
@@ -901,6 +906,7 @@ impl QueryManager {
             visible_rows_by_batch: HashMap::new(),
             authoritative_batch_fate_cache: HashMap::new(),
             row_bytes_dedup: Default::default(),
+            write_check_overlay: None,
             #[cfg(test)]
             include_placement_override: None,
             applied_pending_batch_fates: Vec::new(),

@@ -367,6 +367,7 @@ impl SyncManager {
                 error
             })?;
         self.note_sealed_batch_for_sweep(submission.batch_id);
+        self.note_parked_batch_seal_stored(submission.batch_id);
         Ok(())
     }
 
@@ -1374,8 +1375,11 @@ impl SyncManager {
                     // hold a STORED Missing, and the replay short-circuit queues a request
                     // here for every replayed row.
                     if matches!(fate, BatchFate::Missing { .. })
-                        && !self.may_tell_client_a_batch_is_missing(client_id, batch_id)
+                        && (self.batch_rows_are_waiting(client_id, batch_id)
+                            || !self.may_tell_client_a_batch_is_missing(client_id, batch_id))
                     {
+                        // Its rows came with the question and wait for their check: the
+                        // fate follows them, and asking for them again has them sent twice.
                         continue;
                     }
                     self.queue_batch_fate_to_client_unfiltered(client_id, fate);
@@ -1906,7 +1910,27 @@ impl SyncManager {
         );
     }
 
-    fn declared_rows_for_submission(
+    /// The declared members [`Self::declared_rows_for_submission`] finds no row for.
+    pub(crate) fn absent_declared_members(
+        submission: &SealedBatchSubmission,
+        batch_rows: &[(String, StoredRowBatch)],
+    ) -> Vec<ObjectId> {
+        submission
+            .members
+            .iter()
+            .filter(|member| {
+                !batch_rows.iter().any(|(_, row)| {
+                    row.row_id == member.object_id
+                        && row.branch.as_str() == submission.target_branch_name.as_str()
+                        && (row.content_digest() == member.row_digest
+                            || row.content_digest_ignoring_parents() == member.row_digest)
+                })
+            })
+            .map(|member| member.object_id)
+            .collect()
+    }
+
+    pub(crate) fn declared_rows_for_submission(
         submission: &SealedBatchSubmission,
         batch_rows: &[(String, StoredRowBatch)],
     ) -> Option<Vec<(String, StoredRowBatch)>> {
@@ -2355,6 +2379,14 @@ impl SyncManager {
             // Bounded, because that same handler is what makes the answer worth
             // repeating and what makes repeating it dangerous: see
             // `may_tell_client_a_batch_is_missing`.
+            //
+            // Not when every absent member is already here and only not decided yet:
+            // queued for its check, or parked for a sibling. The seal is decided with them,
+            // and asking for them again only has them sent twice.
+            let absent = Self::absent_declared_members(&submission, &batch_rows);
+            if self.absent_members_are_waiting(client_id, batch_id, &absent) {
+                return;
+            }
             if self.may_tell_client_a_batch_is_missing(client_id, batch_id) {
                 self.queue_batch_fate_to_client_unfiltered(
                     client_id,
@@ -2363,6 +2395,12 @@ impl SyncManager {
             }
             return;
         };
+        // A batch with parked rows is decided with them (`QueryManager::decide_parked_batches`),
+        // whatever order its rows and seal arrive in; the decision settles it from there. A
+        // member still missing is asked for above, as for any batch.
+        if self.has_parked_batch(batch_id) {
+            return;
+        }
         let mode = match self.infer_sealed_batch_mode(&submission, &batch_rows) {
             Ok(Some(mode)) => mode,
             Ok(None) => return,
@@ -2556,6 +2594,10 @@ impl SyncManager {
                 continue;
             }
 
+            // Its parked rows decide it, and the decision settles it.
+            if self.has_parked_batch(batch_id) {
+                continue;
+            }
             self.settle_sealed_batch(storage, None, submission, batch_rows, declared_rows, mode);
             recovered_any = true;
         }

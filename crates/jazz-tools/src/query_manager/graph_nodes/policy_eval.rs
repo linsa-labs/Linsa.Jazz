@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::object::ObjectId;
 use crate::query_manager::policy::{
@@ -13,6 +13,7 @@ use crate::query_manager::types::{
     ColumnType, LoadedRow, Row, RowDescriptor, RowPolicyMode, Schema, TableName, Value,
 };
 use crate::storage::Storage;
+use crate::sync_manager::RowBatchKey;
 
 use super::super::encoding::{column_is_null, decode_column};
 
@@ -26,6 +27,11 @@ pub(crate) struct PolicyContextEvaluator<'a> {
     branches: &'a [String],
     row_policy_mode: RowPolicyMode,
     settlement_eval_cache: Option<&'a mut SettlementEvalCache>,
+    /// Rows of the write's own batch that the scans of this evaluation see as if they
+    /// were stored visibly: the approved siblings of a check evaluated again
+    /// (`QueryManager::decide_parked_batches`). The row loader must serve the same
+    /// versions, or the scan and the materialised row disagree.
+    local_overlay_rows: Option<&'a HashMap<ObjectId, RowBatchKey>>,
 }
 
 impl<'a> PolicyContextEvaluator<'a> {
@@ -41,7 +47,16 @@ impl<'a> PolicyContextEvaluator<'a> {
             branches,
             row_policy_mode,
             settlement_eval_cache: None,
+            local_overlay_rows: None,
         }
+    }
+
+    pub(crate) fn with_local_overlay_rows(
+        mut self,
+        local_overlay_rows: Option<&'a HashMap<ObjectId, RowBatchKey>>,
+    ) -> Self {
+        self.local_overlay_rows = local_overlay_rows;
+        self
     }
 
     /// Canonical cache-key spelling of the branch universe (`\u{1f}` joined:
@@ -509,8 +524,9 @@ impl<'a> PolicyContextEvaluator<'a> {
         };
 
         for _ in 0..100 {
-            if graph.settle_with_settlement_eval_cache(
+            if graph.settle_with_overlay(
                 io,
+                self.local_overlay_rows,
                 self.settlement_eval_cache.as_deref_mut(),
                 row_loader,
             ) {
@@ -558,8 +574,9 @@ impl<'a> PolicyContextEvaluator<'a> {
         };
 
         for _ in 0..100 {
-            if graph.settle_with_settlement_eval_cache(
+            if graph.settle_with_overlay(
                 io,
+                self.local_overlay_rows,
                 self.settlement_eval_cache.as_deref_mut(),
                 row_loader,
             ) {

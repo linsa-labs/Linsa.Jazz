@@ -4,6 +4,8 @@
 //! These graphs are throwaway - created, settled until complete, then discarded.
 
 use crate::object::ObjectId;
+use crate::sync_manager::RowBatchKey;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::storage::Storage;
@@ -374,8 +376,26 @@ impl PolicyGraph {
         settlement_eval_cache: Option<&mut SettlementEvalCache>,
         row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     ) -> bool {
-        let _delta = self.graph.settle_with_settlement_eval_cache(
+        self.settle_with_overlay(io, None, settlement_eval_cache, row_loader)
+    }
+
+    /// [`Self::settle_with_settlement_eval_cache`], with the scans also seeing
+    /// `local_overlay_rows`. A result read through an overlay holds for that overlay only,
+    /// so the two are never combined.
+    pub(crate) fn settle_with_overlay(
+        &mut self,
+        io: &dyn Storage,
+        local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
+        settlement_eval_cache: Option<&mut SettlementEvalCache>,
+        row_loader: &mut dyn FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
+    ) -> bool {
+        assert!(
+            local_overlay_rows.is_none() || settlement_eval_cache.is_none(),
+            "a policy result read through a batch overlay must not be cached"
+        );
+        let _delta = self.graph.settle_with_overlay_and_cache(
             io,
+            local_overlay_rows,
             settlement_eval_cache,
             &mut |id, hint| row_loader(id, hint),
         );

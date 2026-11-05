@@ -667,16 +667,22 @@ impl QueryGraph {
         self.settle_with_context(storage, local_overlay_rows, None, &mut row_loader)
     }
 
-    pub(crate) fn settle_with_settlement_eval_cache<F>(
+    pub(crate) fn settle_with_overlay_and_cache<F>(
         &mut self,
         storage: &dyn Storage,
+        local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
         settlement_eval_cache: Option<&mut SettlementEvalCache>,
         row_loader: F,
     ) -> RowDelta
     where
         F: FnMut(ObjectId, Option<TableName>) -> Option<LoadedRow>,
     {
-        self.settle_with_context(storage, None, settlement_eval_cache, row_loader)
+        self.settle_with_context(
+            storage,
+            local_overlay_rows,
+            settlement_eval_cache,
+            row_loader,
+        )
     }
 
     fn settle_with_context<F>(

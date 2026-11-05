@@ -687,6 +687,65 @@ impl QueryManager {
         ))
     }
 
+    /// [`Self::load_row_for_authorization_context`] for a row of the batch a parked check
+    /// is evaluated in: its version in that batch, whether or not anything of it is
+    /// visible. Only as the table the policy asks for: a row is in one table.
+    #[allow(clippy::too_many_arguments)]
+    fn load_batch_row_for_authorization_context(
+        &mut self,
+        storage: &dyn Storage,
+        object_id: ObjectId,
+        batch_id: BatchId,
+        member: &super::batch_siblings::OverlayMember,
+        table_hint: Option<TableName>,
+        source_branch_schema_map: &std::collections::HashMap<String, SchemaHash>,
+        auth_context: &crate::schema_manager::SchemaContext,
+    ) -> Option<LoadedRow> {
+        if let Some(hint) = table_hint {
+            let auth_name = translate_table_name_from_schema(
+                auth_context,
+                member.table_name.as_str(),
+                &member.schema_hash,
+            )
+            .unwrap_or_else(|| member.table_name.clone());
+            if auth_name != hint.as_str() {
+                return None;
+            }
+        }
+        let row = storage
+            .load_history_row_batch_for_schema_hash(
+                member.table_name.as_str(),
+                member.schema_hash,
+                member.branch_name.as_str(),
+                object_id,
+                batch_id,
+            )
+            .ok()
+            .flatten()?;
+        if row.is_hard_deleted() {
+            return None;
+        }
+        let content =
+            self.row_bytes_dedup
+                .borrow_mut()
+                .dedup(object_id, row.batch_id, row.data.clone());
+        let transformed = self.transform_content_to_authorization_schema(
+            &member.table_name,
+            &content,
+            row.batch_id,
+            member.branch_name,
+            source_branch_schema_map,
+            auth_context,
+            Some(member.schema_hash),
+        )?;
+        Some(LoadedRow::new(
+            transformed,
+            row.row_provenance(),
+            [(object_id, member.branch_name)].into_iter().collect(),
+            row.batch_id,
+        ))
+    }
+
     pub(super) fn evaluate_authorization_policy(
         &mut self,
         storage: &dyn Storage,
@@ -738,16 +797,46 @@ impl QueryManager {
                 &own_branch
             }
         };
+        // A parked check evaluated again reads the approved rows of its own batch as if
+        // they were stored visibly: the scans through the graph overlay, the row loads
+        // through the batch's own versions. Only on its own branch, where the batch lives.
+        let overlay = self
+            .write_check_overlay
+            .as_ref()
+            .filter(|_| policy_branches == [branch_name.as_str().to_string()].as_slice())
+            .filter(|overlay| overlay.evaluated == object_id)
+            .cloned();
+        let overlay_rows = overlay
+            .as_ref()
+            .map(|overlay| overlay.row_keys(branch_name.as_str()));
+        assert!(
+            overlay_rows.is_none() || settlement_eval_cache.is_none(),
+            "a write check read through its batch must not be cached"
+        );
         let mut evaluator = PolicyContextEvaluator::new(
             auth_schema,
             session,
             policy_branches,
             self.row_policy_mode,
         )
-        .with_settlement_eval_cache(settlement_eval_cache);
+        .with_settlement_eval_cache(settlement_eval_cache)
+        .with_local_overlay_rows(overlay_rows.as_ref());
         let row = Row::new(object_id, transformed, BatchId([0; 16]), provenance.clone());
         let mut visited = HashSet::new();
-        let mut row_loader = |related_id: ObjectId, _table_hint: Option<TableName>| {
+        let mut row_loader = |related_id: ObjectId, table_hint: Option<TableName>| {
+            if let Some(overlay) = overlay.as_ref()
+                && let Some(member) = overlay.member(related_id)
+            {
+                return self.load_batch_row_for_authorization_context(
+                    storage,
+                    related_id,
+                    overlay.batch_id,
+                    member,
+                    table_hint,
+                    source_branch_schema_map,
+                    auth_context,
+                );
+            }
             self.load_row_for_authorization_context(
                 storage,
                 related_id,
@@ -2424,11 +2513,36 @@ impl QueryManager {
         // that never resolves runs out together with it, not one timeout after another.
         let mut waiting_clients = HashSet::new();
         let mut effects = BatchedSubscriptionVisibilityEffects::default();
+        // A sealed batch still waiting for its rows holds its writer's later writes the
+        // same way: they may lean on it (see `batch_siblings`).
+        let mut now = self.refresh_parked_batches(storage);
+        self.sync_manager.note_checks_in_flight(&pending);
         for mut check in pending {
+            self.sync_manager.check_leaves_flight(&check);
             if waiting_clients.contains(&check.client_id) {
                 check
                     .schema_wait_started_at
                     .get_or_insert_with(Instant::now);
+                self.sync_manager
+                    .requeue_pending_permission_checks(vec![check]);
+                continue;
+            }
+            let check_batch = match &check.payload {
+                SyncPayload::RowBatchCreated { row, .. }
+                | SyncPayload::RowBatchNeeded { row, .. } => Some(row.batch_id),
+                _ => None,
+            };
+            // A batch parked earlier in this pass holds what comes after it as well.
+            if now.is_none() && self.sync_manager.has_parked_checks() {
+                now = Some(self.sync_manager.now_micros_for_parking());
+            }
+            if let Some(now) = now
+                && self.sync_manager.parked_batch_holds_check(
+                    &crate::sync_manager::parked_checks::ParkingWriter::of(&check),
+                    check_batch,
+                    now,
+                )
+            {
                 self.sync_manager
                     .requeue_pending_permission_checks(vec![check]);
                 continue;
@@ -2439,6 +2553,7 @@ impl QueryManager {
             }
             self.index_new_row_visibility(storage, &mut effects);
         }
+        self.decide_parked_batches(storage, now, &mut effects);
         self.apply_batched_subscription_visibility_effects(effects);
     }
 
@@ -2934,8 +3049,14 @@ impl QueryManager {
                 "{:?} denied by policy on table {}",
                 check.operation, write_table_name.0
             );
-            self.sync_manager
-                .reject_permission_check(storage, check, reason);
+            self.deny_write_by_policy(
+                storage,
+                check,
+                reason,
+                policy,
+                &auth_schema,
+                auth_table_name,
+            );
             return WriteCheckOutcome::Decided;
         }
 
@@ -3203,8 +3324,14 @@ impl QueryManager {
                     "Update denied by USING policy on table {} - cannot see old row",
                     write_table_name.0
                 );
-                self.sync_manager
-                    .reject_permission_check(storage, check, reason);
+                self.deny_write_by_policy(
+                    storage,
+                    check,
+                    reason,
+                    using,
+                    auth_schema,
+                    auth_table_name,
+                );
                 return;
             }
         }
@@ -3257,8 +3384,14 @@ impl QueryManager {
                     "Update denied by WITH CHECK policy on table {}",
                     write_table_name.0
                 );
-                self.sync_manager
-                    .reject_permission_check(storage, check, reason);
+                self.deny_write_by_policy(
+                    storage,
+                    check,
+                    reason,
+                    with_check,
+                    auth_schema,
+                    auth_table_name,
+                );
                 return;
             }
         }

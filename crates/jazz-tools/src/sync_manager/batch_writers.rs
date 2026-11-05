@@ -114,7 +114,7 @@ impl SyncManager {
     /// row that is being decided has bound the batch, so it never binds. A store that
     /// cannot say answers no, so the denial stays on its own row; a transactional batch
     /// left that way waits for its seal to be judged again rather than being rejected.
-    pub(super) fn holds_batch<H: Storage>(
+    pub(crate) fn holds_batch<H: Storage>(
         storage: &H,
         batch_id: BatchId,
         claimant: &BatchWriter,
