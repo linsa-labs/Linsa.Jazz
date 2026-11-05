@@ -1,5 +1,6 @@
+use super::batch_writers::{Admission, Binding};
 use super::*;
-use crate::batch_fate::{BatchFate, BatchMode, SealedBatchSubmission};
+use crate::batch_fate::{BatchFate, BatchMode, BatchWriter, SealedBatchSubmission};
 use crate::metadata::MetadataKey;
 use crate::object::{BranchName, ObjectId};
 use crate::query_manager::policy::Operation;
@@ -1859,6 +1860,28 @@ impl SyncManager {
         fate: BatchFate,
         batch_rows: &[(String, StoredRowBatch)],
     ) {
+        // An accepted batch's rows are already served. A seal that fails to validate
+        // afterwards says something about the seal, not about the rows, so it is
+        // dropped and the fate stands; the writer's next sound seal can still promote it.
+        match storage.load_authoritative_batch_fate(fate.batch_id()) {
+            Ok(Some(BatchFate::DurableDirect { .. } | BatchFate::AcceptedTransaction { .. })) => {
+                tracing::warn!(
+                    batch_id = ?fate.batch_id(),
+                    rejection = ?fate,
+                    "a seal of an accepted batch failed to validate; the fate stands"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    batch_id = ?fate.batch_id(),
+                    %error,
+                    "failed to load a batch's fate before rejecting its seal"
+                );
+                return;
+            }
+        }
         let fate = match self.persist_authoritative_batch_fate(storage, &fate) {
             Ok((fate, true)) => {
                 self.pending_batch_fates.push(fate.clone());
@@ -1906,6 +1929,37 @@ impl SyncManager {
             declared_rows.push(matching_row.clone());
         }
         Some(declared_rows)
+    }
+
+    /// Whether this node, holding the batch's rows, would settle `submission` as a direct
+    /// batch: the checks `try_accept_completed_sealed_batch_from_client` runs before it
+    /// settles. Only such a seal of a batch settled here is worth sending upstream. One
+    /// that fails them would be rejected by a higher tier that has no fate for the batch
+    /// yet, and that rejection would come back down over the fate accepted here.
+    fn would_settle_as_direct<H: Storage>(
+        &self,
+        storage: &H,
+        submission: &SealedBatchSubmission,
+    ) -> bool {
+        if self.validate_sealed_batch_submission(submission).is_err() {
+            return false;
+        }
+        let batch_rows = self.transactional_batch_rows(
+            storage,
+            submission.batch_id,
+            &submission
+                .members
+                .iter()
+                .map(|member| member.object_id)
+                .collect::<Vec<_>>(),
+        );
+        self.validate_batch_rows_target_branch(submission, &batch_rows)
+            .is_ok()
+            && Self::declared_rows_for_submission(submission, &batch_rows).is_some()
+            && matches!(
+                self.infer_sealed_batch_mode(submission, &batch_rows),
+                Ok(Some(SealedBatchMode::Direct))
+            )
     }
 
     /// True when this authority's tier outranks an existing `DurableDirect`
@@ -2802,6 +2856,11 @@ impl SyncManager {
             | SyncPayload::RowBatchNeeded { metadata, row } => {
                 let object_id = row.row_id;
                 let branch_name = BranchName::new(&row.branch);
+                if client.role != ClientRole::User {
+                    // A batch a trusted connection starts is bound to it, so no user can
+                    // later claim it (`batch_writers`).
+                    Self::bind_trusted_batch(storage, row.batch_id);
+                }
                 match client.role {
                     ClientRole::Peer => {
                         if payload.is_catalogue() {
@@ -2861,6 +2920,46 @@ impl SyncManager {
                             });
                             return;
                         };
+                        // Before anything else reads the batch id, the replay short-circuit
+                        // included: a row of another writer's batch is refused alone, and
+                        // never reaches a decision that could settle that batch.
+                        let refusal = match Self::admit_batch_writer(
+                            storage,
+                            row.batch_id,
+                            &BatchWriter::User(session.user_id.clone()),
+                            Binding::Bind,
+                        ) {
+                            Admission::Writer => None,
+                            Admission::Stranger => Some((
+                                "batch_writer_mismatch",
+                                "the row names a batch another writer holds",
+                            )),
+                            // Nothing was bound: the writer's next sound seal binds the batch, and
+                            // the `Missing` it is answered with has her rows sent again.
+                            Admission::Unavailable => Some((
+                                "batch_writer_unavailable",
+                                "the batch's writer could not be read",
+                            )),
+                        };
+                        if let Some((code, reason)) = refusal {
+                            tracing::warn!(
+                                %client_id,
+                                batch_id = ?row.batch_id,
+                                %object_id,
+                                code,
+                                "refusing a row of a batch"
+                            );
+                            self.outbox.push(OutboxEntry {
+                                destination: Destination::Client(client_id),
+                                payload: SyncPayload::Error(SyncError::PermissionDenied {
+                                    object_id,
+                                    branch_name,
+                                    code: code.to_string(),
+                                    reason: reason.to_string(),
+                                }),
+                            });
+                            return;
+                        }
                         if payload.is_catalogue() {
                             if self.allow_unprivileged_schema_catalogue_writes
                                 && payload.is_structural_schema_catalogue()
@@ -3003,7 +3102,50 @@ impl SyncManager {
                     }
                 }
             }
-            SyncPayload::SealBatch { .. } => {
+            SyncPayload::SealBatch { submission } => {
+                // A seal decides the fate of every row the batch holds, so it is only the
+                // writer's to send. A stranger's is dropped without an answer: answering
+                // would tell it the batch exists.
+                let claimant = match (client.role, &client.session) {
+                    (ClientRole::User, Some(session)) => BatchWriter::User(session.user_id.clone()),
+                    (ClientRole::User, None) => {
+                        tracing::warn!(%client_id, batch_id = ?submission.batch_id, "ignoring a seal from a user with no session");
+                        return;
+                    }
+                    (ClientRole::Peer | ClientRole::Admin | ClientRole::Backend, _) => {
+                        BatchWriter::Trusted
+                    }
+                };
+                // Only a seal that validates may start a batch; one that does not is judged
+                // against a batch someone already holds, or dropped.
+                let binding = if self.validate_sealed_batch_submission(submission).is_ok() {
+                    Binding::Bind
+                } else {
+                    Binding::CheckOnly
+                };
+                match Self::admit_batch_writer(storage, submission.batch_id, &claimant, binding) {
+                    Admission::Writer => {}
+                    Admission::Stranger => {
+                        tracing::warn!(
+                            %client_id,
+                            batch_id = ?submission.batch_id,
+                            "ignoring a seal of a batch another writer holds"
+                        );
+                        return;
+                    }
+                    // Nothing was bound: `Missing` has the writer send rows and seal again.
+                    Admission::Unavailable => {
+                        if self.may_tell_client_a_batch_is_missing(client_id, submission.batch_id) {
+                            self.queue_batch_fate_to_client_unfiltered(
+                                client_id,
+                                BatchFate::Missing {
+                                    batch_id: submission.batch_id,
+                                },
+                            );
+                        }
+                        return;
+                    }
+                }
                 self.apply_payload_from_client(
                     storage,
                     client_id,
@@ -3244,6 +3386,20 @@ impl SyncManager {
                     }
                     Ok(Some(fate @ BatchFate::Rejected { .. }))
                     | Ok(Some(fate @ BatchFate::AcceptedTransaction { .. })) => {
+                        self.queue_batch_fate_to_client(client_id, fate);
+                        return;
+                    }
+                    // Settled here at a tier this node cannot raise: the seal has nothing
+                    // left to decide, so it is answered with the fate and never judged again.
+                    // A sound one still goes upstream, where a higher tier can promote it.
+                    Ok(Some(fate @ BatchFate::DurableDirect { .. }))
+                        if !self.can_promote_direct_fate(&fate) =>
+                    {
+                        if self.has_servers_or_pending_servers()
+                            && self.would_settle_as_direct(storage, &submission)
+                        {
+                            self.seal_batch_to_servers(submission.clone());
+                        }
                         self.queue_batch_fate_to_client(client_id, fate);
                         return;
                     }

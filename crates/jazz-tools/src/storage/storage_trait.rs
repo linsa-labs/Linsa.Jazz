@@ -911,6 +911,41 @@ pub trait Storage {
         )
     }
 
+    /// Who `batch_id` belongs to on this node, once anyone has been bound to it.
+    fn load_batch_writer(&self, batch_id: BatchId) -> Result<Option<BatchWriter>, StorageError> {
+        match self.raw_table_get(BATCH_WRITER_TABLE, &local_batch_record_key(batch_id))? {
+            Some(bytes) => {
+                ensure_system_raw_table_header_validated_once(
+                    self,
+                    BATCH_WRITER_TABLE,
+                    STORAGE_KIND_BATCH_WRITER,
+                    BATCH_WRITER_FORMAT_V1,
+                )?;
+                BatchWriter::decode_storage_row(&bytes)
+                    .map(Some)
+                    .map_err(|err| StorageError::IoError(format!("decode batch writer: {err}")))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn put_batch_writer(
+        &mut self,
+        batch_id: BatchId,
+        writer: &BatchWriter,
+    ) -> Result<(), StorageError> {
+        ensure_raw_table_header(
+            self,
+            BATCH_WRITER_TABLE,
+            &RawTableHeader::system(STORAGE_KIND_BATCH_WRITER, BATCH_WRITER_FORMAT_V1),
+        )?;
+        self.raw_table_put(
+            BATCH_WRITER_TABLE,
+            &local_batch_record_key(batch_id),
+            &writer.encode_storage_row(),
+        )
+    }
+
     fn load_authoritative_batch_fate(
         &self,
         batch_id: BatchId,
@@ -2357,6 +2392,18 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
         batch_id: BatchId,
     ) -> Result<Option<BatchFate>, StorageError> {
         (**self).load_authoritative_batch_fate(batch_id)
+    }
+
+    fn load_batch_writer(&self, batch_id: BatchId) -> Result<Option<BatchWriter>, StorageError> {
+        (**self).load_batch_writer(batch_id)
+    }
+
+    fn put_batch_writer(
+        &mut self,
+        batch_id: BatchId,
+        writer: &BatchWriter,
+    ) -> Result<(), StorageError> {
+        (**self).put_batch_writer(batch_id, writer)
     }
 
     fn acknowledge_rejected_batch_fate(&mut self, batch_id: BatchId) -> Result<(), StorageError> {

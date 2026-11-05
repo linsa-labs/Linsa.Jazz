@@ -75,7 +75,7 @@ fn sqlite() -> SqliteStorage {
 }
 
 fn server_runtime(schema: Schema, storage: SqliteStorage) -> Core {
-    let mut core = runtime(schema.clone(), storage);
+    let mut core = server_core(schema.clone(), storage);
     core.schema_manager_mut()
         .query_manager_mut()
         .set_authorization_schema(permissions_for(&schema));
@@ -87,9 +87,23 @@ fn server_runtime(schema: Schema, storage: SqliteStorage) -> Core {
 }
 
 fn runtime(schema: Schema, storage: SqliteStorage) -> Core {
+    runtime_with(schema, storage, SyncManager::new())
+}
+
+/// A server at the tier a deployed one has with no upstream (`server::builder`): without
+/// one it never stores a fate, and every batch stays in the window before it.
+fn server_core(schema: Schema, storage: SqliteStorage) -> Core {
+    runtime_with(
+        schema,
+        storage,
+        SyncManager::new().with_durability_tier(crate::sync_manager::DurabilityTier::GlobalServer),
+    )
+}
+
+fn runtime_with(schema: Schema, storage: SqliteStorage, sync_manager: SyncManager) -> Core {
     let app_id = AppId::from_name(APP);
     let mut schema_manager =
-        SchemaManager::new(SyncManager::new(), schema, app_id, "dev", "main").unwrap();
+        SchemaManager::new(sync_manager, schema, app_id, "dev", "main").unwrap();
     crate::schema_manager::rehydrate_schema_manager_from_catalogue(
         &mut schema_manager,
         &storage,

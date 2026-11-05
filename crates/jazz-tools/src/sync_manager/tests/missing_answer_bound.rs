@@ -302,6 +302,12 @@ fn replayed_rows_alone_stop_drawing_missing() {
     // answer, so the synthesised `Missing` — the amplifier — only exists for a batch
     // whose fate this authority never recorded, which is the loop's own shape.
     seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    // The replayer wrote the batch: the binding its first send made.
+    io.put_batch_writer(
+        batch_id,
+        &crate::batch_fate::BatchWriter::User("alice".to_string()),
+    )
+    .unwrap();
 
     add_client(&mut sm, &io, client_id);
     sm.set_client_role(client_id, ClientRole::User);

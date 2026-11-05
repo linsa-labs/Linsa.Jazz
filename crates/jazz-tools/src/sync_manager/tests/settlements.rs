@@ -655,6 +655,12 @@ fn replayed_rows_queue_one_settlement_per_batch_after_inbox_batch() {
         })
         .collect();
 
+    // The replayer wrote the batch: the binding its first send made.
+    io.put_batch_writer(
+        batch_id,
+        &crate::batch_fate::BatchWriter::User("alice".to_string()),
+    )
+    .unwrap();
     io.upsert_authoritative_batch_fate(&BatchFate::DurableDirect {
         batch_id,
         confirmed_tier: DurabilityTier::GlobalServer,

@@ -15,6 +15,12 @@ fn row_batch_created_from_user_with_exact_history_match_skips_permission_check()
     let batch_id = row.batch_id;
 
     seed_visible_row(&mut sm, &mut io, "users", row.clone());
+    // The replayer wrote the batch: the binding its first send made.
+    io.put_batch_writer(
+        batch_id,
+        &crate::batch_fate::BatchWriter::User("bob".to_string()),
+    )
+    .unwrap();
     persist_visible_row_settlement(&mut io, row_id, &row);
 
     add_client(&mut sm, &io, client_id);
@@ -80,6 +86,12 @@ fn row_batch_created_from_user_with_same_batch_correction_queues_permission_chec
     );
 
     seed_visible_row(&mut sm, &mut io, "users", stale_row.clone());
+    // The replayer wrote the batch: the binding its first send made.
+    io.put_batch_writer(
+        batch_id,
+        &crate::batch_fate::BatchWriter::User("bob".to_string()),
+    )
+    .unwrap();
     persist_visible_row_settlement(&mut io, row_id, &stale_row);
 
     add_client(&mut sm, &io, client_id);
@@ -356,6 +368,12 @@ fn row_batch_created_from_user_with_older_exact_history_match_skips_permission_c
     );
 
     seed_visible_row(&mut sm, &mut io, "users", older_row.clone());
+    // The replayer wrote the batch: the binding its first send made.
+    io.put_batch_writer(
+        older_row.batch_id,
+        &crate::batch_fate::BatchWriter::User("bob".to_string()),
+    )
+    .unwrap();
     io.append_history_region_rows("users", std::slice::from_ref(&newer_row))
         .unwrap();
     io.upsert_visible_region_rows(

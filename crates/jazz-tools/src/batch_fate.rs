@@ -217,6 +217,46 @@ impl BatchFate {
     }
 }
 
+/// Who a batch belongs to on this node: the connection its first row (or, with no row
+/// yet, its first seal) came in on. Only the writer may add rows to the batch or seal
+/// it. A batch's fate covers every row it holds, so a stranger who could do either
+/// could decide the fate of rows the writer's readers are already being served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchWriter {
+    /// A peer, backend or admin connection: it carries other writers' rows by design.
+    Trusted,
+    /// An end user's session, by its user id.
+    User(String),
+}
+
+impl BatchWriter {
+    const TRUSTED_TAG: u8 = 0;
+    const USER_TAG: u8 = 1;
+
+    pub fn encode_storage_row(&self) -> Vec<u8> {
+        match self {
+            Self::Trusted => vec![Self::TRUSTED_TAG],
+            Self::User(user_id) => {
+                let mut bytes = Vec::with_capacity(1 + user_id.len());
+                bytes.push(Self::USER_TAG);
+                bytes.extend_from_slice(user_id.as_bytes());
+                bytes
+            }
+        }
+    }
+
+    pub fn decode_storage_row(bytes: &[u8]) -> Result<Self, String> {
+        match bytes.split_first() {
+            Some((&Self::TRUSTED_TAG, [])) => Ok(Self::Trusted),
+            Some((&Self::USER_TAG, user_id)) => std::str::from_utf8(user_id)
+                .map(|user_id| Self::User(user_id.to_string()))
+                .map_err(|err| format!("batch writer user id is not utf-8: {err}")),
+            Some((tag, _)) => Err(format!("unknown batch writer tag {tag}")),
+            None => Err("empty batch writer row".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalBatchRecord {
     pub batch_id: BatchId,

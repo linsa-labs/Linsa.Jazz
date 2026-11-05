@@ -1,6 +1,6 @@
 use super::inbox::AuthoritativeFateRecording;
 use super::*;
-use crate::batch_fate::BatchFate;
+use crate::batch_fate::{BatchFate, BatchWriter};
 use crate::query_manager::policy::Operation;
 use crate::query_manager::session::Session;
 use crate::row_histories::{
@@ -100,11 +100,19 @@ impl SyncManager {
         code: String,
         reason: String,
     ) {
+        // The batch-level answer settles every row the batch holds, so it is only for the
+        // batch's writer. A check from anyone else (the inbox refuses their rows before
+        // they are queued, so this is a belt) is denied for its own row alone.
         if let SyncPayload::RowBatchCreated { row, .. } | SyncPayload::RowBatchNeeded { row, .. } =
             &check.payload
             && matches!(
                 row.state,
                 RowState::StagingPending | RowState::VisibleDirect
+            )
+            && Self::holds_batch(
+                storage,
+                row.batch_id,
+                &BatchWriter::User(check.session.user_id.clone()),
             )
         {
             let fate = BatchFate::Rejected {

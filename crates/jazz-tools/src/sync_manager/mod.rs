@@ -13,6 +13,7 @@ use crate::row_histories::{BatchId, RowVisibilityChange};
 use crate::storage::{PreparedRowTableContext, Storage};
 
 // Module declarations
+mod batch_writers;
 pub mod clock;
 pub mod forwarding;
 pub mod inbox;

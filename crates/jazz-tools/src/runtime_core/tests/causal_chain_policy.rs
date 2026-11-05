@@ -211,15 +211,13 @@ fn permissions() -> Schema {
 }
 
 fn runtime(storage: SqliteStorage) -> Core {
+    runtime_with(storage, SyncManager::new())
+}
+
+fn runtime_with(storage: SqliteStorage, sync_manager: SyncManager) -> Core {
     let app_id = AppId::from_name(APP);
-    let mut schema_manager = SchemaManager::new(
-        SyncManager::new(),
-        structural_schema(),
-        app_id,
-        "dev",
-        "main",
-    )
-    .unwrap();
+    let mut schema_manager =
+        SchemaManager::new(sync_manager, structural_schema(), app_id, "dev", "main").unwrap();
     crate::schema_manager::rehydrate_schema_manager_from_catalogue(
         &mut schema_manager,
         &storage,
@@ -235,8 +233,14 @@ fn sqlite() -> SqliteStorage {
     SqliteStorage::open(":memory:").expect("in-memory sqlite storage should open")
 }
 
+/// The server, at the tier a deployed one has with no upstream (`server::builder`). Without
+/// a tier a node never stores a fate, and what a gate would read as accepted is only the
+/// client's own local fate.
 fn server_runtime() -> Core {
-    let mut core = runtime(sqlite());
+    let mut core = runtime_with(
+        sqlite(),
+        SyncManager::new().with_durability_tier(crate::sync_manager::DurabilityTier::GlobalServer),
+    );
     core.schema_manager_mut()
         .query_manager_mut()
         .set_authorization_schema(permissions());
@@ -449,14 +453,36 @@ impl World {
         )
     }
 
-    /// The fate the client holds for `batch`, as a short word.
+    /// The batch's fate as the SERVER stored it. A client's own `DurableDirect{Local}` is
+    /// not an acceptance, so a batch only the client has settled reads "local only"; and a
+    /// client that disagrees with the server's stored fate fails the gate on the spot.
     fn fate(&self, batch: BatchId) -> String {
-        match self.client.batch_fate(batch).expect("load batch fate") {
-            None => "none".into(),
-            Some(BatchFate::Rejected { .. }) => "rejected".into(),
-            Some(BatchFate::DurableDirect { .. }) => "accepted".into(),
-            Some(BatchFate::AcceptedTransaction { .. }) => "accepted".into(),
-            Some(BatchFate::Missing { .. }) => "missing".into(),
+        fn kind(fate: &BatchFate) -> &'static str {
+            match fate {
+                BatchFate::Rejected { .. } => "rejected",
+                BatchFate::DurableDirect { .. } | BatchFate::AcceptedTransaction { .. } => {
+                    "accepted"
+                }
+                BatchFate::Missing { .. } => "missing",
+            }
+        }
+        let client = self.client.batch_fate(batch).expect("load batch fate");
+        let server = self
+            .server
+            .storage()
+            .load_authoritative_batch_fate(batch)
+            .expect("load the server's batch fate");
+        match (&server, &client) {
+            (Some(server_fate), Some(client_fate))
+                if self.connected && kind(server_fate) != kind(client_fate) =>
+            {
+                panic!(
+                    "client and server disagree on {batch:?}: server {server_fate:?}, client {client_fate:?}"
+                )
+            }
+            (Some(server_fate), _) => kind(server_fate).into(),
+            (None, None) => "none".into(),
+            (None, Some(_)) => "local only".into(),
         }
     }
 
