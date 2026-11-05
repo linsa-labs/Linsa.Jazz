@@ -2028,7 +2028,7 @@ fn seal_batch_rejects_a_stale_frontier_declared_with_the_parents_blind_digest() 
     );
 }
 
-// ---- LOCAL ONLY (A1 at the sync-manager level): who may add to a batch and seal it.
+// ---- Who may add rows to a batch and seal it.
 
 fn users_row_of_batch(batch_id: BatchId, author: &str) -> crate::row_histories::StoredRowBatch {
     let mut row = row_with_batch_state(
@@ -2719,11 +2719,12 @@ fn an_edge_forwards_only_a_reseal_it_would_settle() {
     );
 }
 
-// ---- LOCAL ONLY (A1 differential): random interleavings against a model of the rules.
+// ---- Random interleavings of writers and strangers, against a model of the rules.
 
 mod batch_writer_differential {
     use super::*;
-    use crate::batch_fate::BatchWriter;
+    use crate::batch_fate::{BatchMode, BatchWriter};
+    use crate::row_histories::{RowState, StoredRowBatch};
     use std::collections::{BTreeMap, HashSet};
 
     /// SplitMix64, as the other differential gates use.
@@ -2758,18 +2759,39 @@ mod batch_writer_differential {
         DeniedRow,
         Replay,
         HonestSeal,
+        /// A digest that does not match the members.
         BrokenSeal,
+        /// Well formed, for another branch.
+        WrongBranch,
+        /// Well formed, leaving one of the batch's rows out.
+        MemberLeftOut,
+        /// Well formed, naming a row the batch does not hold.
+        ExtraMember,
     }
+
+    const OPS: [Op; 8] = [
+        Op::AllowedRow,
+        Op::DeniedRow,
+        Op::Replay,
+        Op::HonestSeal,
+        Op::BrokenSeal,
+        Op::WrongBranch,
+        Op::MemberLeftOut,
+        Op::ExtraMember,
+    ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Fate {
         None,
+        /// A direct fate confirmed below this node's tier, which this node can promote.
+        AcceptedBelow,
         Accepted,
         Rejected,
     }
 
     struct Batch {
         id: BatchId,
+        mode: BatchMode,
         writer: Option<BatchWriter>,
         fate: Fate,
     }
@@ -2781,9 +2803,21 @@ mod batch_writer_differential {
         }
     }
 
-    fn stored_fate(io: &MemoryStorage, batch_id: BatchId) -> Fate {
+    fn connect(sm: &mut SyncManager, io: &MemoryStorage, client_id: ClientId, role: Role) {
+        add_client(sm, io, client_id);
+        match role {
+            Role::User(user) => sm.set_client_session(client_id, Session::new(user)),
+            Role::Peer => sm.set_client_role(client_id, ClientRole::Peer),
+            Role::Backend => sm.set_client_role(client_id, ClientRole::Backend),
+        }
+    }
+
+    fn stored_fate(io: &MemoryStorage, batch_id: BatchId, tier: DurabilityTier) -> Fate {
         match io.load_authoritative_batch_fate(batch_id).unwrap() {
             None => Fate::None,
+            Some(BatchFate::DurableDirect { confirmed_tier, .. }) if confirmed_tier < tier => {
+                Fate::AcceptedBelow
+            }
             Some(BatchFate::DurableDirect { .. } | BatchFate::AcceptedTransaction { .. }) => {
                 Fate::Accepted
             }
@@ -2792,10 +2826,7 @@ mod batch_writer_differential {
         }
     }
 
-    fn stored_rows(
-        io: &MemoryStorage,
-        batch_id: BatchId,
-    ) -> Vec<crate::row_histories::StoredRowBatch> {
+    fn stored_rows(io: &MemoryStorage, batch_id: BatchId) -> Vec<StoredRowBatch> {
         io.load_local_batch_row_index(batch_id)
             .unwrap()
             .unwrap_or_default()
@@ -2813,16 +2844,38 @@ mod batch_writer_differential {
             .collect()
     }
 
+    /// A new row of `batch` by `author`: staged in a transactional batch, visible in a
+    /// direct one.
+    fn row_of(batch: &Batch, author: &str) -> StoredRowBatch {
+        let state = match batch.mode {
+            BatchMode::Direct => RowState::VisibleDirect,
+            BatchMode::Transactional => RowState::StagingPending,
+        };
+        let mut row = row_with_batch_state(
+            visible_row(ObjectId::new(), "main", Vec::new(), 1_000, b"alice"),
+            batch.id,
+            state,
+            None,
+        );
+        row.created_by = author.into();
+        row.updated_by = author.into();
+        row
+    }
+
+    fn members_of(rows: &[StoredRowBatch]) -> Vec<SealedBatchMember> {
+        rows.iter()
+            .map(|row| SealedBatchMember {
+                object_id: row.row_id,
+                row_digest: row.content_digest(),
+            })
+            .collect()
+    }
+
     /// The model's admission: a trusted connection always; a user if she holds the batch,
     /// or nobody does and every row it holds is hers. Only a row or a seal that validates
     /// (`binds`) may bind; a seal that does not decides nothing for a batch nobody holds
     /// and that holds nothing.
-    fn admit(
-        batch: &mut Batch,
-        role: Role,
-        stored: &[crate::row_histories::StoredRowBatch],
-        binds: bool,
-    ) -> bool {
+    fn admit(batch: &mut Batch, role: Role, stored: &[StoredRowBatch], binds: bool) -> bool {
         let claimant = claimant(role);
         match (&batch.writer, role) {
             (Some(_), Role::Peer | Role::Backend) => true,
@@ -2844,36 +2897,60 @@ mod batch_writer_differential {
         }
     }
 
-    fn run(seed: u64, steps: usize) {
+    /// The model's fate after an admitted step. A batch with no fate is decided by its
+    /// writer's denied row or by a seal of its rows; a fate below this node is promoted by
+    /// a seal that settles, and nothing else; any other fate stands.
+    fn next_fate(fate: Fate, op: Op, role: Role, stored: &[StoredRowBatch]) -> Fate {
+        let names_rows = !stored.is_empty();
+        match (fate, op) {
+            (Fate::None, Op::DeniedRow) if matches!(role, Role::User(_)) => Fate::Rejected,
+            (Fate::None | Fate::AcceptedBelow, Op::HonestSeal | Op::MemberLeftOut)
+                if names_rows =>
+            {
+                Fate::Accepted
+            }
+            (Fate::None, Op::BrokenSeal | Op::WrongBranch) if names_rows => Fate::Rejected,
+            (fate, _) => fate,
+        }
+    }
+
+    fn run(seed: u64, steps: usize, tier: DurabilityTier) {
         let mut rng = Rng(seed);
-        let mut sm = SyncManager::new().with_durability_tier(DurabilityTier::GlobalServer);
+        let mut sm = SyncManager::new().with_durability_tier(tier);
         let mut io = MemoryStorage::new();
         seed_users_schema(&mut io);
 
         // Two connections for alice, one for everyone else.
-        let mut connections: Vec<(ClientId, Role)> = Vec::new();
-        for user in USERS {
-            connections.push((user_client(&mut sm, &io, user), Role::User(user)));
-        }
-        connections.push((user_client(&mut sm, &io, "alice"), Role::User("alice")));
-        for (role, client_role) in [
-            (Role::Peer, ClientRole::Peer),
-            (Role::Backend, ClientRole::Backend),
-        ] {
-            let client_id = ClientId::new();
-            add_client(&mut sm, &io, client_id);
-            sm.set_client_role(client_id, client_role);
-            connections.push((client_id, role));
+        let connections: Vec<(ClientId, Role)> = [
+            Role::User("alice"),
+            Role::User("bob"),
+            Role::User("mallory"),
+            Role::User("alice"),
+            Role::Peer,
+            Role::Backend,
+        ]
+        .into_iter()
+        .map(|role| (ClientId::new(), role))
+        .collect();
+        for &(client_id, role) in &connections {
+            connect(&mut sm, &io, client_id, role);
         }
 
-        let mut batches: Vec<Batch> = (0..3)
-            .map(|_| Batch {
-                id: BatchId::new(),
-                writer: None,
-                fate: Fate::None,
-            })
-            .collect();
-        // One batch stored before bindings existed, written by alice.
+        let mut batches: Vec<Batch> = [
+            BatchMode::Direct,
+            BatchMode::Direct,
+            BatchMode::Transactional,
+            BatchMode::Transactional,
+        ]
+        .into_iter()
+        .map(|mode| Batch {
+            id: BatchId::new(),
+            mode,
+            writer: None,
+            fate: Fate::None,
+        })
+        .collect();
+        // A direct batch stored before bindings existed, written by alice.
         let legacy = BatchId::new();
         seed_visible_row(
             &mut sm,
@@ -2883,34 +2960,86 @@ mod batch_writer_differential {
         );
         batches.push(Batch {
             id: legacy,
+            mode: BatchMode::Direct,
             writer: None,
             fate: Fate::None,
         });
+        if tier == DurabilityTier::EdgeServer {
+            // Batches settled below this node, which a seal that settles promotes: the one
+            // from before bindings, and one alice wrote through this node.
+            let relayed = BatchId::new();
+            seed_visible_row(
+                &mut sm,
+                &mut io,
+                "users",
+                users_row_of_batch(relayed, "alice"),
+            );
+            let alice = BatchWriter::User("alice".to_string());
+            io.put_batch_writer(relayed, &alice).unwrap();
+            batches.push(Batch {
+                id: relayed,
+                mode: BatchMode::Direct,
+                writer: Some(alice),
+                fate: Fate::None,
+            });
+            for batch in batches
+                .iter_mut()
+                .filter(|batch| batch.id == legacy || batch.id == relayed)
+            {
+                io.upsert_authoritative_batch_fate(&BatchFate::DurableDirect {
+                    batch_id: batch.id,
+                    confirmed_tier: DurabilityTier::Local,
+                })
+                .unwrap();
+                batch.fate = Fate::AcceptedBelow;
+            }
+        }
 
         let mut denied_rows = HashSet::new();
         // Every row an admitted connection sent, by batch: the batch may hold only these
-        // (and the legacy row).
+        // (and the seeded rows).
         let mut admitted_rows: BTreeMap<BatchId, HashSet<ObjectId>> = BTreeMap::new();
-        admitted_rows
-            .entry(legacy)
-            .or_default()
-            .extend(stored_rows(&io, legacy).iter().map(|row| row.row_id));
-        let mut sent: Vec<(ClientId, crate::row_histories::StoredRowBatch)> = Vec::new();
+        for batch in &batches {
+            admitted_rows
+                .entry(batch.id)
+                .or_default()
+                .extend(stored_rows(&io, batch.id).iter().map(|row| row.row_id));
+        }
+        let mut sent: Vec<(ClientId, StoredRowBatch)> = Vec::new();
         sm.take_outbox();
 
         for step in 0..steps {
+            if rng.below(30) == 0 {
+                // A restart: a fresh node over the same store, every connection back.
+                sm = SyncManager::new().with_durability_tier(tier);
+                for &(client_id, role) in &connections {
+                    connect(&mut sm, &io, client_id, role);
+                }
+                sm.take_outbox();
+                continue;
+            }
+            if rng.below(15) == 0 {
+                // A new batch, so the time before a batch has a fate keeps coming back.
+                batches.push(Batch {
+                    id: BatchId::new(),
+                    mode: [BatchMode::Direct, BatchMode::Transactional][rng.below(2)],
+                    writer: None,
+                    fate: Fate::None,
+                });
+                continue;
+            }
             let (client_id, role) = connections[rng.below(connections.len())];
-            let index = rng.below(batches.len());
-            let op = [
-                Op::AllowedRow,
-                Op::DeniedRow,
-                Op::Replay,
-                Op::HonestSeal,
-                Op::BrokenSeal,
-            ][rng.below(5)];
+            // Half the steps go to the newest batch, which is the likeliest to have no fate.
+            let index = if rng.below(2) == 0 {
+                batches.len() - 1
+            } else {
+                rng.below(batches.len())
+            };
+            let op = OPS[rng.below(OPS.len())];
             let batch_id = batches[index].id;
             let stored = stored_rows(&io, batch_id);
-            let context = format!("seed {seed:#x} step {step}: {role:?} {op:?} on batch {index}");
+            let context =
+                format!("seed {seed:#x} {tier:?} step {step}: {role:?} {op:?} on batch {index}");
 
             let payload = match op {
                 Op::AllowedRow | Op::DeniedRow => {
@@ -2918,7 +3047,7 @@ mod batch_writer_differential {
                         Role::User(user) => user,
                         Role::Peer | Role::Backend => USERS[rng.below(USERS.len())],
                     };
-                    let row = users_row_of_batch(batch_id, author);
+                    let row = row_of(&batches[index], author);
                     if op == Op::DeniedRow {
                         denied_rows.insert(row.row_id);
                     }
@@ -2936,14 +3065,40 @@ mod batch_writer_differential {
                     }
                     row_payload(&mine[rng.below(mine.len())])
                 }
-                Op::HonestSeal | Op::BrokenSeal => {
-                    let rows: Vec<_> = stored.iter().collect();
-                    let seal = honest_seal(batch_id, &rows);
+                Op::HonestSeal
+                | Op::BrokenSeal
+                | Op::WrongBranch
+                | Op::MemberLeftOut
+                | Op::ExtraMember => {
+                    let mut members = members_of(&stored);
+                    match op {
+                        Op::MemberLeftOut if members.len() < 2 => continue,
+                        Op::MemberLeftOut => {
+                            members.remove(rng.below(members.len()));
+                        }
+                        Op::ExtraMember => members.push(SealedBatchMember {
+                            object_id: ObjectId::new(),
+                            row_digest: crate::digest::Digest32([7; 32]),
+                        }),
+                        _ => {}
+                    }
+                    let branch = if op == Op::WrongBranch {
+                        "elsewhere"
+                    } else {
+                        "main"
+                    };
+                    let submission = sealed_submission_with_mode(
+                        batch_id,
+                        batches[index].mode,
+                        branch,
+                        members,
+                        Vec::new(),
+                    );
                     SyncPayload::SealBatch {
                         submission: if op == Op::BrokenSeal {
-                            broken(seal)
+                            broken(submission)
                         } else {
-                            seal
+                            submission
                         },
                     }
                 }
@@ -2958,7 +3113,8 @@ mod batch_writer_differential {
             let batch = &mut batches[index];
             let binds = match op {
                 Op::AllowedRow | Op::DeniedRow | Op::Replay => true,
-                Op::HonestSeal => !stored.is_empty(),
+                Op::HonestSeal | Op::WrongBranch => !stored.is_empty(),
+                Op::MemberLeftOut | Op::ExtraMember => true,
                 Op::BrokenSeal => false,
             };
             let admitted = admit(batch, role, &stored, binds);
@@ -2966,12 +3122,7 @@ mod batch_writer_differential {
                 admitted_rows.entry(batch_id).or_default().insert(object_id);
             }
             if admitted {
-                batch.fate = match (batch.fate, op) {
-                    (Fate::None, Op::DeniedRow) if matches!(role, Role::User(_)) => Fate::Rejected,
-                    (Fate::None, Op::HonestSeal) if !stored.is_empty() => Fate::Accepted,
-                    (Fate::None, Op::BrokenSeal) if !stored.is_empty() => Fate::Rejected,
-                    (fate, _) => fate,
-                };
+                batch.fate = next_fate(batch.fate, op, role, &stored);
             }
 
             // The system.
@@ -2997,7 +3148,7 @@ mod batch_writer_differential {
             );
             for batch in &batches {
                 assert_eq!(
-                    stored_fate(&io, batch.id),
+                    stored_fate(&io, batch.id, tier),
                     batch.fate,
                     "{context}: fate of {:?}",
                     batch.id
@@ -3034,8 +3185,25 @@ mod batch_writer_differential {
 
     #[test]
     fn random_interleavings_of_writers_and_strangers_match_the_model() {
-        for seed in 0..40u64 {
-            run(0xA1A1_0000_0000_0000 ^ seed, 300);
+        for seed in 0..100u64 {
+            run(
+                0xA1A1_0000_0000_0000 ^ seed,
+                300,
+                DurabilityTier::GlobalServer,
+            );
+        }
+    }
+
+    /// The same on an edge, where batches settled below it are promoted by a seal that
+    /// settles and by nothing else.
+    #[test]
+    fn random_interleavings_on_an_edge_holding_lower_fates_match_the_model() {
+        for seed in 0..100u64 {
+            run(
+                0xA1A2_0000_0000_0000 ^ seed,
+                300,
+                DurabilityTier::EdgeServer,
+            );
         }
     }
 }
