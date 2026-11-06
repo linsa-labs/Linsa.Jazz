@@ -319,7 +319,8 @@ impl MaterializeNode {
                         .output_descriptor
                         .element(elem_idx)
                         .map(|element| element.table);
-                    if let Some(loaded) = loader(*id, table_hint) {
+                    // A retired row is gone to whatever this node feeds.
+                    if let Some(loaded) = loader(*id, table_hint).filter(|loaded| !loaded.retired) {
                         let row = Row::new(
                             *id,
                             loaded.data.clone(),

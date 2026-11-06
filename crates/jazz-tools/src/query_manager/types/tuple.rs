@@ -114,6 +114,10 @@ pub struct LoadedRow {
     pub row_provenance: RowProvenance,
     pub provenance: TupleProvenance,
     pub batch_id: BatchId,
+    /// A soft-deleted row an authorization loader handed on: INHERITS may stand on a
+    /// deleted parent, but to an EXISTS it is no row at all. Query loaders never set it,
+    /// they drop such rows themselves.
+    pub retired: bool,
 }
 
 impl LoadedRow {
@@ -128,7 +132,13 @@ impl LoadedRow {
             row_provenance,
             provenance,
             batch_id,
+            retired: false,
         }
+    }
+
+    pub fn with_retired(mut self, retired: bool) -> Self {
+        self.retired = retired;
+        self
     }
 }
 

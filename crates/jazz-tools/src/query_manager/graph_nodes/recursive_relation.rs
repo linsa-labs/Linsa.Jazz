@@ -595,7 +595,9 @@ impl RecursiveRelationNode {
                     else {
                         continue;
                     };
-                    let Some(target_row) = row_loader(*target_id, Some(hop.table)) else {
+                    let Some(target_row) = row_loader(*target_id, Some(hop.table))
+                        .filter(|target_row| !target_row.retired)
+                    else {
                         continue;
                     };
                     if decode_row(&self.output_descriptor, &target_row.data).is_err() {

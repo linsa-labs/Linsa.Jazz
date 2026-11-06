@@ -53,6 +53,8 @@ pub(crate) struct ExecutionQueryPlan {
     pub include_deleted: bool,
     pub array_subqueries: Vec<ArraySubquerySpec>,
     pub project_columns: Option<Vec<ProjectColumn>>,
+    /// See [`crate::query_manager::graph::RelationCompileFeatures::keep_residual_filter`].
+    pub keep_residual_filter: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -958,6 +960,7 @@ pub(crate) fn lower_relation_to_execution_plan(
         include_deleted,
         array_subqueries,
         project_columns,
+        keep_residual_filter: false,
     };
     bind_row_id_condition_columns(&mut plan, schema);
     Some(plan)

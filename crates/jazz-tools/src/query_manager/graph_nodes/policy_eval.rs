@@ -5,7 +5,7 @@ use crate::query_manager::policy::{
     Operation, PolicyExpr, bind_outer_row_refs, bind_relation_refs,
     evaluate_expr_recursive_with_row_id, normalize_recursive_max_depth,
 };
-use crate::query_manager::policy_graph::PolicyGraph;
+use crate::query_manager::policy_graph::{GenerationScans, PolicyGraph};
 use crate::query_manager::relation_ir::RelExpr;
 use crate::query_manager::session::Session;
 use crate::query_manager::settlement_eval_cache::{RefAccessSubexprKey, SettlementEvalCache};
@@ -32,6 +32,9 @@ pub(crate) struct PolicyContextEvaluator<'a> {
     /// (`QueryManager::decide_parked_batches`). The row loader must serve the same
     /// versions, or the scan and the materialised row disagree.
     local_overlay_rows: Option<&'a HashMap<ObjectId, RowBatchKey>>,
+    /// The generation of every branch, when the caller knows them: EXISTS scans then read
+    /// only the rows one equality of the condition can match.
+    generations: Option<GenerationScans<'a>>,
 }
 
 impl<'a> PolicyContextEvaluator<'a> {
@@ -48,7 +51,13 @@ impl<'a> PolicyContextEvaluator<'a> {
             row_policy_mode,
             settlement_eval_cache: None,
             local_overlay_rows: None,
+            generations: None,
         }
+    }
+
+    pub(crate) fn with_generation_scans(mut self, generations: GenerationScans<'a>) -> Self {
+        self.generations = Some(generations);
+        self
     }
 
     pub(crate) fn with_local_overlay_rows(
@@ -206,7 +215,10 @@ impl<'a> PolicyContextEvaluator<'a> {
         }
 
         for source_row_id in candidate_ids {
-            let Some(source_row) = row_loader(source_row_id, Some(source_table_name)) else {
+            // A retired referencing row grants nothing.
+            let Some(source_row) = row_loader(source_row_id, Some(source_table_name))
+                .filter(|source_row| !source_row.retired)
+            else {
                 continue;
             };
 
@@ -518,6 +530,8 @@ impl<'a> PolicyContextEvaluator<'a> {
             self.branches,
             operation,
             self.row_policy_mode,
+            self.generations,
+            self.local_overlay_rows,
         ) {
             Some(g) => g,
             None => return false,
@@ -534,7 +548,30 @@ impl<'a> PolicyContextEvaluator<'a> {
             }
         }
 
-        graph.result()
+        let verdict = graph.result();
+        // Every narrowed verdict is judged again over whole scans, which narrowing must not
+        // change. The second pass is not counted as the check's reads on this thread; the
+        // process-wide `settle_cost` counters do count it, as other threads count into them
+        // at the same time.
+        #[cfg(test)]
+        if self.generations.is_some()
+            && !crate::query_manager::policy_graph::WHOLE_SCANS.with(std::cell::Cell::get)
+        {
+            use crate::query_manager::manager::VISIBLE_CANDIDATE_LOADS;
+            let loads = VISIBLE_CANDIDATE_LOADS.with(std::cell::Cell::get);
+            let whole = {
+                let _whole = crate::query_manager::policy_graph::WholeScans::begin();
+                self.evaluate_exists_with_context(
+                    table, condition, operation, row, descriptor, io, row_loader, depth,
+                )
+            };
+            VISIBLE_CANDIDATE_LOADS.with(|counted| counted.set(loads));
+            assert_eq!(
+                verdict, whole,
+                "a narrowed scan changed the verdict of an EXISTS on {table}: {condition:?}"
+            );
+        }
+        verdict
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -26,7 +26,7 @@ use super::manager::{
     ServerQuerySubscription,
 };
 use super::policy::{ComplexClause, Operation, PolicyExpr};
-use super::policy_graph::{PolicyGraph, PolicyGraphBuildOptions};
+use super::policy_graph::{GenerationScans, PolicyGraph, PolicyGraphBuildOptions};
 use super::session::Session;
 use super::settlement_eval_cache::SettlementEvalCache;
 use super::types::{
@@ -122,7 +122,8 @@ pub(crate) struct AuthorizationPolicyRequest<'a> {
     /// The sanctioned branch universe policy CONTEXT arms (EXISTS /
     /// readReferencing / INHERITS) evaluate against.
     ///
-    /// `None` keeps the write default: the write's own branch. READ paths
+    /// `None` is a write check: the same family plus the write's own branch, each
+    /// branch's scan narrowed to one equality of the condition. READ paths
     /// must pass the same cross-branch family plain reads serve — after a
     /// migration a row's supporting rows (a co-membership grounding a
     /// readReferencing arm) can live on the other same-lineage world, and a
@@ -679,12 +680,15 @@ impl QueryManager {
             None,
         )?;
 
-        Some(LoadedRow::new(
-            transformed,
-            tip_provenance,
-            [(object_id, found_branch)].into_iter().collect(),
-            row.batch_id,
-        ))
+        Some(
+            LoadedRow::new(
+                transformed,
+                tip_provenance,
+                [(object_id, found_branch)].into_iter().collect(),
+                row.batch_id,
+            )
+            .with_retired(row.is_soft_deleted()),
+        )
     }
 
     /// [`Self::load_row_for_authorization_context`] for a row of the batch a parked check
@@ -738,12 +742,15 @@ impl QueryManager {
             auth_context,
             Some(member.schema_hash),
         )?;
-        Some(LoadedRow::new(
-            transformed,
-            row.row_provenance(),
-            [(object_id, member.branch_name)].into_iter().collect(),
-            row.batch_id,
-        ))
+        Some(
+            LoadedRow::new(
+                transformed,
+                row.row_provenance(),
+                [(object_id, member.branch_name)].into_iter().collect(),
+                row.batch_id,
+            )
+            .with_retired(row.is_soft_deleted()),
+        )
     }
 
     pub(super) fn evaluate_authorization_policy(
@@ -784,17 +791,25 @@ impl QueryManager {
             return false;
         };
 
-        // Write authorization stays scoped to the write's own branch. Read
-        // paths pass their sanctioned universe explicitly (defect 24): a
-        // policy arm grounded in a supporting row must see every branch the
-        // query itself reads, or a cross-world family denies a row the
-        // session is entitled to.
-        let own_branch;
+        // A policy arm grounded in a supporting row sees every branch readers
+        // serve rows from (defect 24): read paths pass their sanctioned universe,
+        // and a write is judged by the same family, plus its own branch. Scoped to
+        // the write's branch alone, every row from before the last deployment is
+        // invisible to it — a membership readers serve as active denies the
+        // member's message, and a membership handed away on the newer generation
+        // still vouches for a device on the older one.
+        let write_check = policy_branches.is_none();
+        let write_universe;
         let policy_branches: &[String] = match policy_branches {
             Some(universe) => universe,
             None => {
-                own_branch = [branch_name.as_str().to_string()];
-                &own_branch
+                let mut branches =
+                    ReadPolicyBranchUniverse::from_authorization_context(auth_context).branches;
+                if !branches.iter().any(|branch| branch == branch_name.as_str()) {
+                    branches.push(branch_name.as_str().to_string());
+                }
+                write_universe = branches;
+                &write_universe
             }
         };
         // A parked check evaluated again reads the approved rows of its own batch as if
@@ -803,7 +818,11 @@ impl QueryManager {
         let overlay = self
             .write_check_overlay
             .as_ref()
-            .filter(|_| policy_branches == [branch_name.as_str().to_string()].as_slice())
+            .filter(|_| {
+                policy_branches
+                    .iter()
+                    .any(|branch| branch == branch_name.as_str())
+            })
             .filter(|overlay| overlay.evaluated == object_id)
             .cloned();
         let overlay_rows = overlay
@@ -821,6 +840,13 @@ impl QueryManager {
         )
         .with_settlement_eval_cache(settlement_eval_cache)
         .with_local_overlay_rows(overlay_rows.as_ref());
+        // Narrowing each generation's scan is the write check's; reads keep scanning whole.
+        if write_check {
+            evaluator = evaluator.with_generation_scans(GenerationScans {
+                context: auth_context,
+                branch_schemas: source_branch_schema_map,
+            });
+        }
         let row = Row::new(object_id, transformed, BatchId([0; 16]), provenance.clone());
         let mut visited = HashSet::new();
         let mut row_loader = |related_id: ObjectId, table_hint: Option<TableName>| {
@@ -3493,6 +3519,8 @@ impl QueryManager {
                         &policy_branches,
                         operation,
                         self.row_policy_mode,
+                        None,
+                        None,
                     ) {
                         graphs.push(graph);
                     } else {

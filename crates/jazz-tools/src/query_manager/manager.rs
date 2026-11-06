@@ -813,6 +813,13 @@ pub(super) enum DeclaredIndexSteps {
     Granted(bool),
 }
 
+// Per-branch visible-row loads made while picking a row's winner across branches, on this
+// thread: what a check that reads rows across generations pays in storage.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static VISIBLE_CANDIDATE_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl QueryManager {
     fn mark_schema_catalogue_dirty(&mut self, schema_hash: SchemaHash) {
         self.pending_catalogue_schema_hashes.insert(schema_hash);
@@ -3774,6 +3781,8 @@ impl QueryManager {
                 Some(_) => translated_table.as_deref().unwrap_or(original_table),
                 None => original_table,
             };
+            #[cfg(test)]
+            VISIBLE_CANDIDATE_LOADS.with(|loads| loads.set(loads.get() + 1));
             let loaded_row = Self::load_visible_query_row_from_candidate_tables(
                 storage,
                 primary_table,

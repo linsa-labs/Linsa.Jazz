@@ -981,11 +981,21 @@ fn evaluate_cmp_with_row_id(
 }
 
 fn normalize_cmp_value_for_decoded_column(left: &Value, right: Value) -> Value {
-    match (left, right) {
-        (Value::Uuid(_), Value::Text(raw)) => Uuid::parse_str(&raw)
+    match left {
+        Value::Uuid(_) => uuid_from_text(right),
+        _ => right,
+    }
+}
+
+/// The value a comparison with a uuid holds `value` to: the uuid a text spells, as a
+/// session's `user_id` spells a row's uuid reference. Text that spells none stays text,
+/// which equals no uuid.
+pub(crate) fn uuid_from_text(value: Value) -> Value {
+    match value {
+        Value::Text(raw) => Uuid::parse_str(&raw)
             .map(|uuid| Value::Uuid(ObjectId::from_uuid(uuid)))
             .unwrap_or(Value::Text(raw)),
-        (_, right) => right,
+        value => value,
     }
 }
 

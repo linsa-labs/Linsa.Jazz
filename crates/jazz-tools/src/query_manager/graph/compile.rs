@@ -479,9 +479,10 @@ impl QueryGraph {
                 schema_context,
                 row_policy_mode,
                 declarations,
+                features.keep_residual_filter,
             );
         }
-        let plan = lower_relation_to_execution_plan(
+        let mut plan = lower_relation_to_execution_plan(
             relation,
             branches,
             features.include_deleted,
@@ -489,6 +490,7 @@ impl QueryGraph {
             features.select_columns,
             schema,
         )?;
+        plan.keep_residual_filter = features.keep_residual_filter;
         validate_execution_plan(&plan, schema).ok()?;
         Self::compile_execution_plan_with_schema_context(
             &plan,
@@ -500,6 +502,7 @@ impl QueryGraph {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_relation_ir_union_with_schema_context_and_features(
         inputs: &[RelExpr],
         schema: &Schema,
@@ -508,6 +511,7 @@ impl QueryGraph {
         schema_context: &SchemaContext,
         row_policy_mode: RowPolicyMode,
         declarations: &Arc<IndexDeclarations>,
+        keep_residual_filter: bool,
     ) -> Option<Self> {
         let mut compiled_inputs = inputs
             .iter()
@@ -518,7 +522,10 @@ impl QueryGraph {
                     branches,
                     session.clone(),
                     schema_context,
-                    RelationCompileFeatures::default(),
+                    RelationCompileFeatures {
+                        keep_residual_filter,
+                        ..RelationCompileFeatures::default()
+                    },
                     row_policy_mode,
                     declarations,
                 )
@@ -960,6 +967,7 @@ impl QueryGraph {
             &plan.disjuncts,
             &scan_plans,
             &current_tuple_descriptor,
+            plan.keep_residual_filter,
         );
         if !matches!(predicate, Predicate::True) {
             let filter_node =
@@ -2353,8 +2361,10 @@ fn build_remaining_predicate_from_disjuncts(
     disjuncts: &[Conjunction],
     scan_plans: &[IndexScanPlan],
     tuple_descriptor: &TupleDescriptor,
+    keep_residual_filter: bool,
 ) -> Predicate {
-    let all_fully_covered = disjuncts.len() == scan_plans.len()
+    let all_fully_covered = !keep_residual_filter
+        && disjuncts.len() == scan_plans.len()
         && scan_plans.iter().all(|scan_plan| scan_plan.fully_covers);
 
     if all_fully_covered {

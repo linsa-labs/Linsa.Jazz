@@ -165,6 +165,8 @@ pub(crate) struct RelationCompileFeatures {
     pub include_deleted: bool,
     pub array_subqueries: Vec<ArraySubquerySpec>,
     pub select_columns: Option<Vec<String>>,
+    /// Judge every scanned row by the whole predicate, even where an index scan covers it.
+    pub keep_residual_filter: bool,
 }
 
 impl QueryGraph {

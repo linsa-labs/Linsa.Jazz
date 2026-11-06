@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::storage::Storage;
 
-use crate::schema_manager::SchemaContext;
+use crate::schema_manager::transformer::translate_table_and_column_for_schema;
+use crate::schema_manager::{SchemaContext, translate_table_name_to_schema};
 
 use super::graph::{GraphNode, QueryGraph, RelationCompileFeatures};
 use super::graph_nodes::NodeId;
@@ -20,13 +21,193 @@ use super::graph_nodes::materialize::MaterializeNode;
 use super::graph_nodes::policy_filter::{PolicyFilterNode, PolicyFilterOptions};
 use super::graph_nodes::union::UnionNode;
 use super::index::ScanCondition;
-use super::policy::{Operation, PolicyExpr};
+use super::policy::{
+    CmpOp, Operation, PolicyExpr, PolicyValue, resolve_session_value, uuid_from_text,
+};
 use super::relation_ir::RelExpr;
 use super::relation_ir_query_plan::lower_relation_to_execution_plan;
 use super::session::Session;
 use super::settlement_eval_cache::SettlementEvalCache;
-use super::types::ColumnName;
-use super::types::{LoadedRow, RowPolicyMode, Schema, TableName, TupleDescriptor, Value};
+use super::types::{ColumnName, SchemaHash};
+use super::types::{
+    ColumnType, LoadedRow, RowPolicyMode, Schema, TableName, TupleDescriptor, Value,
+};
+
+/// The generation every branch of a write check's EXISTS universe holds its rows in: the
+/// branches as the main context's `branch_schema_map` names them, each generation read from
+/// the authorization context. What narrows the scan of each branch to the rows one indexed
+/// equality of the condition can still match, and names the table as that generation
+/// stores it.
+#[derive(Clone, Copy)]
+pub(crate) struct GenerationScans<'a> {
+    pub(crate) context: &'a SchemaContext,
+    pub(crate) branch_schemas: &'a HashMap<String, SchemaHash>,
+}
+
+impl GenerationScans<'_> {
+    /// The scan of `branch` narrowed to one top-level equality of `condition`, in that
+    /// branch's own table and column names: `None` keeps the full scan. The PolicyFilter
+    /// above judges every row by the whole condition all the same, so a narrowed scan only
+    /// has to keep every row of the branch the equality can match. An index lists every
+    /// row under its whole value (`indices.rs`) and the lenses carry values through
+    /// unchanged. The policy's equality is strict but for one conversion: a uuid is
+    /// compared with the uuid a text value spells (`uuid_from_text`), as a session's
+    /// `user_id` names a row's uuid reference. So an index lookup of the value, converted
+    /// the same way where the column holds uuids, keeps them all where:
+    /// - the value is not a null: an index holds no entry for one, and the policy's
+    ///   equality matches a null to a null;
+    /// - the lenses carry the column to the branch's generation, under the name it has
+    ///   there, and that generation declares and indexes it with the type the policy's
+    ///   generation declares; where a lens on the way adds or removes the column, a column
+    ///   of the same name on the older generation is another column, whose values the
+    ///   lenses do not serve;
+    /// - `id` is the row id, a uuid, only where the table declares no `id` column of its
+    ///   own;
+    /// - the branch holds no rows of the write's own batch in another layout than the
+    ///   policy's: the scan matches those by decoding them in the policy's layout.
+    fn narrowed_scan(
+        &self,
+        table: &TableName,
+        condition: &PolicyExpr,
+        session: &Session,
+        branch: &str,
+        local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
+    ) -> Option<(TableName, ColumnName, ScanCondition)> {
+        #[cfg(test)]
+        if WHOLE_SCANS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let hash = *self.branch_schemas.get(branch)?;
+        if hash != self.context.current_hash
+            && local_overlay_rows
+                .is_some_and(|rows| rows.values().any(|key| key.branch_name.as_str() == branch))
+        {
+            return None;
+        }
+        let generation = self.context.get_schema(&hash)?;
+        let declared = self.context.current_schema.get(table)?;
+        let mut conjuncts = Vec::new();
+        top_level_conjuncts(condition, &mut conjuncts);
+        conjuncts.into_iter().find_map(|conjunct| {
+            let PolicyExpr::Cmp {
+                column,
+                op: CmpOp::Eq,
+                value,
+            } = conjunct
+            else {
+                return None;
+            };
+            let value = match value {
+                PolicyValue::Literal(value) => value.clone(),
+                PolicyValue::SessionRef(path) => resolve_session_value(path, session)?,
+            };
+            if value.is_null() {
+                return None;
+            }
+            let Some(declared_column) = declared.columns.column(column) else {
+                if column != "id" {
+                    return None;
+                }
+                let scan_table =
+                    translate_table_name_to_schema(self.context, table.as_str(), &hash)?;
+                return Some((
+                    TableName::new(&scan_table),
+                    ColumnName::new("_id"),
+                    ScanCondition::Eq(uuid_from_text(value)),
+                ));
+            };
+            // With no lens path at all, a table translates only to itself under identical
+            // columns, so the column keeps its name. A path that declines the column is
+            // final: the full scan stays.
+            let (scan_table, scan_column) = match translate_table_and_column_for_schema(
+                self.context,
+                table.as_str(),
+                column,
+                &hash,
+            ) {
+                Some(translated) => translated,
+                None if self.context.lens_path(&hash).is_err() => (
+                    translate_table_name_to_schema(self.context, table.as_str(), &hash)?,
+                    column.clone(),
+                ),
+                None => return None,
+            };
+            let scan_table_schema = generation.get(&TableName::new(&scan_table))?;
+            let scan_column_type = &scan_table_schema.columns.column(&scan_column)?.column_type;
+            if *scan_column_type != declared_column.column_type
+                || !scan_table_schema.is_indexed_column(&scan_column)
+            {
+                return None;
+            }
+            let value = match scan_column_type {
+                ColumnType::Uuid => uuid_from_text(value),
+                _ => value,
+            };
+            Some((
+                TableName::new(&scan_table),
+                ColumnName::new(&scan_column),
+                ScanCondition::Eq(value),
+            ))
+        })
+    }
+}
+
+// Set while a write check's EXISTS is judged again over whole scans, on this thread: the
+// verdict a narrowed scan has to match.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WHOLE_SCANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whole scans on this thread while it lives, a panic included.
+#[cfg(test)]
+pub(crate) struct WholeScans;
+
+#[cfg(test)]
+impl WholeScans {
+    pub(crate) fn begin() -> Self {
+        WHOLE_SCANS.with(|whole| whole.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WholeScans {
+    fn drop(&mut self) {
+        WHOLE_SCANS.with(|whole| whole.set(false));
+    }
+}
+
+impl GenerationScans<'_> {
+    /// The table a whole scan of `table` reads on `branch`: the name `branch`'s generation
+    /// stores it by, as a renamed table's older rows live under its old name there. `None`
+    /// where a lens path to that generation declines the table: it was added on the path,
+    /// so the generation holds no rows of it, and its current name there may be another
+    /// table's, one a rename on the path freed it from, whose rows the loader serves as
+    /// that other table. With no generation known for the branch, or no lens path to it,
+    /// the table keeps its name.
+    fn whole_scan_table(&self, table: &TableName, branch: &str) -> Option<TableName> {
+        let Some(hash) = self.branch_schemas.get(branch) else {
+            return Some(*table);
+        };
+        match translate_table_name_to_schema(self.context, table.as_str(), hash) {
+            Some(name) => Some(TableName::new(&name)),
+            None if self.context.lens_path(hash).is_err() => Some(*table),
+            None => None,
+        }
+    }
+}
+
+fn top_level_conjuncts<'e>(condition: &'e PolicyExpr, conjuncts: &mut Vec<&'e PolicyExpr>) {
+    match condition {
+        PolicyExpr::And(exprs) => {
+            for expr in exprs {
+                top_level_conjuncts(expr, conjuncts);
+            }
+        }
+        other => conjuncts.push(other),
+    }
+}
 
 /// A one-shot graph for evaluating a policy condition.
 ///
@@ -202,7 +383,8 @@ impl PolicyGraph {
     /// satisfying row on ANY queried branch still gets nothing.
     ///
     /// Returns None if the table is not in the schema or no branch is given.
-    pub fn for_exists(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_exists(
         table: &TableName,
         condition: &PolicyExpr,
         session: &Session,
@@ -210,25 +392,42 @@ impl PolicyGraph {
         branches: &[String],
         policy_operation: Operation,
         row_policy_mode: RowPolicyMode,
+        generations: Option<GenerationScans<'_>>,
+        local_overlay_rows: Option<&HashMap<ObjectId, RowBatchKey>>,
     ) -> Option<Self> {
         let table_schema = schema.get(table)?;
         let descriptor = table_schema.columns.clone();
 
         let mut graph = QueryGraph::new(*table, descriptor.clone());
 
-        // IndexScan nodes: full table scan (check all rows), one per branch.
+        // IndexScan nodes, one per branch: what one equality of the condition narrows the
+        // branch to, or the whole table.
         let id_column = ColumnName::new("_id");
         let mut scan_ids = Vec::new();
         for branch in branches {
+            let (scan_table, scan_column, scan_condition) = generations
+                .and_then(|generations| {
+                    generations.narrowed_scan(table, condition, session, branch, local_overlay_rows)
+                })
+                .unwrap_or_else(|| {
+                    match generations.map(|generations| generations.whole_scan_table(table, branch))
+                    {
+                        Some(None) => (*table, id_column, ScanCondition::Empty),
+                        Some(Some(scan_table)) => (scan_table, id_column, ScanCondition::All),
+                        None => (*table, id_column, ScanCondition::All),
+                    }
+                });
             let scan_node = IndexScanNode::new_with_branch(
-                *table,
-                id_column,
+                scan_table,
+                scan_column,
                 branch,
-                ScanCondition::All,
+                scan_condition,
                 descriptor.clone(),
             );
             let scan_id = graph.add_node_with_id(GraphNode::IndexScan(scan_node));
-            graph.index_scan_nodes.push((scan_id, *table, id_column));
+            graph
+                .index_scan_nodes
+                .push((scan_id, scan_table, scan_column));
             scan_ids.push(scan_id);
         }
         let scan_output = if scan_ids.len() > 1 {
@@ -323,7 +522,13 @@ impl PolicyGraph {
             branches,
             session,
             &schema_context,
-            RelationCompileFeatures::default(),
+            // A scan of an older generation lists a row by that copy's value, while the
+            // row it loads is the newest version across the universe: an index that covers
+            // the condition does not vouch for the row the policy is handed.
+            RelationCompileFeatures {
+                keep_residual_filter: true,
+                ..RelationCompileFeatures::default()
+            },
             if use_structural_rows {
                 RowPolicyMode::PermissiveLocal
             } else {

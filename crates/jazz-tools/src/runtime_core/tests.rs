@@ -2388,6 +2388,7 @@ mod sync_replay;
 mod table_rename_write;
 mod unappliable_row_logging;
 mod write_batch;
+mod write_policy_generation_universe;
 
 /// A wiped upstream (fresh store behind the same endpoint) RELEARNS settled
 /// rows on reconnect: the reconnect replay re-offers the client's durable
