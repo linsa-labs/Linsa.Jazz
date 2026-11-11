@@ -13,6 +13,21 @@ import {
   type OpenJazzClientConfig,
 } from "../react-native/create-jazz-client.js";
 import { refuseClientAppId } from "../runtime/client-scope.js";
+import type { AppBearer } from "../accounts/enrollment.js";
+
+/**
+ * LINSA FORK: `fetch` presenting the app's bearer, so the backend that names
+ * the user (the session registry) sees who is asking. Without it a backend
+ * that authenticates by bearer, not cookie, never answers the session.
+ */
+const withBearer =
+  (bearer: AppBearer): typeof fetch =>
+  async (input, init) => {
+    const token = await bearer();
+    const headers = new Headers(init?.headers);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    return fetch(input, { ...init, headers });
+  };
 
 export type JazzClientConfig = Omit<OpenJazzClientConfig, "account" | "serverUrl" | "appId"> &
   Omit<AccountManagerConfig, "appId"> & {
@@ -75,6 +90,7 @@ export async function createJazzClient(
       registry: clientRegistryUrl(config),
       events: nativeBackendWatchEvents,
       linkGuest: config.linkGuestOnSignUp,
+      ...(config.bearer ? { fetch: withBearer(config.bearer) } : {}),
     }),
   });
   await firstBackendAnswer(session);
