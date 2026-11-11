@@ -47,7 +47,7 @@ fn v1() -> JazzSchema {
     JazzSchema::new(&v1_source()).unwrap()
 }
 
-fn v2() -> JazzSchema {
+pub(crate) fn v2() -> JazzSchema {
     JazzSchema::new(&v2_source()).unwrap()
 }
 
@@ -79,11 +79,11 @@ pub(crate) fn migrations() -> Vec<u8> {
     .unwrap()
 }
 
-fn author() -> AuthorSubject {
+pub(crate) fn author() -> AuthorSubject {
     AuthorSubject::for_test_bytes([0x5a; 16])
 }
 
-fn identity(node: u8) -> DbIdentity {
+pub(crate) fn identity(node: u8) -> DbIdentity {
     DbIdentity {
         node: NodeUuid::from_bytes([node; 16]),
         author: author(),
@@ -109,7 +109,7 @@ fn authority(path: &std::path::Path) -> Binding {
     Binding::new(db, identity, true)
 }
 
-fn relay(path: std::path::PathBuf, migrations: Option<Vec<u8>>) -> NativeRelay {
+pub(crate) fn relay(path: std::path::PathBuf, migrations: Option<Vec<u8>>) -> NativeRelay {
     NativeRelay::spawn(RelayOpenConfig {
         supported_abi: NativeRelayAbiRange {
             minimum: NATIVE_RELAY_ABI_V1,
@@ -250,4 +250,38 @@ fn a_relay_that_refuses_its_upstream_reports_it_on_the_wire() {
         "{reason}"
     );
     assert_eq!(refusal(&relay).as_deref(), Some(reason.as_str()));
+}
+
+/// A store a build without the app's migrations already opened names the
+/// migrated version afresh, and reopening it with them does not rename what
+/// it stored. Its foregrounds (which open with the migrations) then refuse
+/// the relay: the refusal is latched once, as non-retrying upstream state,
+/// and local ticks keep running.
+#[test]
+fn a_store_opened_without_the_migrations_latches_its_foregrounds_refusal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("alice.sqlite");
+    drop(relay(path.clone(), None));
+
+    let relay = relay(path, Some(migrations()));
+    let client = relay
+        .attach_client(identity(0x02), BTreeMap::new())
+        .unwrap();
+    client.pump_foreground().expect("local ticks keep running");
+    let refusal = client
+        .relay_refusal()
+        .unwrap()
+        .expect("the refusal is latched");
+    assert!(!refusal.retrying);
+    assert!(
+        refusal.reason.contains("stores otherwise"),
+        "{}",
+        refusal.reason
+    );
+    client.pump_foreground().expect("local ticks keep running");
+    assert_eq!(
+        client.relay_refusal().unwrap(),
+        Some(refusal),
+        "one sequence"
+    );
 }

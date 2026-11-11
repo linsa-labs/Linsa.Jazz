@@ -7,7 +7,7 @@ import { assertAccountConfig } from "../accounts/config-capability.js";
 import type { NativeForegroundFactory } from "./native-foreground-db.js";
 import type { ClientMigrations } from "../runtime/client-migrations.js";
 import type { WasmSchema } from "../drivers/types.js";
-import { serializeSchemaSource } from "../drivers/schema-wire.js";
+import { runtimeSchemaJsonReplacer, serializeSchemaSource } from "../drivers/schema-wire.js";
 
 /** The same native account admission is used by contexts and device receipts. */
 export function beginNativeAccountSession(
@@ -62,7 +62,7 @@ export function nativeAccountSchemaSource(
 ): string {
   const source = serializeSchemaSource(schema);
   if (!migrations) return source;
-  return JSON.stringify({ ...JSON.parse(source), migrations });
+  return JSON.stringify({ ...JSON.parse(source), migrations }, runtimeSchemaJsonReplacer);
 }
 
 /** Schema attachment consumes the one-shot setup on success or failure. */

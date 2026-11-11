@@ -573,6 +573,35 @@ impl NativeRelayClient {
             .run(move |worker| Ok(worker.client(id)?.binding.db.seq_high_water()))
     }
 
+    /// Drain this foreground's mutation errors, with why it refused its
+    /// relay if it did, in one owner turn: `TickEvents` runs on every tick.
+    pub(crate) fn drain_tick_events(
+        &self,
+    ) -> Result<
+        (
+            ForegroundDbCommandResponse,
+            Option<crate::NativeUpstreamFailure>,
+        ),
+        RelayError,
+    > {
+        let id = self.id;
+        self.relay.run(move |worker| {
+            let refusal = worker.client(id)?.relay_refusal.clone();
+            let errors =
+                worker.execute_foreground(id, ForegroundDbCommandRequest::DrainMutationErrors)?;
+            Ok((errors, refusal))
+        })
+    }
+
+    /// Why this foreground refused its relay, if it did: the relay's store
+    /// cannot serve it, so nothing local syncs to it either.
+    #[cfg(test)]
+    pub(crate) fn relay_refusal(&self) -> Result<Option<crate::NativeUpstreamFailure>, RelayError> {
+        let id = self.id;
+        self.relay
+            .run(move |worker| Ok(worker.client(id)?.relay_refusal.clone()))
+    }
+
     /// Run an operation against this UI peer's database on the owner thread.
     pub fn with_db<T: Send + 'static>(
         &self,
@@ -658,6 +687,8 @@ struct Foreground {
     link: Link,
     /// The relay's subscriber link serving it.
     served: Link,
+    /// This foreground refused its relay (see [`RelayWorker::drive`]).
+    relay_refusal: Option<crate::NativeUpstreamFailure>,
     subscriptions: BTreeMap<u64, ForegroundSubscription>,
     pending: BTreeMap<u64, PendingOperation>,
     /// Results of pending operations that completed before being polled.
@@ -1059,6 +1090,7 @@ impl RelayWorker {
                 dirty,
                 link,
                 served,
+                relay_refusal: None,
                 subscriptions: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 completed: BTreeMap::new(),
@@ -1202,6 +1234,24 @@ impl RelayWorker {
             && let Some(error) = upstream.link.upstream_refusal()
         {
             upstream.wire.refuse(error.to_string());
+        }
+        // A foreground refusing its own relay sees none of the relay's rows:
+        // the relay's store names a version otherwise than the app's
+        // migrations do (a build without them opened it). Latched once, with
+        // one sequence, and reported as non-retrying upstream state in
+        // `TickEvents`: local ticks keep running and the host learns why.
+        for client in self.clients.values_mut() {
+            if client.relay_refusal.is_none()
+                && let Some(error) = client.link.upstream_refusal()
+            {
+                client.relay_refusal = Some(crate::NativeUpstreamFailure {
+                    sequence: crate::next_upstream_event(),
+                    reason: format!(
+                        "native relay foreground refused its relay store (clear the store): {error}"
+                    ),
+                    retrying: false,
+                });
+            }
         }
         for client in self.clients.values_mut() {
             if let Err(error) = client.collect_events() {
