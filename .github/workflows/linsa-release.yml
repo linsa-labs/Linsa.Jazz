@@ -114,15 +114,18 @@ jobs:
           set -euo pipefail
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           manifest() { tar -xzOf "out/$1.tgz" package/package.json; }
+          # Lists to a file first: `tar | grep -q` fails under pipefail once
+          # grep stops reading (tar: stdout: write error).
+          contains() { tar -tzf "out/$1.tgz" > "$RUNNER_TEMP/listing"; grep -q "$2" "$RUNNER_TEMP/listing"; }
           for platform in ios android; do
             test "$(manifest jazz-rn | jq -r ".dependencies[\"jazz-rn-$platform\"]")" = "$base/jazz-rn-$platform.tgz"
           done
           test "$(manifest jazz-tools | jq -r '.dependencies["jazz-wasm"]')" = "$base/jazz-wasm.tgz"
           test "$(manifest jazz-tools | jq -r '.optionalDependencies["jazz-napi"]')" = "$base/jazz-napi.tgz"
-          tar -tzf out/jazz-rn-ios.tgz | grep -q '^package/JazzNativeRelay.xcframework/'
-          tar -tzf out/jazz-rn-android.tgz | grep -q '^package/android/src/main/jniLibs/'
-          tar -tzf out/jazz-rn.tgz | grep -q '^package/lib/module/index.js$'
-          tar -tzf out/jazz-tools.tgz | grep -q '^package/dist/react-native/runtime-source.js$'
+          contains jazz-rn-ios '^package/JazzNativeRelay.xcframework/'
+          contains jazz-rn-android '^package/android/src/main/jniLibs/'
+          contains jazz-rn '^package/lib/module/index.js$'
+          contains jazz-tools '^package/dist/react-native/runtime-source.js$'
           for asset in jazz-tools jazz-rn jazz-napi; do
             if manifest "$asset" | grep -q 'workspace:'; then
               echo "::error::$asset still has a workspace: range"
