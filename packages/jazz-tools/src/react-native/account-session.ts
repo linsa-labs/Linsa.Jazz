@@ -5,6 +5,9 @@ import { clientScope } from "../runtime/client-scope.js";
 import type { Session } from "../runtime/context.js";
 import { assertAccountConfig } from "../accounts/config-capability.js";
 import type { NativeForegroundFactory } from "./native-foreground-db.js";
+import type { ClientMigrations } from "../runtime/client-migrations.js";
+import type { WasmSchema } from "../drivers/types.js";
+import { serializeSchemaSource } from "../drivers/schema-wire.js";
 
 /** The same native account admission is used by contexts and device receipts. */
 export function beginNativeAccountSession(
@@ -44,6 +47,22 @@ export function beginNativeAccountSession(
       server_url: config.serverUrl ?? null,
     }),
   );
+}
+
+/**
+ * The schema source a native scope opens: the app's tables, with the
+ * migrations it ships beside them. The native relay opens every database
+ * with those migrations, as napi and wasm stores do; without them a version
+ * the app reached through a migration is named afresh and the relay refuses
+ * its server's catalogue.
+ */
+export function nativeAccountSchemaSource(
+  schema: WasmSchema,
+  migrations: ClientMigrations | undefined,
+): string {
+  const source = serializeSchemaSource(schema);
+  if (!migrations) return source;
+  return JSON.stringify({ ...JSON.parse(source), migrations });
 }
 
 /** Schema attachment consumes the one-shot setup on success or failure. */

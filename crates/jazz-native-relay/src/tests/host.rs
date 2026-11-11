@@ -351,6 +351,7 @@ fn incompatible_open_creates_no_relay_or_sqlite_store() {
             node: NodeUuid::from_bytes([0xa1; 16]),
             author: AuthorSubject::for_test_bytes([0xa2; 16]),
         },
+        migrations: None,
     };
     assert!(matches!(
         registry.open_admitted(config),
@@ -776,6 +777,7 @@ fn a_relay_refuses_a_client_of_another_identity() {
         sqlite_path: directory.path().join("alice.sqlite"),
         schema: schema(),
         identity: identity(0x01),
+        migrations: None,
     })
     .unwrap();
     let other = DbIdentity {

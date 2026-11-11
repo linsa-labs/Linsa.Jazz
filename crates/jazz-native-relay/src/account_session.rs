@@ -596,6 +596,84 @@ mod tests {
         assert_eq!(named.scope.storage_namespace, uuid.scope.storage_namespace);
     }
 
+    /// Begin alice's account session and attach `schema_source`, as the
+    /// React Native runtime does: the status, and the admitted scope's
+    /// migrations.
+    fn attach_source(schema_source: &[u8]) -> (JazzNativeRelayStatus, Option<Vec<u8>>) {
+        let root = tempfile::tempdir().unwrap();
+        let root_bytes = root.path().to_str().unwrap().as_bytes();
+        let request = serde_json::to_vec(&external("alice")).unwrap();
+        unsafe {
+            let host = jazz_native_relay_host_new();
+            let lease = jazz_native_relay_host_retain(host, 1);
+            let mut out = JazzNativeRelayBytes::EMPTY;
+            assert_eq!(
+                jazz_native_relay_host_lease_begin_account_session_json(
+                    lease,
+                    request.as_ptr(),
+                    request.len(),
+                    root_bytes.as_ptr(),
+                    root_bytes.len(),
+                    &mut out
+                ),
+                JazzNativeRelayStatus::Ok
+            );
+            let pending = std::slice::from_raw_parts(out.data, out.len).to_vec();
+            jazz_native_relay_bytes_free(&mut out);
+            let status = jazz_native_relay_host_lease_attach_account_schema_json(
+                lease,
+                pending.as_ptr(),
+                pending.len(),
+                schema_source.as_ptr(),
+                schema_source.len(),
+                &mut out,
+            );
+            if status == JazzNativeRelayStatus::Ok {
+                jazz_native_relay_bytes_free(&mut out);
+            }
+            let migrations = match (*lease).inner.lock() {
+                Ok(state) => state
+                    .admitted_scopes
+                    .values()
+                    .next()
+                    .and_then(|admitted| admitted.config.migrations.clone()),
+                Err(_) => panic!("relay host mutex poisoned"),
+            };
+            jazz_native_relay_host_lease_free(lease);
+            jazz_native_relay_host_free(host);
+            (status, migrations)
+        }
+    }
+
+    /// The schema source carries the app's migrations beside its tables;
+    /// the admitted scope opens with them, and a bundle it could not open
+    /// with is refused before any capability exists.
+    #[test]
+    fn an_account_schema_carries_the_apps_migrations_into_its_scope() {
+        use crate::relay::migrations_tests::{migrations, v2_source};
+        let schema = JazzSchema::new(&v2_source()).unwrap();
+        let tables = serde_json::to_value(schema.public_schema()).unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(&migrations()).unwrap();
+
+        let (status, admitted) = attach_source(&serde_json::to_vec(&tables).unwrap());
+        assert_eq!(status, JazzNativeRelayStatus::Ok);
+        assert_eq!(admitted, None, "a source without migrations ships none");
+
+        let mut source = tables.clone();
+        source["migrations"] = bundle.clone();
+        let (status, admitted) = attach_source(&serde_json::to_vec(&source).unwrap());
+        assert_eq!(status, JazzNativeRelayStatus::Ok);
+        let admitted: serde_json::Value = serde_json::from_slice(&admitted.unwrap()).unwrap();
+        assert_eq!(admitted, bundle);
+
+        let mut broken = tables;
+        broken["migrations"] =
+            serde_json::json!({"schemas": [{"hash": "x", "schema": {}}], "migrations": []});
+        let (status, admitted) = attach_source(&serde_json::to_vec(&broken).unwrap());
+        assert_eq!(status, JazzNativeRelayStatus::LifecycleFailure);
+        assert_eq!(admitted, None);
+    }
+
     #[test]
     fn account_context_shutdown_preserves_sibling_foreground() {
         // Native capability ownership is below the public query API: prove

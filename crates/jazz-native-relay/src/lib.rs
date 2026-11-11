@@ -132,6 +132,9 @@ struct RelayScopeAdmissionRequest {
     pub scope: RelayScopeRequest,
     pub sqlite_path: String,
     pub schema_json: String,
+    /// The migrations the app ships into `schema_json` (see
+    /// [`RelayOpenConfig::migrations`]), canonical JSON.
+    pub migrations_json: Option<String>,
     pub identity: DbIdentity,
     pub claims: BTreeMap<String, Value>,
 }
@@ -185,6 +188,8 @@ struct TrustedRelayScopeAdmissionJson {
     scope: TrustedRelayScopeJson,
     sqlite_path: String,
     schema_json: String,
+    #[serde(default)]
+    migrations_json: Option<String>,
     identity: TrustedRelayIdentityJson,
     claims: BTreeMap<String, Value>,
 }
@@ -223,14 +228,17 @@ impl TrustedRelayScopeAdmissionJson {
         reject_bearer_claims(&self.claims)?;
         // Parse and reserialize before storing so the trusted boundary has one
         // normalized schema spelling and malformed JSON cannot reach admission.
-        let schema_value = serde_json::from_str::<serde_json::Value>(&self.schema_json)
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let schema_json = serde_json::to_string(&schema_value)
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        let schema_json = canonical_json(&self.schema_json)?;
+        let migrations_json = self
+            .migrations_json
+            .as_deref()
+            .map(canonical_json)
+            .transpose()?;
         Ok(RelayScopeAdmissionRequest {
             scope,
             sqlite_path: self.sqlite_path,
             schema_json,
+            migrations_json,
             identity: DbIdentity {
                 node: self.identity.node,
                 author: self.identity.author,
@@ -238,6 +246,13 @@ impl TrustedRelayScopeAdmissionJson {
             claims: self.claims,
         })
     }
+}
+
+/// `json` in one normalized spelling; malformed JSON is refused.
+fn canonical_json(json: &str) -> Result<String, JazzNativeRelayStatus> {
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    serde_json::to_string(&value).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)
 }
 
 fn reject_bearer_claims(claims: &BTreeMap<String, Value>) -> Result<(), JazzNativeRelayStatus> {
@@ -1906,6 +1921,13 @@ impl NativeRelayHost {
             .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
         let schema =
             JazzSchema::new(&public_schema).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        // Refuse a bundle the relay could not open with before any capability
+        // exists, rather than on the owner thread.
+        let migrations = request.migrations_json.map(String::into_bytes);
+        if let Some(json) = &migrations {
+            jazz::tools::deployment::published::client_migrations(json)
+                .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        }
         let config = RelayOpenConfig {
             supported_abi: NativeRelayAbiRange {
                 minimum: NATIVE_RELAY_ABI_V1,
@@ -1915,6 +1937,7 @@ impl NativeRelayHost {
             sqlite_path: PathBuf::from(request.sqlite_path),
             schema,
             identity: request.identity,
+            migrations,
         };
         // A scope is immutable once trusted code has admitted it. Reject a
         // conflicting second configuration before JavaScript can receive a
@@ -1923,6 +1946,7 @@ impl NativeRelayHost {
             admitted.config.scope == config.scope
                 && (admitted.config.sqlite_path != config.sqlite_path
                     || admitted.config.schema.version_id() != config.schema.version_id()
+                    || admitted.config.migrations != config.migrations
                     || admitted.config.identity != config.identity
                     || admitted.claims != request.claims)
         }) {
@@ -2049,7 +2073,17 @@ impl NativeRelayHost {
         // Canonicalize at this credential-free boundary before constructing a
         // JazzSchema. A malformed schema consumes the one-shot session setup;
         // callers must restart setup rather than attach a different schema.
-        let value = serde_json::from_str::<serde_json::Value>(schema_json)
+        //
+        // The schema source may carry the app's migrations beside its tables
+        // (`{"tables": …, "migrations": …}`): the relay opens with them, as
+        // napi and wasm stores do.
+        let mut value = serde_json::from_str::<serde_json::Value>(schema_json)
+            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        let migrations_json = value
+            .as_object_mut()
+            .and_then(|source| source.remove("migrations"))
+            .map(|migrations| serde_json::to_string(&migrations))
+            .transpose()
             .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
         let schema_json =
             serde_json::to_string(&value).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
@@ -2058,6 +2092,7 @@ impl NativeRelayHost {
             scope: pending.scope,
             sqlite_path: pending.sqlite_path,
             schema_json,
+            migrations_json,
             identity: pending.identity,
             claims: pending.claims,
         })?;

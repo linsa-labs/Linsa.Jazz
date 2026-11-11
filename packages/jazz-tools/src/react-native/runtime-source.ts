@@ -25,9 +25,9 @@ import { accountConfigBearer, assertAccountConfig } from "../accounts/config-cap
 import {
   beginNativeAccountSession,
   attachNativeAccountSchema,
+  nativeAccountSchemaSource,
   resolveNativeSession,
 } from "./account-session.js";
-import { serializeSchemaSource } from "../drivers/schema-wire.js";
 import {
   REACT_NATIVE_MEMORY_RUNTIME_UNSUPPORTED_ERROR,
   REACT_NATIVE_NATIVE_RELAY_MEMORY_ONLY_ERROR,
@@ -221,7 +221,7 @@ export class ReactNativeRuntimeSource extends RuntimeSource<ReactNativeDbConfig>
         this.admittedCapability = attachNativeAccountSchema(
           this.foregroundFactory!,
           pending,
-          serializeSchemaSource(context.schema),
+          nativeAccountSchemaSource(context.schema, context.migrations),
         );
       } finally {
         this.pendingCapability = null;

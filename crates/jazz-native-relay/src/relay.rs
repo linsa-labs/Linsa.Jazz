@@ -134,6 +134,12 @@ pub struct RelayOpenConfig {
     pub sqlite_path: PathBuf,
     pub schema: JazzSchema,
     pub identity: DbIdentity,
+    /// The migrations the app ships (the JSON bundle `defineApp` records,
+    /// see `jazz::tools::deployment::published::client_migrations`). A
+    /// schema the app reached through migrations is stored upstream under
+    /// the names its lenses carried forward; opened without them, the relay
+    /// names that version afresh and refuses its upstream's catalogue.
+    pub migrations: Option<Vec<u8>>,
 }
 
 impl RelayOpenConfig {
@@ -164,6 +170,10 @@ pub struct NativeRelayWire {
     outbound_ready: Arc<tokio::sync::Notify>,
     /// Set when the owner retired this connection: no more frames cross it.
     retired: Arc<AtomicBool>,
+    /// Why the relay's database dropped this connection on its own (see
+    /// [`Link::upstream_refusal`]): nothing syncs over it any more, so its
+    /// carrier stops instead of keeping a socket open that moves nothing.
+    refusal: Arc<Mutex<Option<String>>>,
 }
 
 impl NativeRelayWire {
@@ -234,6 +244,27 @@ impl NativeRelayWire {
     fn retire(&self) {
         self.retired.store(true, Ordering::Release);
         self.outbound_ready.notify_one();
+    }
+
+    /// The relay's database refused its upstream over this connection.
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record the first refusal and wake the carrier to act on it.
+    fn refuse(&self, reason: String) {
+        let mut refusal = self
+            .refusal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if refusal.is_none() {
+            *refusal = Some(reason);
+            drop(refusal);
+            self.outbound_ready.notify_one();
+        }
     }
 }
 
@@ -808,6 +839,8 @@ fn poll_once<T>(future: &mut Pin<Box<dyn Future<Output = T>>>) -> Poll<T> {
 
 pub(crate) struct RelayWorker {
     schema: JazzSchema,
+    /// The app's migrations, for every database this relay opens.
+    migrations: Option<Vec<u8>>,
     persistent: Binding,
     persistent_dirty: Rc<Cell<bool>>,
     upstream: Option<UpstreamConnection>,
@@ -854,6 +887,20 @@ fn ensure_sqlite_store(path: &std::path::Path) -> Result<(), RelayError> {
     Ok(())
 }
 
+/// The configuration a relay database opens under: `schema`, with the app's
+/// `migrations` into it.
+fn db_config(
+    schema: &JazzSchema,
+    identity: DbIdentity,
+    migrations: Option<&[u8]>,
+) -> Result<DbConfig, RelayError> {
+    jazz::tools::deployment::published::with_client_migrations(
+        DbConfig::new(schema.clone(), identity),
+        migrations,
+    )
+    .map_err(RelayError::Storage)
+}
+
 impl RelayWorker {
     fn open(config: RelayOpenConfig) -> Result<Self, RelayError> {
         ensure_sqlite_store(&config.sqlite_path)?;
@@ -862,7 +909,11 @@ impl RelayWorker {
                 .map_err(|error| RelayError::Storage(error.to_string()))?;
         }
         let db = block_on(Db::open_at(
-            DbConfig::new(config.schema.clone(), config.identity),
+            db_config(
+                &config.schema,
+                config.identity,
+                config.migrations.as_deref(),
+            )?,
             &config.sqlite_path,
             FileOptions::default(),
         ))
@@ -871,6 +922,7 @@ impl RelayWorker {
         let persistent_dirty = hook(&persistent);
         Ok(Self {
             schema: config.schema,
+            migrations: config.migrations,
             persistent,
             persistent_dirty,
             upstream: None,
@@ -966,8 +1018,10 @@ impl RelayWorker {
             .db
             .check_serves(identity.author)
             .map_err(|error| RelayError::Host(error.into()))?;
-        let db = block_on(Db::open(DbConfig::new(self.schema.clone(), identity)))
-            .map_err(|error| RelayError::Host(error.into()))?;
+        // A foreground mirrors the relay's catalogue, so it opens with the
+        // same migrations the relay did.
+        let config = db_config(&self.schema, identity, self.migrations.as_deref())?;
+        let db = block_on(Db::open(config)).map_err(|error| RelayError::Host(error.into()))?;
         // Continue after the node's previous holder: its transaction ids
         // were (seq, node), and the relay deduplicates by them.
         if high_water > 0 {
@@ -1140,6 +1194,14 @@ impl RelayWorker {
             if !progressed {
                 break;
             }
+        }
+        // A database that refuses its upstream detaches from it and drops
+        // what it queued: the link stands but nothing syncs over it again.
+        if let Some(upstream) = &self.upstream
+            && upstream.wire.refusal().is_none()
+            && let Some(error) = upstream.link.upstream_refusal()
+        {
+            upstream.wire.refuse(error.to_string());
         }
         for client in self.clients.values_mut() {
             if let Err(error) = client.collect_events() {
@@ -2256,6 +2318,10 @@ async fn bridge_connection(
         if cancelled.load(Ordering::Acquire) {
             return LinkEnd::Cancelled;
         }
+        // Reconnecting would only be refused again: stop, and report why.
+        if let Some(reason) = wire.refusal() {
+            return LinkEnd::Stop(format!("native relay refused its upstream: {reason}"));
+        }
         // The relay's frames out.
         let outbound = match wire.take_outbound_encoded() {
             Ok(frames) => frames,
@@ -2370,3 +2436,7 @@ pub enum RelayError {
     #[error("native relay socket: {0}")]
     Socket(String),
 }
+
+#[cfg(test)]
+#[path = "tests/migrations.rs"]
+pub(crate) mod migrations_tests;
