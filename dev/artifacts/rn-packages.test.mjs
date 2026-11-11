@@ -5,6 +5,7 @@ import {
   mkdirSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   cpSync,
   symlinkSync,
@@ -150,6 +151,44 @@ test("payload resolution follows pnpm links, rejects version mismatch, and previ
       sourceRevision: "b".repeat(40),
     });
     assert.notEqual(spawnSync("node", command).status, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// LINSA FORK: linsa-release.yml links each payload to its own release asset.
+test("a linsa release names its payloads by this fork's release URL", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "rn-linsa-release-test-")));
+  try {
+    const wrapper = join(root, "store/jazz-rn");
+    const payload = join(root, "store/ios");
+    const version = "2.0.0-alpha.60";
+    const metadata = { name: "jazz-rn", version, dependencies: {} };
+    json(join(payload, "package.json"), { name: "jazz-rn-ios", version });
+    json(join(payload, "ios/jazz-native-relay.manifest.json"), { sourceRevision: "a".repeat(40) });
+    mkdirSync(join(wrapper, "node_modules"), { recursive: true });
+    symlinkSync(payload, join(wrapper, "node_modules/jazz-rn-ios"));
+    write(
+      join(wrapper, "scripts/resolve-payload.cjs"),
+      readFileSync(join(repository, "crates/jazz-rn/scripts/resolve-payload.cjs")),
+    );
+    const command = [join(wrapper, "scripts/resolve-payload.cjs"), "ios"];
+    const resolves = (declared) => {
+      metadata.dependencies["jazz-rn-ios"] = declared;
+      json(join(wrapper, "package.json"), metadata);
+      return spawnSync("node", command, { encoding: "utf8" });
+    };
+    const releases = "https://github.com/linsa-labs/Linsa.Jazz/releases/download";
+    assert.equal(resolves(`${releases}/linsa-sqlite-2/jazz-rn-ios.tgz`).stdout, payload);
+    assert.notEqual(resolves(`${releases}/linsa-sqlite-2/jazz-rn-android.tgz`).status, 0);
+    assert.notEqual(resolves(`${releases}/v1/jazz-rn-ios.tgz`).status, 0);
+    assert.notEqual(
+      resolves("https://github.com/someone/Linsa.Jazz/releases/download/linsa-1/jazz-rn-ios.tgz")
+        .status,
+      0,
+    );
+    json(join(payload, "package.json"), { name: "jazz-rn-ios", version: "2.0.0-alpha.59" });
+    assert.notEqual(resolves(`${releases}/linsa-sqlite-2/jazz-rn-ios.tgz`).status, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
