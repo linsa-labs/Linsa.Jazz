@@ -21,10 +21,18 @@ function resolvePayload(platform, wrapperRoot = join(__dirname, "..")) {
   // Release-candidate tarballs are GitHub release assets, not npm packages;
   // dev/artifacts/rc-tarballs.mjs links each one to its sibling asset's URL.
   const releaseAsset = `https://github.com/garden-co/jazz/releases/download/v${wrapper.version}/${name}-${wrapper.version}.tgz`;
+  // LINSA FORK: a release of this fork (.github/workflows/linsa-release.yml)
+  // names each payload as its own release's asset `<name>.tgz`; the payload's
+  // version is still checked against the wrapper's below.
+  const linsaRelease =
+    typeof declared === "string" &&
+    new RegExp(
+      `^https://github\\.com/linsa-labs/Linsa\\.Jazz/releases/download/linsa-[\\w.-]+/${name}\\.tgz$`,
+    ).test(declared);
   if (
     metadata.name !== name ||
     metadata.version !== wrapper.version ||
-    (![wrapper.version, "workspace:*", releaseAsset].includes(declared) && !preview)
+    (![wrapper.version, "workspace:*", releaseAsset].includes(declared) && !preview && !linsaRelease)
   )
     throw new Error(`RN payload ${name} must match jazz-rn ${wrapper.version}`);
   if (metadata.os || metadata.cpu || metadata.optionalDependencies || metadata.codegenConfig)
