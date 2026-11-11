@@ -1,0 +1,149 @@
+name: Linsa release
+
+# LINSA FORK: builds every package of this branch and publishes the tarballs on
+# a GitHub Release, so consumers install them by URL:
+#
+#   "jazz-tools": "https://github.com/linsa-labs/Linsa.Jazz/releases/download/<tag>/jazz-tools.tgz"
+#   "jazz-rn":    "https://github.com/linsa-labs/Linsa.Jazz/releases/download/<tag>/jazz-rn.tgz"
+#
+# Release assets rather than Actions artifacts: those expire and need a token
+# even on a public repository. The packages of one release depend on each
+# other by these URLs (see .github/scripts/linsa-release-manifests.mjs), so a
+# consumer never pulls upstream's native binaries from npm.
+#
+# The build is the upstream reusable build-jazz-packages.yml, which this branch
+# runs on GitHub-hosted runners.
+
+on:
+  push:
+    tags:
+      - "linsa-sqlite-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create (e.g. linsa-sqlite-1); the run's commit is released
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linsa-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-jazz-packages.yml
+    secrets: inherit
+    with:
+      ref: ${{ github.sha }}
+      napi_matrix: '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64-gnu","use_sccache":false},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-arm64-gnu","use_sccache":false},{"os":"macos-15","target":"x86_64-apple-darwin","platform":"darwin-x64","use_sccache":false},{"os":"macos-15","target":"aarch64-apple-darwin","platform":"darwin-arm64","use_sccache":false}]'
+      include_rn: true
+
+  release:
+    name: Pack and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: ./.github/actions/setup-build
+        with:
+          rust-toolchain: ""
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pkg-jazz-tools
+          path: packages/jazz-tools
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pkg-jazz-wasm
+          path: crates/jazz-wasm
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pkg-jazz-napi
+          path: crates/jazz-napi
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: pkg-jazz-rn
+          path: crates/jazz-rn
+
+      # As the upstream preview does: the inspector is private and must be
+      # embedded in jazz-tools before it is packed.
+      - name: Stage inspector overlay assets into jazz-tools
+        run: |
+          pnpm --filter inspector run build:embedded
+          pnpm --filter jazz-tools run stage:inspector-overlay
+
+      - name: Verify the staged jazz-rn payloads
+        run: |
+          JAZZ_NATIVE_RELAY_SOURCE_REVISION="$(git rev-parse HEAD)" \
+            node dev/artifacts/rn-packages.mjs verify
+
+      - name: Point the released packages at each other and pack them
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          dirs=(packages/jazz-tools crates/jazz-wasm crates/jazz-napi crates/jazz-rn crates/jazz-rn/npm/ios crates/jazz-rn/npm/android)
+          for platform in crates/jazz-napi/npm/*/; do
+            [ -f "${platform}package.json" ] && dirs+=("${platform%/}")
+          done
+          mkdir -p out
+          node .github/scripts/linsa-release-manifests.mjs "$base" "${dirs[@]}" > out/assets.tsv
+          while IFS=$'\t' read -r dir asset; do
+            before=$(ls out)
+            pnpm --dir "$dir" pack --pack-destination "$GITHUB_WORKSPACE/out"
+            produced=$(comm -13 <(echo "$before") <(ls out) | grep '\.tgz$')
+            test "$(echo "$produced" | wc -l)" -eq 1
+            mv "out/$produced" "out/$asset.tgz"
+            echo "packed $asset from $dir"
+          done < out/assets.tsv
+          rm out/assets.tsv
+          ls -lh out
+
+      - name: Verify the packed manifests and payloads
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          manifest() { tar -xzOf "out/$1.tgz" package/package.json; }
+          for platform in ios android; do
+            test "$(manifest jazz-rn | jq -r ".dependencies[\"jazz-rn-$platform\"]")" = "$base/jazz-rn-$platform.tgz"
+          done
+          test "$(manifest jazz-tools | jq -r '.dependencies["jazz-wasm"]')" = "$base/jazz-wasm.tgz"
+          test "$(manifest jazz-tools | jq -r '.optionalDependencies["jazz-napi"]')" = "$base/jazz-napi.tgz"
+          tar -tzf out/jazz-rn-ios.tgz | grep -q '^package/JazzNativeRelay.xcframework/'
+          tar -tzf out/jazz-rn-android.tgz | grep -q '^package/android/src/main/jniLibs/'
+          tar -tzf out/jazz-rn.tgz | grep -q '^package/lib/module/index.js$'
+          tar -tzf out/jazz-tools.tgz | grep -q '^package/dist/react-native/runtime-source.js$'
+          for asset in jazz-tools jazz-rn jazz-napi; do
+            if manifest "$asset" | grep -q 'workspace:'; then
+              echo "::error::$asset still has a workspace: range"
+              exit 1
+            fi
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" out/*.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Jazz build from the \`linsa-sqlite\` branch of this fork (commit ${GITHUB_SHA}).
+
+          Install by URL, for example:
+
+              \"jazz-tools\": \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/jazz-tools.tgz\"
+              \"jazz-rn\": \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/jazz-rn.tgz\"
+
+          The packages of this release depend on each other by these URLs, native payloads included."

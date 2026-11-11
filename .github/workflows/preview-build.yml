@@ -1,13 +1,12 @@
 name: Preview build (pkg.pr.new)
 
 # LINSA FORK: runs on GitHub-hosted runners (upstream uses Blacksmith, which
-# this org does not have), and every push to `linsa-sqlite` publishes a full
-# preview including jazz-rn, so consumers install a commit by its
-# pkg.pr.new URL without a pull request.
+# this org does not have). A manual run publishes a full preview including
+# jazz-rn; it needs the pkg-pr-new GitHub App on this repository, which
+# linsa-labs does not have installed, so releases go through
+# linsa-release.yml (GitHub Release tarballs) instead.
 
 on:
-  push:
-    branches: [linsa-sqlite]
   workflow_dispatch:
   pull_request:
     # Keep previews current after the label opt-in. An unlabeled event cancels
