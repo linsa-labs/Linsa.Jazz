@@ -47,7 +47,9 @@ inputs:
   sccache-sticky-disk:
     description: "Mount Blacksmith's sticky disk for sccache. Disable on persistent self-hosted runners."
     required: false
-    default: "true"
+    # LINSA FORK: off by default; the fork runs on GitHub-hosted runners,
+    # which have no Blacksmith sticky disks.
+    default: "false"
 
 runs:
   using: "composite"

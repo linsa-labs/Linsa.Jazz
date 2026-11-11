@@ -6,11 +6,15 @@ if (!/^[a-f0-9]{40}$/.test(commit ?? ""))
 const root = resolve(process.argv[3] ?? "crates/jazz-rn");
 const path = `${root}/package.json`;
 const wrapper = JSON.parse(readFileSync(path, "utf8"));
+// LINSA FORK: a fork publishes its previews under its own repository.
+const repository = process.env.JAZZ_RN_PREVIEW_REPOSITORY || "garden-co/jazz";
+if (!/^[\w.-]+\/[\w.-]+$/.test(repository))
+  throw new Error("RN preview repository must be owner/name");
 for (const platform of ["android", "ios"]) {
   const name = `jazz-rn-${platform}`;
   const payload = JSON.parse(readFileSync(`${root}/npm/${platform}/package.json`, "utf8"));
   if (payload.name !== name || payload.version !== wrapper.version)
     throw new Error("RN preview payload version mismatch");
-  wrapper.dependencies[name] = `https://pkg.pr.new/garden-co/jazz/${name}@${commit}`;
+  wrapper.dependencies[name] = `https://pkg.pr.new/${repository}/${name}@${commit}`;
 }
 writeFileSync(path, JSON.stringify(wrapper, null, 2) + "\n");
