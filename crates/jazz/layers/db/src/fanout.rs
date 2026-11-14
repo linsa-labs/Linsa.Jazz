@@ -941,6 +941,7 @@ impl Inner {
                 session: &session,
                 out: Evidence::new(),
                 through: Vec::new(),
+                reader: reader.clone(),
             };
             let understood = policy_pins_enabled()
                 && read.view.is_none()
@@ -2557,6 +2558,11 @@ struct Occurrence {
     pin: Option<(String, String)>,
     /// The stored application columns of the table's rows it reads.
     columns: BTreeSet<String>,
+    /// DRAFT (`JAZZ_POLICY_FILTER=1`): an `INHERITS_REFERENCING` in the
+    /// reader's own policy, `(reader table, stored via column)`: a row of
+    /// this table can only change which reader rows with `id = via` are
+    /// visible.
+    link: Option<(String, String)>,
 }
 
 /// The stored tables read policies read as evidence, each with every
@@ -2594,6 +2600,8 @@ struct EvidenceWalk<'a> {
     /// The tables (and operations) whose policies an `INHERITS` is being
     /// read through: a chain back to one is watched whole.
     through: Vec<(String, Operation)>,
+    /// The stored table whose policy is walked.
+    reader: String,
 }
 
 impl EvidenceWalk<'_> {
@@ -2695,7 +2703,7 @@ impl EvidenceWalk<'_> {
                 else {
                     return false;
                 };
-                self.inherit(target, *operation, BTreeSet::new())
+                self.inherit(target, *operation, BTreeSet::new(), None)
             }
             PolicyExpr::InheritsReferencing {
                 operation,
@@ -2707,7 +2715,13 @@ impl EvidenceWalk<'_> {
                     return false;
                 };
                 let mut columns = BTreeSet::new();
-                column(via_column, &mut columns) && self.inherit(source, *operation, columns)
+                let link = (self.through.is_empty() && table.stored == self.reader).then(|| {
+                    (
+                        table.stored.clone(),
+                        source.stored_name(via_column).to_owned(),
+                    )
+                });
+                column(via_column, &mut columns) && self.inherit(source, *operation, columns, link)
             }
             PolicyExpr::ExistsRel { .. } => false,
         }
@@ -2722,6 +2736,7 @@ impl EvidenceWalk<'_> {
         table: &Table,
         operation: Operation,
         mut columns: BTreeSet<String>,
+        link: Option<(String, String)>,
     ) -> bool {
         let key = (table.stored.clone(), operation);
         if self.through.contains(&key) {
@@ -2741,11 +2756,21 @@ impl EvidenceWalk<'_> {
         let pin = conjuncts(policy)
             .into_iter()
             .find_map(|c| value_pin(table, c, self.session));
-        self.occurrence(table, pin, columns);
+        self.linked_occurrence(table, pin, columns, link);
         true
     }
 
     fn occurrence(&mut self, table: &Table, pin: Option<Pin>, columns: BTreeSet<String>) {
+        self.linked_occurrence(table, pin, columns, None)
+    }
+
+    fn linked_occurrence(
+        &mut self,
+        table: &Table,
+        pin: Option<Pin>,
+        columns: BTreeSet<String>,
+        link: Option<(String, String)>,
+    ) {
         let columns = columns
             .iter()
             .map(|c| table.stored_name(c).to_owned())
@@ -2753,7 +2778,7 @@ impl EvidenceWalk<'_> {
         add_evidence(
             &mut self.out,
             &table.stored,
-            Some(Occurrence { pin, columns }),
+            Some(Occurrence { pin, columns, link }),
         );
     }
 }
@@ -3124,8 +3149,58 @@ fn evidenced(
                 }
                 _ => true,
             };
-        pinned && changed
+        pinned && changed && linked(group, occurrence, images)
     })
+}
+
+/// DRAFT (`JAZZ_POLICY_FILTER=1`): whether a change matching a linked
+/// [`Occurrence`] can reach the result. The reader table's rows with
+/// `id = via` are the only ones it can show or hide; when the result reads
+/// the reader only at relation levels keyed by `id` (every one complete),
+/// those rows matter only if a held parent names them. Anything else: yes.
+fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>]) -> bool {
+    let Some((reader, via)) = occurrence.link.as_ref().filter(|_| policy_filter_enabled()) else {
+        return true;
+    };
+    if group.awaiting || group.root == *reader {
+        return true;
+    }
+    let levels: Vec<&Held> = group
+        .correlations
+        .iter()
+        .zip(&group.held)
+        .filter(|(level, _)| level.table == *reader)
+        .map(|(level, held)| (level.inner == "id" && held.complete).then_some(held))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    if levels.is_empty()
+        || levels.len()
+            != group
+                .correlations
+                .iter()
+                .filter(|l| l.table == *reader)
+                .count()
+    {
+        return true;
+    }
+    images.iter().any(|image| {
+        image
+            .iter()
+            .filter(|(column, _)| column == via)
+            .any(|(_, cell)| match stored_atoms(cell, false) {
+                Some(atoms) => atoms
+                    .iter()
+                    .any(|atom| levels.iter().any(|held| held.parents.contains(atom))),
+                None => true,
+            })
+    }) || !images
+        .iter()
+        .any(|image| image.iter().any(|(column, _)| column == via))
+}
+
+fn policy_filter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_POLICY_FILTER").as_deref() == Ok("1"))
 }
 
 fn correlated(
