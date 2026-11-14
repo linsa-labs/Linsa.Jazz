@@ -3505,7 +3505,59 @@ fn shadow_compare(fanout: &Inner, group: &mut Group, label: &str, on: bool) {
                 entry.2
             );
         }
+        if !same || !typed {
+            eprintln!(
+                "[{label}-shadow] detail table={} identity={:?} {}",
+                group.root,
+                group.identity,
+                shadow_detail(&group.rows, &rows)
+            );
+        }
     });
+}
+
+/// Which rows a mismatch is about, by id: in the full result but not the
+/// kept one, kept but not in the full one, held by both with other cells,
+/// deletion or types, and whether only the order differs. At most 8 ids each.
+fn shadow_detail<R: ShadowRow>(kept: &[R], full: &[R]) -> String {
+    let ids = |rows: &[R]| rows.iter().map(|row| row.shadow_id()).collect::<BTreeSet<_>>();
+    let (kept_ids, full_ids) = (ids(kept), ids(full));
+    let list = |ids: Vec<String>| {
+        let n = ids.len();
+        let head = ids.into_iter().take(8).collect::<Vec<_>>().join(",");
+        format!("{n}[{head}]")
+    };
+    let missing = list(full_ids.difference(&kept_ids).cloned().collect());
+    let extra = list(kept_ids.difference(&full_ids).cloned().collect());
+    let by_id = full.iter().map(|row| (row.shadow_id(), row)).collect::<HashMap<_, _>>();
+    let changed = list(
+        kept.iter()
+            .filter_map(|row| {
+                let id = row.shadow_id();
+                let other = by_id.get(&id)?;
+                (!row.shadow_same(other)).then_some(id)
+            })
+            .collect(),
+    );
+    let order_only = kept_ids == full_ids
+        && kept.len() == full.len()
+        && kept.iter().all(|row| by_id.get(&row.shadow_id()).is_some_and(|other| row.shadow_same(other)));
+    format!("missing={missing} extra={extra} changed={changed} order_only={order_only}")
+}
+
+trait ShadowRow {
+    fn shadow_id(&self) -> String;
+    fn shadow_same(&self, other: &Self) -> bool;
+}
+
+impl ShadowRow for CurrentRow {
+    fn shadow_id(&self) -> String {
+        format!("{:?}", self.id)
+    }
+
+    fn shadow_same(&self, other: &Self) -> bool {
+        self.cells == other.cells && self.deleted == other.deleted && self.types == other.types
+    }
 }
 
 fn recheckable(query: &Query, root: &str, read: &ReadSpec, compiled: &Compiled) -> bool {

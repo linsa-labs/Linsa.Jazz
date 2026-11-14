@@ -6203,6 +6203,13 @@ impl Inner {
         };
         let mismatch = check_shadow()
             && self.check_in_fresh(schema, table, row, key, author, operation)? != value;
+        if mismatch {
+            eprintln!(
+                "[check-shadow] detail table={} op={operation:?} author={author:?} row={row:?} \
+                 planned={value} hit={hit} constant_skip={skipped} schema_version={:?}",
+                table.stored, schema.version
+            );
+        }
         check_stat(hit, skipped, mismatch);
         Ok(value)
     }
