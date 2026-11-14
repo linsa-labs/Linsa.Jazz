@@ -528,6 +528,9 @@ pub struct SchemaPublication {
 
 struct Inner {
     conn: Connection,
+    /// Write transactions the connection committed since the store opened
+    /// ([`Db::write_commits`]).
+    write_commits: Arc<std::sync::atomic::AtomicU64>,
     /// One-way, owner-wide fence for new application mutations during close.
     mutation_admission_closed: bool,
     /// Enum variants a write may hold though its schema does not declare
@@ -1610,6 +1613,20 @@ impl Db {
         )
     }
 
+    /// How many write transactions the store's connection has committed
+    /// since the store opened, host writes included (SQLite's commit hook
+    /// counts them; a read commits nothing). A host that syncs the file
+    /// itself (`synchronous = NORMAL`, see
+    /// [`crate::host::HostTables::host_synchronous_full`]) compares it with
+    /// its value at the last sync to know whether there is anything to
+    /// sync.
+    pub fn write_commits(&self) -> u64 {
+        self.inner
+            .borrow()
+            .write_commits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Run `f` on the store's connection, outside any transaction handle's
     /// overlay (see [`crate::host`]).
     pub(crate) fn with_host_connection<T>(
@@ -1729,8 +1746,11 @@ impl Db {
         // Nodes a transaction writes stay cached until it ends: until then
         // the reader connection cannot see them.
         let committed = chunks.clone();
+        let write_commits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&write_commits);
         conn.commit_hook(Some(move || {
             committed.unpin();
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             false
         }))
         .map_err(storage)?;
@@ -1830,6 +1850,7 @@ impl Db {
             defer_fetches: false,
             inner: Rc::new(Store::new(Inner {
                 conn,
+                write_commits,
                 mutation_admission_closed: false,
                 kept_variants: BTreeMap::new(),
                 #[cfg(any(test, feature = "testing"))]
