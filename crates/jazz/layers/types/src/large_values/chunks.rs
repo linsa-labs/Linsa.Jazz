@@ -71,6 +71,14 @@ impl From<ChunkStorageError> for ChunkError {
 pub trait ChunkProvider {
     /// The encoded node `request` names.
     fn get(&self, request: ChunkRequest) -> ChunkFuture<'_, Result<Bytes, ChunkError>>;
+
+    /// DRAFT (`JAZZ_X_LVMEMO`): whether every node this provider returns has
+    /// already been authenticated against its object hash (a store that
+    /// keeps only nodes it verified on the way in), so a traversal need not
+    /// hash the bytes again.
+    fn object_verified(&self) -> bool {
+        false
+    }
 }
 
 /// Exact reads from the local chunk store only, used to validate an upload

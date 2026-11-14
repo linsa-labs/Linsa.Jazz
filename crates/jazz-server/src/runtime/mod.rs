@@ -554,7 +554,12 @@ impl Source {
                 .map(|store| {
                     Some(ChunkStoreChoice {
                         store: Arc::new(store),
-                        network: false,
+                        // DRAFT (JAZZ_CHUNK_OFFLOAD=1): run the directory's puts
+                        // (two fsyncs per leaf) on the chunk I/O lanes beside the
+                        // store thread, as a network store's are, instead of
+                        // inline in every tick. The bytes are already durable in
+                        // SQLite with their row; the move is housekeeping.
+                        network: chunk_offload(),
                     })
                 })
                 .map_err(|error| format!("open large-value directory {}: {error}", dir.display())),
@@ -587,6 +592,13 @@ impl Source {
         }
         .map_err(|error| format!("open server store reader: {error}"))
     }
+}
+
+/// DRAFT: whether a local large-value directory's I/O runs on the chunk
+/// I/O lanes (`JAZZ_CHUNK_OFFLOAD=1`), read once.
+fn chunk_offload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_CHUNK_OFFLOAD").as_deref() == Ok("1"))
 }
 
 /// The chunk store a runtime opens with, and whether its I/O runs beside
@@ -2285,6 +2297,11 @@ struct SessionQueues {
     /// This tick took some of them.
     early_served: std::cell::Cell<bool>,
     slice: Rc<TickSlice>,
+    /// DRAFT (queue stats): when each message still in `inbound` arrived.
+    stamps: RefCell<VecDeque<std::time::Instant>>,
+    /// DRAFT: a trusted link (the app's backend or an authority), served
+    /// as SYSTEM.
+    trusted: std::cell::Cell<bool>,
 }
 
 /// How many sessions the tick in progress takes inbound messages from,
@@ -2341,6 +2358,116 @@ impl TickSlice {
         let fits = TICK_SLICE.as_nanos() / average.as_nanos().max(1);
         self.cap
             .set(usize::try_from(fits).unwrap_or(usize::MAX).max(1));
+    }
+}
+
+/// DRAFT: how long inbound messages wait for the store loop to take them,
+/// for trusted links (the app's backend) and for sessions, and how long a
+/// round of all sessions takes. `JAZZ_QUEUE_STATS=1` prints one line to
+/// stderr every 10 s. Store-thread only.
+mod queue_stats {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Stats {
+        trusted: Vec<u32>,
+        other: Vec<u32>,
+        rounds: Vec<u32>,
+        depth_trusted: usize,
+        depth_other: usize,
+        last_round: Option<Instant>,
+        last_report: Option<Instant>,
+    }
+
+    thread_local! {
+        static STATS: RefCell<Stats> = RefCell::default();
+    }
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_QUEUE_STATS").as_deref() == Ok("1"))
+    }
+
+    pub(super) fn trusted_every_tick() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_TRUSTED_EVERY_TICK").as_deref() == Ok("1"))
+    }
+
+    pub(super) fn depth(trusted: bool, len: usize) {
+        if !on() {
+            return;
+        }
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            let slot = if trusted { &mut stats.depth_trusted } else { &mut stats.depth_other };
+            *slot = (*slot).max(len);
+        });
+    }
+
+    pub(super) fn waited(trusted: bool, wait: Duration) {
+        if !on() {
+            return;
+        }
+        let micros = u32::try_from(wait.as_micros()).unwrap_or(u32::MAX);
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            if trusted { stats.trusted.push(micros) } else { stats.other.push(micros) }
+        });
+        report();
+    }
+
+    pub(super) fn round_over() {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            if let Some(last) = stats.last_round.replace(now) {
+                let micros = u32::try_from((now - last).as_micros()).unwrap_or(u32::MAX);
+                stats.rounds.push(micros);
+            }
+        });
+    }
+
+    fn summary(values: &mut Vec<u32>) -> String {
+        if values.is_empty() {
+            return "n=0".into();
+        }
+        values.sort_unstable();
+        let at = |q: f64| values[((values.len() - 1) as f64 * q) as usize] / 1000;
+        let out = format!(
+            "n={} p50={}ms p95={}ms p99={}ms max={}ms",
+            values.len(),
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            values[values.len() - 1] / 1000
+        );
+        values.clear();
+        out
+    }
+
+    fn report() {
+        STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            let now = Instant::now();
+            let last = *stats.last_report.get_or_insert(now);
+            if now - last < Duration::from_secs(10) {
+                return;
+            }
+            stats.last_report = Some(now);
+            let trusted = summary(&mut stats.trusted);
+            let other = summary(&mut stats.other);
+            let rounds = summary(&mut stats.rounds);
+            eprintln!(
+                "[queue-stats] trusted wait {trusted} depth<={} | sessions wait {other} depth<={} | round {rounds}",
+                stats.depth_trusted, stats.depth_other
+            );
+            stats.depth_trusted = 0;
+            stats.depth_other = 0;
+        });
     }
 }
 
@@ -2442,6 +2569,8 @@ impl SessionQueues {
             early: std::cell::Cell::new(0),
             early_served: std::cell::Cell::new(false),
             slice,
+            stamps: RefCell::default(),
+            trusted: std::cell::Cell::new(false),
         }
     }
 
@@ -2827,6 +2956,7 @@ impl Owner {
             Rc::clone(&self.slice),
             Arc::clone(&egress),
         ));
+        queues.trusted.set(identity == AuthorSubject::SYSTEM);
         let subscriber = self.db.accept_pinned_subscriber(
             Box::new(SessionTransport(Rc::clone(&queues))),
             identity,

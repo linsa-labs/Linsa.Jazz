@@ -1742,12 +1742,20 @@ pub async fn visit_reachable_chunks(
             object_hash: node_ref.object_hash.0,
         };
         let encoded = provider.get(request.clone()).await?;
-        let node = decode_node_for_format(
-            value.format_version,
-            value.kind,
-            node_ref.object_hash,
-            &encoded,
-        )?;
+        let node = if provider.object_verified() {
+            if lvmemo_shadow() && object_hash(&encoded) != node_ref.object_hash {
+                eprintln!("[lvmemo-shadow] object hash mismatch on a verified node");
+                panic!("[lvmemo-shadow] object hash mismatch on a verified node");
+            }
+            decode_object_verified_node_for_format(value.format_version, value.kind, &encoded)?
+        } else {
+            decode_node_for_format(
+                value.format_version,
+                value.kind,
+                node_ref.object_hash,
+                &encoded,
+            )?
+        };
         traversal.validate_node(value.kind, node_ref, &node)?;
         visit(&request);
         visited = visited.checked_add(1).ok_or(Error::MetricOverflow)?;
@@ -3336,6 +3344,13 @@ pub fn decode_node(
     encoded: &[u8],
 ) -> Result<ChunkNode, Error> {
     decode_node_for_format(FORMAT_VERSION, kind, expected_hash, encoded)
+}
+
+/// DRAFT shadow (`JAZZ_X_LVMEMO_SHADOW=1`): hash a provider-verified node
+/// anyway and fail loudly on a mismatch.
+fn lvmemo_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_LVMEMO_SHADOW").as_deref() == Ok("1"))
 }
 
 /// Decode a node through the exact format selected by its owner descriptor.

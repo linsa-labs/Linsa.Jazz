@@ -3252,7 +3252,29 @@ fn wk(key: (String, String, String)) -> u64 {
 }
 
 fn watch_key(cell: &Sql) -> String {
-    format!("{cell:?}")
+    // DRAFT (`JAZZ_X_WKEY=1`): a tag and hex, not the Debug print. Keys are
+    // hashed in-process only (`wk`), and every one is made here.
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*FAST.get_or_init(|| std::env::var("JAZZ_X_WKEY").as_deref() == Ok("1")) {
+        return format!("{cell:?}");
+    }
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |tag: char, bytes: &[u8]| {
+        let mut out = String::with_capacity(1 + bytes.len() * 2);
+        out.push(tag);
+        for byte in bytes {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        out
+    };
+    match cell {
+        Sql::Null => "N".to_owned(),
+        Sql::Integer(v) => format!("I{v}"),
+        Sql::Real(v) => hex('R', &v.to_bits().to_be_bytes()),
+        Sql::Text(bytes) => hex('T', bytes),
+        Sql::Blob(bytes) => hex('B', bytes),
+    }
 }
 
 fn image_cell(image: &Image, column: &str) -> Option<Sql> {
@@ -4124,9 +4146,30 @@ impl Inner {
         } else {
             format!("{} = ?1", quote(column))
         };
-        for found in self.images_where(table, false, &filter, &[&value])? {
+        let images = match FollowMemo::key(table, column, contains, &value) {
+            Some(key) => match FollowMemo::get(&key) {
+                Some(images) => {
+                    if FollowMemo::shadow() {
+                        let fresh = self.images_where(table, false, &filter, &[&value])?;
+                        FollowMemo::count(true, fresh != images);
+                    } else {
+                        FollowMemo::count(true, false);
+                    }
+                    images
+                }
+                None => {
+                    let images = self.images_where(table, false, &filter, &[&value])?;
+                    FollowMemo::put(key, &images);
+                    FollowMemo::count(false, false);
+                    images
+                }
+            },
+            None => self.images_where(table, false, &filter, &[&value])?,
+        };
+        for found in images {
             let row = RowUuid::from_bytes(found.id);
-            let can = readable(
+            // Just read, nothing written since: an existing row.
+            let can = readable_existing(
                 self,
                 &follow.policies,
                 table,
@@ -6582,18 +6625,31 @@ impl Inner {
                     .stored_table(op.table())
                     .is_ok_and(|stored| self.latest_only(stored))
             })
-            || !self.has_pruned_txs()?
+            || (!x_pruned_direct() && !self.has_pruned_txs()?)
         {
             return Ok(false);
         }
-        self.conn
+        let through = self
+            .conn
             .cached_row(
                 "SELECT p.through FROM _jazz_pruned_txs AS p JOIN _jazz_nodes AS n ON n.n = p.n \
                  WHERE n.node = ?1",
                 [node.to_vec()],
                 |r| r.get::<_, i64>(0),
             )
-            .optional()
+            .optional();
+        // DRAFT (`JAZZ_X_PRUNED=1`): no `sqlite_master` scan per commit; a
+        // store that never pruned has no table, which reads as "not dropped".
+        let through = match through {
+            Err(error)
+                if x_pruned_direct()
+                    && error.to_string().contains("no such table: _jazz_pruned_txs") =>
+            {
+                return Ok(false);
+            }
+            through => through,
+        };
+        through
             .map(|through| through.is_some_and(|through| tx as i64 <= through))
             .map_err(storage)
     }
@@ -11484,6 +11540,9 @@ impl Db {
         let through = inner.served_through();
         let relaying = inner.relays_upstream();
         let mut cache: HashMap<(String, RowUuid, Pos), Vec<Image>> = HashMap::new();
+        // DRAFT (`JAZZ_X_FOLLOW=1`): the fan-out below only reads; what a
+        // followed key finds is read once for every session following it.
+        let _follow_memo = FollowMemo::arm();
         // Rows written since the last tick, with the watch keys they match.
         let written = std::mem::take(&mut inner.since_tick);
         let mut written_keys: Vec<((String, RowUuid, Vec<u8>), Vec<u64>)> = Vec::new();
@@ -12092,12 +12151,17 @@ impl Db {
             // replica with no server accepted. (Where a latest-only table
             // pruned an earlier of several own versions of the row in one
             // tick, that version counts as unreadable.)
-            let covered: BTreeSet<String> = inner.sessions[index]
-                .subs
-                .values()
-                .filter_map(|(_, group, ..)| group.upgrade())
-                .flat_map(|group| group.borrow().tables().clone())
-                .collect();
+            // DRAFT (`JAZZ_X_TICK=1`): built only when a committed row asks.
+            let covered_now = |inner: &Inner| -> BTreeSet<String> {
+                inner.sessions[index]
+                    .subs
+                    .values()
+                    .filter_map(|(_, group, ..)| group.upgrade())
+                    .flat_map(|group| group.borrow().tables().clone())
+                    .collect()
+            };
+            let mut covered: Option<BTreeSet<String>> =
+                (!x_tick()).then(|| covered_now(&inner));
             let mut write_only: HashSet<(String, RowUuid, Vec<u8>)> = HashSet::new();
             {
                 let mut written: BTreeMap<(String, RowUuid, Vec<u8>), Vec<Pos>> = BTreeMap::new();
@@ -12113,7 +12177,7 @@ impl Db {
                     // A live read of the table reconciles the row: checked
                     // first, so a burst into a read table costs no extra
                     // store lookup per row (R62).
-                    if covered.contains(&table) {
+                    if covered.get_or_insert_with(|| covered_now(&inner)).contains(&table) {
                         continue;
                     }
                     let Some(current) = inner.current_image(&table, row, &key)? else {
@@ -13227,7 +13291,14 @@ impl Db {
                 } else {
                     None
                 };
-                let rows = inner.run(&prepared, policy, &read)?;
+                // DRAFT (`JAZZ_X_READ=1`): the answer ships stored images,
+                // never these rows' cells; a relay still decodes them, as a
+                // missing chunk is what makes it fetch upstream.
+                let rows = if inner.client.is_none() {
+                    crate::db::x_without_cells(|| inner.run(&prepared, policy, &read))?
+                } else {
+                    inner.run(&prepared, policy, &read)?
+                };
                 let unchanged: HashSet<RowUuid> = rows
                     .iter()
                     .filter(|row| {
@@ -14571,6 +14642,22 @@ fn readable(
     inner.check_in(policies, table, row, key, author, Operation::Select)
 }
 
+/// [`readable`] for a row the caller just read from this store.
+fn readable_existing(
+    inner: &Inner,
+    policies: &Schema,
+    table: &str,
+    row: RowUuid,
+    key: &[u8],
+    identity: Option<AuthorSubject>,
+) -> Result<bool, Error> {
+    let Some(author) = identity else {
+        return Ok(true);
+    };
+    let table = owned_table(policies, table)?;
+    inner.check_in_existing(policies, table, row, key, author, Operation::Select)
+}
+
 /// The current schema's table stored as `stored`.
 fn owned_table<'a>(schema: &'a Schema, stored: &str) -> Result<&'a Table, Error> {
     schema
@@ -15239,4 +15326,103 @@ mod tests {
         assert!(joiner.push(&parts[0]).unwrap().is_none());
         assert!(joiner.push(&parts[1]).is_err());
     }
+}
+
+/// DRAFT: read `_jazz_pruned_txs` directly (`JAZZ_X_PRUNED=1`).
+/// DRAFT (`JAZZ_X_FOLLOW=1`): per server tick, the images a followed key
+/// (table, column, value) finds, shared by every session that follows it.
+struct FollowMemo;
+
+thread_local! {
+    static FOLLOW_MEMO: RefCell<Option<HashMap<(String, String, bool, Vec<u8>), Vec<Image>>>> =
+        const { RefCell::new(None) };
+    static FOLLOW_STATS: std::cell::Cell<(u64, u64, u64, Option<std::time::Instant>)> =
+        const { std::cell::Cell::new((0, 0, 0, None)) };
+}
+
+impl FollowMemo {
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_X_FOLLOW").as_deref() == Ok("1"))
+    }
+
+    fn shadow() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_X_FOLLOW_SHADOW").as_deref() == Ok("1"))
+    }
+
+    /// Armed until the guard drops: the rest of a tick.
+    fn arm() -> Option<FollowMemoGuard> {
+        Self::on().then(|| {
+            FOLLOW_MEMO.with(|memo| *memo.borrow_mut() = Some(HashMap::new()));
+            FollowMemoGuard
+        })
+    }
+
+    fn key(table: &str, column: &str, contains: bool, value: &Sql) -> Option<(String, String, bool, Vec<u8>)> {
+        if !FOLLOW_MEMO.with(|memo| memo.borrow().is_some()) {
+            return None;
+        }
+        let bytes = match value {
+            Sql::Null => vec![0],
+            Sql::Integer(v) => [&[1u8][..], &v.to_be_bytes()].concat(),
+            Sql::Real(v) => [&[2u8][..], &v.to_bits().to_be_bytes()].concat(),
+            Sql::Text(v) => [&[3u8][..], v].concat(),
+            Sql::Blob(v) => [&[4u8][..], v].concat(),
+        };
+        Some((table.to_owned(), column.to_owned(), contains, bytes))
+    }
+
+    fn get(key: &(String, String, bool, Vec<u8>)) -> Option<Vec<Image>> {
+        FOLLOW_MEMO.with(|memo| memo.borrow().as_ref()?.get(key).cloned())
+    }
+
+    fn put(key: (String, String, bool, Vec<u8>), images: &[Image]) {
+        FOLLOW_MEMO.with(|memo| {
+            if let Some(memo) = memo.borrow_mut().as_mut() {
+                memo.insert(key, images.to_vec());
+            }
+        });
+    }
+
+    /// Count a hit or a miss, and a shadow mismatch; printed per 10 s.
+    fn count(hit: bool, mismatch: bool) {
+        if mismatch
+            && cfg!(any(test, feature = "testing"))
+            && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+        {
+            panic!("[follow-shadow] a kept follow read differs from a fresh one");
+        }
+        FOLLOW_STATS.with(|stats| {
+            let (mut hits, mut misses, mut mismatches, since) = stats.get();
+            hits += u64::from(hit);
+            misses += u64::from(!hit);
+            mismatches += u64::from(mismatch);
+            let since = since.unwrap_or_else(std::time::Instant::now);
+            if since.elapsed() >= std::time::Duration::from_secs(10) {
+                eprintln!("[follow-memo] hits={hits} misses={misses} mismatches={mismatches}");
+                stats.set((0, 0, 0, Some(std::time::Instant::now())));
+            } else {
+                stats.set((hits, misses, mismatches, Some(since)));
+            }
+        });
+    }
+}
+
+struct FollowMemoGuard;
+
+impl Drop for FollowMemoGuard {
+    fn drop(&mut self) {
+        FOLLOW_MEMO.with(|memo| *memo.borrow_mut() = None);
+    }
+}
+
+fn x_tick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_TICK").as_deref() == Ok("1"))
+}
+
+fn x_pruned_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_PRUNED").as_deref() == Ok("1"))
 }

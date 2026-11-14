@@ -1742,6 +1742,14 @@ impl lv::chunks::ChunkProvider for Stored<'_> {
         };
         Box::pin(std::future::ready(found))
     }
+
+    /// DRAFT (`JAZZ_X_LVMEMO=1`): `stored_bytes` answers only verified
+    /// bytes (nodes are authenticated before `store_chunk`, and the chunk
+    /// cache re-hashes what it reads from the chunk store).
+    fn object_verified(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_X_LVMEMO").as_deref() == Ok("1"))
+    }
 }
 
 /// Admit an uploaded descriptor: its tree must be complete here and honest
@@ -1786,6 +1794,12 @@ pub(crate) fn admit(
             let mut validator =
                 lv::LogicalValueValidator::new(&base).map_err(|e| rejected(e.to_string()))?;
             let mut offset = 0;
+            // DRAFT (`JAZZ_X_ADMIT=1`): the validator ignores the bytes of a
+            // Bytes value, and `visit_reachable_chunks` above already proved
+            // every node's object hash, logical hash and metrics.
+            if x_admit_skip() && base.kind == LargeValueKind::Bytes {
+                offset = base.byte_length;
+            }
             while offset < base.byte_length {
                 let end = (offset + WINDOW).min(base.byte_length);
                 let window = chunks.run_reading(
@@ -3059,4 +3073,10 @@ mod tests {
         mark_pushed(&o.conn, &hashes).unwrap();
         assert!(!begin_offload(&o.conn, 1_000).unwrap().is_empty());
     }
+}
+
+/// DRAFT: skip reading back Bytes values on admission (`JAZZ_X_ADMIT=1`).
+fn x_admit_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_ADMIT").as_deref() == Ok("1"))
 }

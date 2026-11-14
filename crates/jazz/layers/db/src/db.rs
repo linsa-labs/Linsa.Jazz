@@ -998,6 +998,9 @@ struct RelationRun<'q> {
     /// Each relation is then read once per run, so there is nothing to
     /// cache for it.
     batch: bool,
+    /// DRAFT (`JAZZ_X_PLAN=1`): the relation columns from the root to the
+    /// level being nested, which name a relation's kept plan.
+    path: Vec<String>,
 }
 
 impl<'q> RelationRun<'q> {
@@ -1016,6 +1019,7 @@ impl<'q> RelationRun<'q> {
             cells: HashMap::new(),
             children: HashMap::new(),
             batch: relation_batch(),
+            path: Vec::new(),
         }
     }
 
@@ -5106,6 +5110,9 @@ impl Inner {
                 .iter()
                 .enumerate()
                 .map(|(i, (name, ty, tags))| {
+                    if x_cells_skipped() {
+                        return Ok((name.clone(), None));
+                    }
                     let cell = row.get_ref(first + i).map_err(storage)?;
                     let value = match compiled.partial.get(i).and_then(Option::as_ref) {
                         Some(part) => self.partial_cell(ty, cell, part),
@@ -5317,7 +5324,24 @@ impl Inner {
         rows: &[CurrentRow],
     ) -> Result<Vec<Value>, Error> {
         let mut found: HashMap<RowUuid, Value> = HashMap::with_capacity(rows.len());
-        for chunk in rows.chunks(batch_limits().0.max(1)) {
+        // DRAFT (`JAZZ_X_PCELL=1`): a row that already carries the parent
+        // column (read through the same view and cut) gives it directly;
+        // only the others are read.
+        let pending: Vec<CurrentRow>;
+        let rows_to_read: &[CurrentRow] = if x_parent_cell() {
+            for row in rows {
+                if let Some((_, Some(value))) =
+                    row.cells.iter().find(|(name, _)| *name == array.outer_column)
+                {
+                    found.insert(row.id, value.clone());
+                }
+            }
+            pending = rows.iter().filter(|row| !found.contains_key(&row.id)).cloned().collect();
+            &pending
+        } else {
+            rows
+        };
+        for chunk in rows_to_read.chunks(batch_limits().0.max(1)) {
             let ids =
                 crate::compile::json_ids(chunk.iter().map(|row| row.id.0.as_bytes().as_slice()));
             let (cell, _) = run
@@ -5365,6 +5389,47 @@ impl Inner {
         array: &crate::query::ArraySubquery,
         parents: &[Value],
     ) -> Result<Vec<Vec<ResultNode>>, Error> {
+        let depth = run.path.len();
+        let out = self.relation_level_at(run, array, parents);
+        run.path.truncate(depth);
+        out
+    }
+
+    fn relation_level_at(
+        &self,
+        run: &mut RelationRun<'_>,
+        array: &crate::query::ArraySubquery,
+        parents: &[Value],
+    ) -> Result<Vec<Vec<ResultNode>>, Error> {
+        // The kept plans, when a group armed them and this read can reuse one.
+        let plans = (run.read.view.is_none() && run.read.cut.is_none())
+            .then(current_plans)
+            .flatten();
+        let plan_path = plans.as_ref().map(|_| {
+            let mut path = run.path.join("\u{1f}");
+            path.push('\u{1f}');
+            path.push_str(&array.column_name);
+            path
+        });
+        // Every level nested under this one, batched or not, is one deeper.
+        run.path.push(array.column_name.clone());
+        if let Some(plans) = &plans {
+            let stamp = PlanStamp {
+                schema: run
+                    .prepared
+                    .schema
+                    .as_ref()
+                    .map_or(0, |schema| std::ptr::from_ref(&**schema) as *const () as usize),
+                withheld: self.withheld.get(),
+                settled_only: run.read.settled_only,
+                include_deleted: run.read.include_deleted,
+            };
+            let mut plans = plans.borrow_mut();
+            if plans.0 != Some(stamp) {
+                plans.0 = Some(stamp);
+                plans.1.clear();
+            }
+        }
         let mut index: HashMap<ParentKey, usize> = HashMap::new();
         // Each distinct bound value, and a parent that binds it.
         let mut values: Vec<(Sql, &Value)> = Vec::new();
@@ -5430,10 +5495,47 @@ impl Inner {
                 batchable = false;
                 break;
             };
-            let Some((compiled, _)) = run
-                .ctx(self)
-                .compile_children_batch(array, elements, list, blobs)?
-            else {
+            let planned = match (&plans, &plan_path) {
+                (Some(plans), Some(path)) => {
+                    let key = (path.clone(), elements, blobs);
+                    let kept = plans.borrow().1.get(&key).cloned();
+                    match kept {
+                        Some(kept) => {
+                            let kept = kept.map(|(mut compiled, at)| {
+                                compiled.params[at] = list.clone();
+                                (compiled, at)
+                            });
+                            plan_stat(true, || {
+                                let fresh = run
+                                    .ctx(self)
+                                    .compile_children_batch(array, elements, list.clone(), blobs)
+                                    .ok()
+                                    .flatten();
+                                match (&fresh, &kept) {
+                                    (None, None) => true,
+                                    (Some((a, i)), Some((b, j))) => {
+                                        i == j && a.sql == b.sql && a.params == b.params
+                                    }
+                                    _ => false,
+                                }
+                            });
+                            kept
+                        }
+                        None => {
+                            let fresh = run
+                                .ctx(self)
+                                .compile_children_batch(array, elements, list, blobs)?;
+                            plans.borrow_mut().1.insert(key, fresh.clone());
+                            plan_stat(false, || true);
+                            fresh
+                        }
+                    }
+                }
+                _ => run
+                    .ctx(self)
+                    .compile_children_batch(array, elements, list, blobs)?,
+            };
+            let Some((compiled, _)) = planned else {
                 // The children's width does not depend on the chunk.
                 debug_assert_eq!(n, 0);
                 batchable = false;
@@ -6006,6 +6108,106 @@ impl Inner {
 
     /// [`Inner::check`] by `schema`'s policies (`table` is `schema`'s).
     pub(crate) fn check_in(
+        &self,
+        schema: &Schema,
+        table: &Table,
+        row: RowUuid,
+        key: &[u8],
+        author: AuthorSubject,
+        operation: Operation,
+    ) -> Result<bool, Error> {
+        if check_plans_on() {
+            return self.check_in_planned(schema, table, row, key, author, operation, false);
+        }
+        self.check_in_fresh(schema, table, row, key, author, operation)
+    }
+
+    /// [`Inner::check_in`] for a row the caller just read from this store,
+    /// with nothing written since: a policy that compiles to a constant
+    /// decides without a statement (`JAZZ_X_CHECK=1`).
+    pub(crate) fn check_in_existing(
+        &self,
+        schema: &Schema,
+        table: &Table,
+        row: RowUuid,
+        key: &[u8],
+        author: AuthorSubject,
+        operation: Operation,
+    ) -> Result<bool, Error> {
+        if check_plans_on() {
+            return self.check_in_planned(schema, table, row, key, author, operation, true);
+        }
+        self.check_in_fresh(schema, table, row, key, author, operation)
+    }
+
+    /// DRAFT (`JAZZ_X_CHECK=1`): the policy text and its leading parameters
+    /// are a function of (schema, table, operation, the author's claims);
+    /// only the row and branch parameters differ per call.
+    #[allow(clippy::too_many_arguments)]
+    fn check_in_planned(
+        &self,
+        schema: &Schema,
+        table: &Table,
+        row: RowUuid,
+        key: &[u8],
+        author: AuthorSubject,
+        operation: Operation,
+        existing: bool,
+    ) -> Result<bool, Error> {
+        let plan_key = (
+            std::ptr::from_ref(schema) as usize,
+            table.stored.clone(),
+            operation,
+            author,
+        );
+        let claims = self.claims.get(&author);
+        let kept = CHECK_PLANS.with(|plans| {
+            plans
+                .borrow()
+                .get(&plan_key)
+                .filter(|plan| plan.claims.as_ref() == claims)
+                .cloned()
+        });
+        let (plan, hit) = match kept {
+            Some(plan) => (plan, true),
+            None => {
+                let session = self.session(author);
+                let (sql, mut params, _) =
+                    self.policy_check_in(schema, table, row, key, None, |ctx| {
+                        ctx.operation_policy(table, operation, "a", &session)
+                    })?;
+                params.truncate(params.len().saturating_sub(2));
+                let constant = params.is_empty() && sql.starts_with("SELECT COALESCE(1, 0) FROM ");
+                let plan = std::rc::Rc::new(CheckPlan {
+                    claims: claims.cloned(),
+                    sql,
+                    params,
+                    constant,
+                });
+                CHECK_PLANS.with(|plans| plans.borrow_mut().insert(plan_key, plan.clone()));
+                (plan, false)
+            }
+        };
+        let skipped = existing && plan.constant;
+        let value = if skipped {
+            true
+        } else {
+            let mut params = plan.params.clone();
+            params.push(Sql::Blob(row.0.as_bytes().to_vec()));
+            params.push(Sql::Blob(key.to_vec()));
+            let value: i64 = self
+                .conn
+                .cached_row(&plan.sql, params_from_iter(params.iter()), |r| r.get(0))
+                .map_err(storage)?;
+            value != 0
+        };
+        let mismatch = check_shadow()
+            && self.check_in_fresh(schema, table, row, key, author, operation)? != value;
+        check_stat(hit, skipped, mismatch);
+        Ok(value)
+    }
+
+    fn check_in_fresh(
         &self,
         schema: &Schema,
         table: &Table,
@@ -10828,4 +11030,166 @@ fn migration_path(
         Some(path) if path.len() > 1 || !path[0].1.is_empty() => path,
         _ => Vec::new(),
     }
+}
+
+thread_local! {
+    /// DRAFT (`JAZZ_X_READ=1`): set around a session read whose answer uses
+    /// only row ids, versions and joined rows, so no cell is decoded.
+    static X_SKIP_CELLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn x_cells_skipped() -> bool {
+    X_SKIP_CELLS.with(std::cell::Cell::get)
+}
+
+/// DRAFT (`JAZZ_X_CHECK=1`): a policy check's statement for one (schema,
+/// table, operation, author), under the claims it was compiled with.
+struct CheckPlan {
+    claims: Option<BTreeMap<String, Value>>,
+    sql: String,
+    /// The parameters before the row and branch ones.
+    params: Vec<Sql>,
+    /// The policy compiled to `1`: any existing row passes.
+    constant: bool,
+}
+
+type CheckKey = (usize, String, Operation, AuthorSubject);
+
+thread_local! {
+    static CHECK_PLANS: RefCell<HashMap<CheckKey, std::rc::Rc<CheckPlan>>> =
+        RefCell::new(HashMap::new());
+    static CHECK_STATS: std::cell::Cell<(u64, u64, u64, u64, Option<std::time::Instant>)> =
+        const { std::cell::Cell::new((0, 0, 0, 0, None)) };
+}
+
+/// Drop the kept policy checks (the schema changed).
+pub(crate) fn clear_check_plans() {
+    CHECK_PLANS.with(|plans| plans.borrow_mut().clear());
+}
+
+fn check_plans_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_CHECK").as_deref() == Ok("1"))
+}
+
+fn check_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_CHECK_SHADOW").as_deref() == Ok("1"))
+}
+
+/// Count a planned check: hit or miss, skipped as constant, shadow
+/// mismatch; printed per 10 s.
+fn check_stat(hit: bool, skipped: bool, mismatch: bool) {
+    if mismatch
+        && cfg!(any(test, feature = "testing"))
+        && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+    {
+        panic!("[check-shadow] a planned policy check differs from a fresh one");
+    }
+    CHECK_STATS.with(|stats| {
+        let (mut hits, mut misses, mut constants, mut mismatches, since) = stats.get();
+        hits += u64::from(hit);
+        misses += u64::from(!hit);
+        constants += u64::from(skipped);
+        mismatches += u64::from(mismatch);
+        let since = since.unwrap_or_else(std::time::Instant::now);
+        if since.elapsed() >= std::time::Duration::from_secs(10) {
+            eprintln!(
+                "[check-plan] hits={hits} misses={misses} constant={constants} mismatches={mismatches}"
+            );
+            stats.set((0, 0, 0, 0, Some(std::time::Instant::now())));
+        } else {
+            stats.set((hits, misses, constants, mismatches, Some(since)));
+        }
+    });
+}
+
+/// DRAFT (`JAZZ_X_PLAN=1`): what a kept relation plan was compiled under;
+/// another stamp drops the group's plans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanStamp {
+    schema: usize,
+    withheld: bool,
+    settled_only: bool,
+    include_deleted: bool,
+}
+
+/// A group's kept relation plans: per relation path, parent shape and
+/// blob parents, the compiled children and the parameter holding the
+/// parents (`None`: too wide to batch).
+pub(crate) type Plans = std::rc::Rc<
+    RefCell<(
+        Option<PlanStamp>,
+        HashMap<(String, bool, bool), Option<(crate::compile::Compiled, usize)>>,
+    )>,
+>;
+
+thread_local! {
+    static CURRENT_PLANS: RefCell<Option<Plans>> = const { RefCell::new(None) };
+}
+
+fn current_plans() -> Option<Plans> {
+    CURRENT_PLANS.with(|plans| plans.borrow().clone())
+}
+
+/// Run `f` with `plans` armed for its relation reads (`JAZZ_X_PLAN=1`).
+pub(crate) fn with_plans<T>(plans: &Plans, f: impl FnOnce() -> T) -> T {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("JAZZ_X_PLAN").as_deref() == Ok("1")) {
+        return f();
+    }
+    struct Reset(Option<Plans>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            CURRENT_PLANS.with(|plans| *plans.borrow_mut() = previous);
+        }
+    }
+    let _reset = Reset(CURRENT_PLANS.with(|current| current.borrow_mut().replace(plans.clone())));
+    f()
+}
+
+/// Count a kept-plan hit (with its shadow, `JAZZ_X_PLAN_SHADOW=1`) or miss.
+fn plan_stat(hit: bool, same: impl FnOnce() -> bool) {
+    static SHADOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let shadow = *SHADOW.get_or_init(|| std::env::var("JAZZ_X_PLAN_SHADOW").as_deref() == Ok("1"));
+    let mismatch = hit && shadow && !same();
+    if mismatch && cfg!(any(test, feature = "testing"))
+        && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+    {
+        panic!("[plan-shadow] kept relation plan differs from a fresh compile");
+    }
+    if fanout::fan_stats::on() {
+        fanout::fan_stats::S.with(|st| {
+            let mut st = st.borrow_mut();
+            if hit {
+                st.plan_hit += 1;
+            } else {
+                st.plan_miss += 1;
+            }
+            st.plan_mismatch += u64::from(mismatch);
+        });
+    }
+}
+
+/// DRAFT: relation parents from the row's own cell (`JAZZ_X_PCELL=1`).
+fn x_parent_cell() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_PCELL").as_deref() == Ok("1"))
+}
+
+/// DRAFT: run `f` with cell decoding off when `JAZZ_X_READ=1`.
+pub(crate) fn x_without_cells<T>(f: impl FnOnce() -> T) -> T {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("JAZZ_X_READ").as_deref() == Ok("1")) {
+        return f();
+    }
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            X_SKIP_CELLS.with(|cell| cell.set(self.0));
+        }
+    }
+    let _reset = Reset(X_SKIP_CELLS.with(|cell| cell.replace(true)));
+    f()
 }

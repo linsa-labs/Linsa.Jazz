@@ -41,6 +41,84 @@ use std::collections::HashSet;
 
 pub(super) type Queue = Rc<RefCell<VecDeque<SubscriptionEvent>>>;
 
+/// STAND PROBE (`JAZZ_FANOUT_STATS=1`): per 10 s, on stderr, per changed
+/// table the rows dispatched and the groups they woke (each group counted
+/// once per dispatch, under the table that woke it first), and per woken
+/// group's root table the re-runs / re-checks and their time.
+pub(crate) mod fan_stats {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+    #[derive(Default)]
+    pub(crate) struct Stats {
+        pub since: Option<Instant>,
+        pub dispatches: u64,
+        pub empty: u64,
+        pub selfheld: u64,
+        pub hold_kept: u64,
+        pub hold_recomputed: u64,
+        pub hold_mismatch: u64,
+        pub plan_hit: u64,
+        pub plan_miss: u64,
+        pub plan_mismatch: u64,
+        pub rplan_hit: u64,
+        pub rplan_miss: u64,
+        pub rplan_refused: u64,
+        pub rplan_mismatch: u64,
+        pub dispatch: Duration,
+        pub changes: BTreeMap<String, u64>,
+        pub woke: BTreeMap<String, u64>,
+        pub refresh: BTreeMap<String, (u64, u64, Duration)>,
+        pub groups_max: usize,
+    }
+    thread_local! { pub(crate) static S: RefCell<Stats> = RefCell::default(); }
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_FANOUT_STATS").as_deref() == Ok("1"))
+    }
+    pub(crate) fn flush() {
+        S.with(|s| {
+            let mut s = s.borrow_mut();
+            let since = *s.since.get_or_insert_with(Instant::now);
+            if since.elapsed() < Duration::from_secs(10) {
+                return;
+            }
+            let fmt = |m: &BTreeMap<String, u64>| {
+                m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+            };
+            let refresh = s
+                .refresh
+                .iter()
+                .map(|(k, (r, c, d))| format!("{k}=rerun{r}/recheck{c}/{}ms", d.as_millis()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[fan-stats] thread={} dispatches={} empty={} selfheld={} hold_kept={} hold_recomputed={} hold_mismatch={} plan_hit={} plan_miss={} plan_mismatch={} rplan_hit={} rplan_miss={} rplan_refused={} rplan_mismatch={} dispatch_ms={} groups<={} | changes {} | woke {} | refresh {}",
+                std::thread::current().name().unwrap_or("?"),
+                s.dispatches,
+                s.empty,
+                s.selfheld,
+                s.hold_kept,
+                s.hold_recomputed,
+                s.hold_mismatch,
+                s.plan_hit,
+                s.plan_miss,
+                s.plan_mismatch,
+                s.rplan_hit,
+                s.rplan_miss,
+                s.rplan_refused,
+                s.rplan_mismatch,
+                s.dispatch.as_millis(),
+                s.groups_max,
+                fmt(&s.changes),
+                fmt(&s.woke),
+                refresh
+            );
+            *s = Stats { since: Some(Instant::now()), ..Stats::default() };
+        });
+    }
+}
+
 /// What a group reads.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Watch {
@@ -85,15 +163,80 @@ struct Correlation {
 }
 
 /// What a group's result holds at one [`Correlation`]'s level.
-#[derive(Clone, Debug, Default)]
+///
+/// Counted, so that one root row's share can be added and taken away
+/// (`JAZZ_X_HOLD=1`); a key is held while its count is positive.
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Held {
     /// The parents' `outer` values, canonical, one per list element.
-    parents: HashSet<String>,
+    parents: HashMap<String, u32>,
     /// The rows the relation holds under them.
-    rows: HashSet<RowUuid>,
-    /// False when a parent's value or a row's id could not be read: then
-    /// every change to the table wakes the group.
-    complete: bool,
+    rows: HashMap<RowUuid, u32>,
+    /// How many times a parent's value or a row's id could not be read:
+    /// while any, every change to the table wakes the group.
+    incomplete: u32,
+}
+
+impl Held {
+    fn complete(&self) -> bool {
+        self.incomplete == 0
+    }
+
+    fn add(&mut self, other: &Held) {
+        for (atom, n) in &other.parents {
+            *self.parents.entry(atom.clone()).or_default() += n;
+        }
+        for (row, n) in &other.rows {
+            *self.rows.entry(*row).or_default() += n;
+        }
+        self.incomplete += other.incomplete;
+    }
+
+    fn sub(&mut self, other: &Held) {
+        for (atom, n) in &other.parents {
+            if let Some(count) = self.parents.get_mut(atom) {
+                *count -= (*n).min(*count);
+                if *count == 0 {
+                    self.parents.remove(atom);
+                }
+            }
+        }
+        for (row, n) in &other.rows {
+            if let Some(count) = self.rows.get_mut(row) {
+                *count -= (*n).min(*count);
+                if *count == 0 {
+                    self.rows.remove(row);
+                }
+            }
+        }
+        self.incomplete -= other.incomplete.min(self.incomplete);
+    }
+
+    /// The same keys held, and the same completeness.
+    fn same_keys(&self, other: &Held) -> bool {
+        self.complete() == other.complete()
+            && self.parents.len() == other.parents.len()
+            && self.rows.len() == other.rows.len()
+            && self.parents.keys().all(|atom| other.parents.contains_key(atom))
+            && self.rows.keys().all(|row| other.rows.contains_key(row))
+    }
+}
+
+/// Where a set of canonical atoms is collected.
+trait AtomSink {
+    fn put(&mut self, atom: String);
+}
+
+impl AtomSink for HashSet<String> {
+    fn put(&mut self, atom: String) {
+        self.insert(atom);
+    }
+}
+
+impl AtomSink for HashMap<String, u32> {
+    fn put(&mut self, atom: String) {
+        *self.entry(atom).or_default() += 1;
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -233,6 +376,18 @@ pub(super) struct Group {
     /// ([`Watch::Related`]), and what the result holds at each, parallel.
     correlations: Vec<Correlation>,
     held: Vec<Held>,
+    /// DRAFT (`JAZZ_X_HOLD=1`): each root row's share of `held`, with the
+    /// cells it was read from (kept alive, so their address names them).
+    by_root: HashMap<RowUuid, (Arc<Vec<(String, Option<Value>)>>, Vec<Held>)>,
+    /// DRAFT (`JAZZ_X_SELFHIT=1`): a re-nest follows this re-check, so its
+    /// shadow compares after that, not here.
+    renest_follows: bool,
+    /// DRAFT (`JAZZ_X_PLAN=1`): the group's kept relation plans.
+    plans: crate::db::Plans,
+    /// DRAFT (`JAZZ_X_RPLAN=1`): the re-check's narrowed root statement per
+    /// id count, with the parameter each id binds to (`None`: refused),
+    /// under the stamp it was compiled with.
+    root_plans: RefCell<(Option<RootStamp>, HashMap<usize, Option<(Compiled, Vec<usize>)>>)>,
     /// When the root table is watched by correlation too (a
     /// self-relation): the root rows the result holds, which wake it
     /// whatever their images say.
@@ -302,6 +457,12 @@ pub(super) struct Fanout {
     key_columns: HashMap<String, BTreeSet<String>>,
     related: HashMap<String, BTreeSet<u64>>,
     evidence: HashMap<String, BTreeSet<u64>>,
+    /// DRAFT (`JAZZ_X_HITS=1`): per table, the level columns its related
+    /// groups correlate on and the columns its evidence groups read; every
+    /// index or unindex (the only ways levels and occurrences change)
+    /// drops them.
+    related_columns: RefCell<HashMap<String, std::rc::Rc<BTreeSet<String>>>>,
+    evidence_columns: RefCell<HashMap<String, std::rc::Rc<BTreeSet<String>>>>,
     stats: FanoutStats,
     /// Bumped by every dropped stream, so `collect` scans only when needed.
     pub(super) dropped: Rc<std::cell::Cell<usize>>,
@@ -309,7 +470,34 @@ pub(super) struct Fanout {
 
 /// The canonical form of a stored SQL value, for watch matching.
 fn canon(value: &Sql) -> String {
-    format!("{value:?}")
+    if !x_fast_canon() {
+        return format!("{value:?}");
+    }
+    // DRAFT (`JAZZ_X_CANON=1`): the same injective canonical form without
+    // Debug formatting: a type tag, then the payload (bytes as hex).
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex = |tag: char, bytes: &[u8]| {
+        let mut out = String::with_capacity(1 + 2 * bytes.len());
+        out.push(tag);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
+        }
+        out
+    };
+    match value {
+        Sql::Null => "N".to_owned(),
+        Sql::Integer(v) => format!("I{v}"),
+        Sql::Real(v) => hex('R', &v.to_bits().to_be_bytes()),
+        Sql::Text(bytes) => hex('T', bytes),
+        Sql::Blob(bytes) => hex('B', bytes),
+    }
+}
+
+/// DRAFT: canonical atoms without Debug formatting (`JAZZ_X_CANON=1`).
+fn x_fast_canon() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_CANON").as_deref() == Ok("1"))
 }
 
 fn canon_value(value: &Value) -> Option<String> {
@@ -331,6 +519,8 @@ fn stored_canon(column: Option<&crate::values::Column>, value: String) -> String
 
 impl Fanout {
     fn index(&mut self, gid: u64, watches: &[Watch]) {
+        self.related_columns.get_mut().clear();
+        self.evidence_columns.get_mut().clear();
         for watch in watches {
             match watch {
                 Watch::Table(table) => {
@@ -357,6 +547,8 @@ impl Fanout {
     }
 
     fn unindex(&mut self, gid: u64, watches: &[Watch]) {
+        self.related_columns.get_mut().clear();
+        self.evidence_columns.get_mut().clear();
         for watch in watches {
             match watch {
                 Watch::Table(table) => {
@@ -564,6 +756,8 @@ impl Inner {
                 history_source_table(&prepared.query.table).unwrap_or(&prepared.query.table),
             )?
             .to_owned();
+        // With relations, the watches must also allow it: decided at each
+        // refresh (`Group::rechecks`), as `refresh_where` rebuilds them.
         let recheck = recheckable(&prepared.query, &root, &read, &compiled);
         let branches = view_branches(
             prepared.schema.as_ref().unwrap_or(&self.owner),
@@ -609,6 +803,10 @@ impl Inner {
             applied,
             correlations,
             held: Vec::new(),
+            by_root: HashMap::new(),
+            renest_follows: false,
+            plans: crate::db::Plans::default(),
+            root_plans: RefCell::default(),
             root_held: None,
         }));
         Self::hold(&mut handle.borrow_mut());
@@ -1059,11 +1257,15 @@ impl Inner {
     /// Record what `group`'s result holds at each of its correlation
     /// levels, after a run replaced its rows.
     fn hold(group: &mut Group) {
-        group.held = group
-            .correlations
-            .iter()
-            .map(|level| held(level, &group.rows))
-            .collect();
+        if x_hold() {
+            Self::hold_incremental(group);
+        } else {
+            group.held = group
+                .correlations
+                .iter()
+                .map(|level| held(level, &group.rows))
+                .collect();
+        }
         group.root_held = group
             .correlations
             .iter()
@@ -1071,8 +1273,92 @@ impl Inner {
             .then(|| group.rows.iter().map(|row| row.id).collect());
     }
 
+    /// DRAFT (`JAZZ_X_HOLD=1`): [`Fanout::hold`] taking away the shares of
+    /// root rows that left or changed (their cells are another `Arc`) and
+    /// adding the shares of the ones that came; an unchanged row costs a
+    /// lookup.
+    fn hold_incremental(group: &mut Group) {
+        let levels = group.correlations.len();
+        if group.held.len() != levels {
+            group.held = vec![Held::default(); levels];
+            group.by_root.clear();
+        }
+        let ids: HashSet<RowUuid> = group.rows.iter().map(|row| row.id).collect();
+        let (mut kept, mut recomputed) = (0u64, 0u64);
+        if ids.len() != group.rows.len() {
+            // A root row more than once: no per-row shares.
+            group.by_root.clear();
+            group.held = group
+                .correlations
+                .iter()
+                .map(|level| held(level, &group.rows))
+                .collect();
+            recomputed += group.rows.len() as u64;
+        } else {
+            let gone: Vec<RowUuid> =
+                group.by_root.keys().filter(|id| !ids.contains(id)).copied().collect();
+            for id in gone {
+                if let Some((_, shares)) = group.by_root.remove(&id) {
+                    for (sum, share) in group.held.iter_mut().zip(&shares) {
+                        sum.sub(share);
+                    }
+                }
+            }
+            for row in &group.rows {
+                if group
+                    .by_root
+                    .get(&row.id)
+                    .is_some_and(|(cells, _)| Arc::ptr_eq(cells, &row.cells))
+                {
+                    kept += 1;
+                    continue;
+                }
+                recomputed += 1;
+                let shares: Vec<Held> = group
+                    .correlations
+                    .iter()
+                    .map(|level| held(level, std::slice::from_ref(row)))
+                    .collect();
+                for (sum, share) in group.held.iter_mut().zip(&shares) {
+                    sum.add(share);
+                }
+                if let Some((_, old)) = group.by_root.insert(row.id, (row.cells.clone(), shares)) {
+                    for (sum, share) in group.held.iter_mut().zip(&old) {
+                        sum.sub(share);
+                    }
+                }
+            }
+        }
+        // A level with no path is never complete (see `held`).
+        for (level, sum) in group.correlations.iter().zip(group.held.iter_mut()) {
+            if level.path.is_empty() {
+                sum.incomplete = sum.incomplete.max(1);
+            }
+        }
+        let mismatch = x_hold_shadow()
+            && group
+                .correlations
+                .iter()
+                .zip(&group.held)
+                .any(|(level, sum)| !held(level, &group.rows).same_keys(sum));
+        if mismatch && shadow_panics() {
+            panic!("[hold-shadow] mismatch on {}", group.root);
+        }
+        if fan_stats::on() {
+            fan_stats::S.with(|st| {
+                let mut st = st.borrow_mut();
+                st.hold_kept += kept;
+                st.hold_recomputed += recomputed;
+                st.hold_mismatch += u64::from(mismatch);
+            });
+        }
+    }
+
     /// Wake the groups a commit's changed rows hit, re-run and diff them.
     pub(super) fn dispatch(&mut self, mut changes: Vec<(String, RowUuid, Vec<u8>)>) {
+        let probe = fan_stats::on().then(std::time::Instant::now);
+        let empty = changes.is_empty() && self.gone.borrow().is_empty();
+        let mut cause: BTreeMap<u64, String> = BTreeMap::new();
         changes.sort();
         // Rows written more than once since the last dispatch (a
         // transaction's repeated writes, a replica applying several
@@ -1106,6 +1392,7 @@ impl Inner {
                     continue;
                 }
                 let root = group.root == table;
+                cause.entry(*gid).or_insert_with(|| table.to_owned());
                 let entry = woken.entry(*gid).or_insert_with(|| Some(BTreeSet::new()));
                 let columns: Vec<&String> = group
                     .includes
@@ -1165,7 +1452,18 @@ impl Inner {
         // Tables watched by correlation: the groups whose relation levels
         // hold the row, or a parent its old or new link names.
         let mut uncorrelated = 0;
+        // DRAFT (`JAZZ_RENEST=1`): groups woken only by correlation, with
+        // the levels and parents that matched (see `Fanout::renest`).
+        let renesting = renest_on();
+        let mut scoped: BTreeMap<u64, Vec<(usize, Hit)>> = BTreeMap::new();
+        // DRAFT (`JAZZ_X_SELFHIT=1`): groups re-checking a held root row
+        // that some relation level also holds (as a child or a parent):
+        // re-nested after the re-check instead of a full run.
+        let selfhit = x_selfhit();
+        let mut selfhits: BTreeMap<u64, Vec<(usize, Hit)>> = BTreeMap::new();
+        let mut selfheld = 0u64;
         let mut related = |table: &str, row: RowUuid, images: Option<&[Vec<(String, Sql)>]>| {
+            let atoms = ChangeAtoms::new(row, images);
             for gid in self.fan.related.get(table).into_iter().flatten() {
                 if woken.get(gid).is_some_and(Option::is_none) {
                     continue;
@@ -1173,18 +1471,65 @@ impl Inner {
                 let Some(group) = self.fan.groups.get(gid) else {
                     continue;
                 };
-                if correlated(&group.borrow(), table, row, images) {
+                let rechecking = woken
+                    .get(gid)
+                    .is_some_and(|ids| ids.as_ref().is_some_and(|ids| ids.contains(&row)))
+                    && group.borrow().root == table;
+                if rechecking
+                    && group.borrow().root_held.as_ref().is_some_and(|held| held.contains(&row))
+                {
+                    selfheld += 1;
+                    if selfhit {
+                        match hits_of(&group.borrow(), table, &atoms, false) {
+                            None => {
+                                selfhits.remove(gid);
+                                woken.insert(*gid, None);
+                            }
+                            Some(hits) if !hits.is_empty() => {
+                                selfhits.entry(*gid).or_default().extend(hits);
+                            }
+                            Some(_) => uncorrelated += 1,
+                        }
+                        continue;
+                    }
+                }
+                if renesting && !woken.contains_key(gid) {
+                    match hits_of(&group.borrow(), table, &atoms, true) {
+                        None => {
+                            cause.entry(*gid).or_insert_with(|| table.to_owned());
+                            scoped.remove(gid);
+                            woken.insert(*gid, None);
+                        }
+                        Some(hits) if !hits.is_empty() => {
+                            cause.entry(*gid).or_insert_with(|| table.to_owned());
+                            scoped.entry(*gid).or_default().extend(hits);
+                        }
+                        Some(_) => uncorrelated += 1,
+                    }
+                    continue;
+                }
+                if correlated_of(&group.borrow(), table, &atoms) {
+                    cause.entry(*gid).or_insert_with(|| table.to_owned());
                     woken.insert(*gid, None);
                 } else {
                     uncorrelated += 1;
                 }
             }
         };
+        // DRAFT (`JAZZ_X_HITS=1`): each table's level columns once per
+        // dispatch (no group changes before the refresh loop below).
+        let hits_on = x_hits();
         for (table, row, key) in &changes {
             let Some(gids) = self.fan.related.get(table) else {
                 continue;
             };
-            let columns: BTreeSet<String> = gids
+            let known = if hits_on {
+                self.fan.related_columns.borrow().get(table).cloned()
+            } else {
+                None
+            };
+            let fresh = |shadow: bool| -> Option<BTreeSet<String>> {
+                (!shadow || x_hits_shadow()).then(|| gids
                 .iter()
                 .filter_map(|gid| self.fan.groups.get(gid))
                 .flat_map(|group| {
@@ -1196,7 +1541,26 @@ impl Inner {
                         .map(|level| level.inner.clone())
                         .collect::<Vec<_>>()
                 })
-                .collect();
+                .collect())
+            };
+            let columns: std::rc::Rc<BTreeSet<String>> = match known {
+                Some(known) => {
+                    if fresh(true).is_some_and(|fresh| fresh != *known) {
+                        hits_mismatch("related columns", table);
+                    }
+                    known
+                }
+                None => {
+                    let built = std::rc::Rc::new(fresh(false).unwrap_or_default());
+                    if hits_on {
+                        self.fan
+                            .related_columns
+                            .borrow_mut()
+                            .insert(table.clone(), built.clone());
+                    }
+                    built
+                }
+            };
             let images = if columns.is_empty() {
                 Some(Vec::new())
             } else {
@@ -1231,6 +1595,7 @@ impl Inner {
                     continue;
                 };
                 if evidenced(&group.borrow(), table, images, gone) {
+                    cause.entry(*gid).or_insert_with(|| table.to_owned());
                     woken.insert(*gid, None);
                 } else {
                     unread += 1;
@@ -1241,6 +1606,12 @@ impl Inner {
             let Some(gids) = self.fan.evidence.get(table) else {
                 continue;
             };
+            let known = if hits_on {
+                self.fan.evidence_columns.borrow().get(table).cloned()
+            } else {
+                None
+            };
+            let fresh = || -> BTreeSet<String> {
             let mut columns: BTreeSet<String> = gids
                 .iter()
                 .filter_map(|gid| self.fan.groups.get(gid))
@@ -1257,6 +1628,26 @@ impl Inner {
                 })
                 .collect();
             columns.insert("_state".to_owned());
+            columns
+            };
+            let columns: std::rc::Rc<BTreeSet<String>> = match known {
+                Some(known) => {
+                    if x_hits_shadow() && fresh() != *known {
+                        hits_mismatch("evidence columns", table);
+                    }
+                    known
+                }
+                None => {
+                    let built = std::rc::Rc::new(fresh());
+                    if hits_on {
+                        self.fan
+                            .evidence_columns
+                            .borrow_mut()
+                            .insert(table.clone(), built.clone());
+                    }
+                    built
+                }
+            };
             let images = self.stored_images(table, *row, key, &columns);
             let images = images.filter(|_| !repeated.contains(&(table.clone(), *row, key.clone())));
             evident(table, images.as_deref(), false);
@@ -1271,10 +1662,24 @@ impl Inner {
                 evident(&image.table, Some(std::slice::from_ref(&cells)), true);
             }
         }
+        if probe.is_some() {
+            fan_stats::S.with(|st| {
+                let mut st = st.borrow_mut();
+                for (table, ..) in &changes {
+                    *st.changes.entry(table.clone()).or_default() += 1;
+                }
+                for table in cause.values() {
+                    *st.woke.entry(table.clone()).or_default() += 1;
+                }
+                st.groups_max = st.groups_max.max(self.fan.groups.len());
+                st.selfheld += selfheld;
+            });
+        }
         self.fan.stats.unevidenced += unread;
         self.fan.stats.uncorrelated += uncorrelated;
         self.fan.stats.woken += woken.len() as u64;
         self.fan.stats.skipped += (self.fan.groups.len() - woken.len()) as u64;
+        let woken_ids: BTreeSet<u64> = woken.keys().copied().collect();
         let groups: Vec<_> = woken
             .into_iter()
             .filter_map(|(gid, ids)| Some((gid, self.fan.groups.get(&gid).cloned()?, ids)))
@@ -1283,15 +1688,79 @@ impl Inner {
             let mut group = group.borrow_mut();
             // Only include targets changed: the result's rows are as before.
             if ids.as_ref().is_none_or(|ids| !ids.is_empty()) {
-                if self.refresh_group(&mut group, ids.as_ref()) {
+                let at = probe.map(|_| std::time::Instant::now());
+                let follows = selfhits.contains_key(&gid) && ids.is_some();
+                group.renest_follows = follows;
+                let mut reran = self.refresh_group(&mut group, ids.as_ref());
+                group.renest_follows = false;
+                if let Some(hits) = selfhits.remove(&gid)
+                    && !reran
+                    && ids.is_some()
+                {
+                    if self.renest(&mut group, &hits) {
+                        shadow_compare(self, &mut group, "selfhit", renest_shadow());
+                    } else {
+                        self.refresh_group(&mut group, None);
+                        reran = true;
+                    }
+                }
+                if reran {
                     self.fan.stats.reran += 1;
                 } else {
                     self.fan.stats.rechecked += 1;
+                }
+                if let Some(at) = at {
+                    let root = group.root.clone();
+                    fan_stats::S.with(|st| {
+                        let mut st = st.borrow_mut();
+                        let entry = st.refresh.entry(root).or_default();
+                        if reran { entry.0 += 1 } else { entry.1 += 1 }
+                        entry.2 += at.elapsed();
+                    });
                 }
             }
             if let Some(changed) = targets.remove(&gid) {
                 refresh_includes(&mut group, &changed);
             }
+        }
+        // Woken any other way too (an evidence match after the
+        // correlation one): those re-ran above.
+        scoped.retain(|gid, _| !woken_ids.contains(gid));
+        for (gid, hits) in scoped {
+            let Some(group) = self.fan.groups.get(&gid).cloned() else {
+                continue;
+            };
+            let mut group = group.borrow_mut();
+            let at = probe.map(|_| std::time::Instant::now());
+            let scoped_ok = self.renest(&mut group, &hits);
+            if scoped_ok {
+                self.fan.stats.rechecked += 1;
+                shadow_compare(self, &mut group, "renest", renest_shadow());
+            } else {
+                self.refresh_group(&mut group, None);
+                self.fan.stats.reran += 1;
+            }
+            if let Some(changed) = targets.remove(&gid) {
+                refresh_includes(&mut group, &changed);
+            }
+            if let Some(at) = at {
+                let root = format!("{}~{}", group.root, if scoped_ok { "renest" } else { "renest-fallback" });
+                fan_stats::S.with(|st| {
+                    let mut st = st.borrow_mut();
+                    let entry = st.refresh.entry(root).or_default();
+                    if scoped_ok { entry.1 += 1 } else { entry.0 += 1 }
+                    entry.2 += at.elapsed();
+                });
+            }
+        }
+        if let Some(at) = probe {
+            fan_stats::S.with(|st| {
+                let mut st = st.borrow_mut();
+                st.dispatches += 1;
+                st.empty += u64::from(empty);
+                st.dispatch += at.elapsed();
+            });
+            fan_stats::flush();
         }
     }
 
@@ -1300,6 +1769,7 @@ impl Inner {
     /// The active schema changed: every subscription re-runs and restates
     /// its rows (a reset), since their shape may have changed.
     pub(super) fn reset_everything(&mut self) {
+        super::clear_check_plans();
         self.refresh_where(|_| true, true);
     }
 
@@ -1364,6 +1834,10 @@ impl Inner {
             group.watches = watches;
             group.evidence = evidence;
             group.correlations = correlations;
+            group.by_root.clear();
+            group.held.clear();
+            group.plans.borrow_mut().1.clear();
+            group.root_plans.borrow_mut().1.clear();
             Self::hold(&mut group);
             if reset {
                 self.reset_group(&mut group);
@@ -1470,6 +1944,99 @@ impl Inner {
     /// rows; one that was full and shrank re-runs, since it never held the
     /// rows after it. `None` when the order cannot be compared from the
     /// rows (then the caller re-runs).
+    /// DRAFT (`JAZZ_X_RPLAN=1`): the re-check statement for `ids` from the
+    /// group's kept plan for their count: compiled once with two sets of
+    /// sentinel ids, kept only when the ids are bound literals at fixed
+    /// positions (the two compiles differ there and nowhere else).
+    fn root_plan(
+        &self,
+        group: &Group,
+        ids: &BTreeSet<RowUuid>,
+        read: &ReadSpec,
+    ) -> Option<Compiled> {
+        let ptr = |schema: &Rc<Schema>| Rc::as_ptr(schema) as *const () as usize;
+        let stamp = RootStamp {
+            schema: group.prepared.schema.as_ref().map_or(0, ptr),
+            current: ptr(&self.schema),
+            owner: ptr(&self.owner),
+            withheld: self.withheld.get(),
+            settled_only: read.settled_only,
+            include_deleted: read.include_deleted,
+        };
+        let n = ids.len();
+        {
+            let mut plans = group.root_plans.borrow_mut();
+            if plans.0 != Some(stamp) {
+                plans.0 = Some(stamp);
+                plans.1.clear();
+            }
+        }
+        let kept = group.root_plans.borrow().1.get(&n).cloned();
+        let kept = match kept {
+            Some(kept) => {
+                rplan_stat(|st| st.rplan_hit += 1);
+                kept
+            }
+            None => {
+                let built = self.build_root_plan(group, n, read);
+                rplan_stat(|st| {
+                    st.rplan_miss += 1;
+                    st.rplan_refused += u64::from(built.is_none());
+                });
+                group.root_plans.borrow_mut().1.insert(n, built.clone());
+                built
+            }
+        };
+        let (mut compiled, slots) = kept?;
+        for (slot, id) in slots.iter().zip(ids) {
+            compiled.params[*slot] = Sql::Blob(id.0.as_bytes().to_vec());
+        }
+        Some(compiled)
+    }
+
+    fn build_root_plan(
+        &self,
+        group: &Group,
+        n: usize,
+        read: &ReadSpec,
+    ) -> Option<(Compiled, Vec<usize>)> {
+        let sentinels = |tag: u8| -> Vec<[u8; 16]> {
+            (0..n)
+                .map(|k| {
+                    let mut id = [tag; 16];
+                    id[8..].copy_from_slice(&(k as u64).to_be_bytes());
+                    id
+                })
+                .collect()
+        };
+        let compile = |ids: &[[u8; 16]]| {
+            let mut prepared = group.prepared.clone();
+            prepared.query.filters.push(crate::query::Predicate::In(
+                crate::query::Operand::Column("id".to_owned()),
+                ids.iter()
+                    .map(|id| crate::query::Operand::Literal(Value::Uuid(uuid::Uuid::from_bytes(*id))))
+                    .collect(),
+            ));
+            prepared.query.order_by.clear();
+            prepared.query.limit = None;
+            self.compile(&prepared, group.identity, read).ok()
+        };
+        let (a, b) = (sentinels(0xa5), sentinels(0x5a));
+        let (plan_a, plan_b) = (compile(&a)?, compile(&b)?);
+        if plan_a.sql != plan_b.sql || plan_a.params.len() != plan_b.params.len() {
+            return None;
+        }
+        let slots: Vec<usize> = (0..plan_a.params.len())
+            .filter(|at| plan_a.params[*at] != plan_b.params[*at])
+            .collect();
+        let bound = slots.len() == n
+            && slots.iter().enumerate().all(|(k, at)| {
+                plan_a.params[*at] == Sql::Blob(a[k].to_vec())
+                    && plan_b.params[*at] == Sql::Blob(b[k].to_vec())
+            });
+        bound.then_some((plan_a, slots))
+    }
+
     fn recheck_rows(
         &self,
         group: &mut Group,
@@ -1504,11 +2071,38 @@ impl Inner {
         if cut_of(&read) != group.applied {
             return None;
         }
-        let narrowed = match self.compile(&prepared, group.identity, &read) {
-            Ok(compiled) => compiled,
-            Err(error) => return Some(Err(error)),
+        let planned = if x_rplan() && read.view.is_none() && read.cut.is_none() {
+            self.root_plan(group, ids, &read)
+        } else {
+            None
+        };
+        let narrowed = match planned {
+            Some(compiled) => {
+                if x_rplan_shadow() {
+                    let fresh = self.compile(&prepared, group.identity, &read).ok();
+                    let same = fresh.as_ref().is_some_and(|fresh| {
+                        fresh.sql == compiled.sql && fresh.params == compiled.params
+                    });
+                    rplan_stat(|st| st.rplan_mismatch += u64::from(!same));
+                    if !same && shadow_panics() {
+                        panic!("[rplan-shadow] kept root plan differs on {}", group.root);
+                    }
+                }
+                compiled
+            }
+            None => match self.compile(&prepared, group.identity, &read) {
+                Ok(compiled) => compiled,
+                Err(error) => return Some(Err(error)),
+            },
         };
         let fresh = match self.execute(&narrowed, &group.prepared.query.table) {
+            Ok(rows) => rows,
+            Err(error) => return Some(Err(error)),
+        };
+        // Relations of the changed roots only; the others' are unchanged.
+        let fresh = match crate::db::with_plans(&group.plans, || {
+            self.nest_relations(&group.prepared, group.identity, &read, fresh)
+        }) {
             Ok(rows) => rows,
             Err(error) => return Some(Err(error)),
         };
@@ -1802,7 +2396,9 @@ impl Inner {
         let read = self.visible_read(&group.read, &group.tables);
         group.applied = cut_of(&read);
         let rows = self.run(&group.prepared, group.identity, &read)?;
-        self.nest_relations(&group.prepared, group.identity, &read, rows)
+        crate::db::with_plans(&group.plans, || {
+            self.nest_relations(&group.prepared, group.identity, &read, rows)
+        })
     }
 
     /// Re-run the live results whose cut moved: their read's settle rose,
@@ -1970,14 +2566,24 @@ impl Inner {
         } else {
             group.rows.iter().map(|row| (row.id, row.clone())).collect()
         };
-        if let Some(ids) = ids.filter(|_| group.recheck) {
+        if let Some(ids) = ids.filter(|_| group.rechecks()) {
+            let relations = !group.prepared.query.array_subqueries.is_empty();
             match self.recheck_rows(group, ids) {
                 Some(Ok(Some(mut event))) => {
                     self.add_splices(group, &prior, &mut event);
                     group.push(event);
+                    if relations {
+                        Self::hold(group);
+                        shadow_compare(self, group, "recheck", recheck_relations_shadow());
+                    }
                     return false;
                 }
-                Some(Ok(None)) => return false,
+                Some(Ok(None)) => {
+                    if relations {
+                        shadow_compare(self, group, "recheck", recheck_relations_shadow());
+                    }
+                    return false;
+                }
                 // Missing chunks: the full run below decides to wait.
                 Some(Err(error)) if crate::large::is_missing(&error) => {}
                 Some(Err(error)) => {
@@ -2021,6 +2627,188 @@ impl Inner {
         Self::hold(group);
         group.keys.clear();
         self.read_keys(group);
+        true
+    }
+
+    /// DRAFT (`JAZZ_RENEST=1`): refresh a group woken only through
+    /// correlated relations by nesting the relations again for the root
+    /// rows whose subtree holds a matched parent or row. A `Related` table
+    /// is read only through optional relations, so the roots, their cells
+    /// and their order are unchanged. False: undecided, re-run instead.
+    fn renest(&self, group: &mut Group, hits: &[(usize, Hit)]) -> bool {
+        if group.awaiting || group.prepared.query.array_subqueries.is_empty() {
+            return false;
+        }
+        let read = self.visible_read(&group.read, &group.tables);
+        if cut_of(&read) != group.applied {
+            return false;
+        }
+        let mut affected = Vec::new();
+        for (index, row) in group.rows.iter().enumerate() {
+            let mut hit_any = false;
+            for (level, hit) in hits {
+                let Some(level) = group.correlations.get(*level) else {
+                    return false;
+                };
+                match root_hit(level, row, hit) {
+                    None => return false,
+                    Some(true) => {
+                        hit_any = true;
+                        break;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if hit_any {
+                affected.push(index);
+            }
+        }
+        if affected.is_empty() {
+            return false;
+        }
+        let relations: HashSet<&str> = group
+            .prepared
+            .query
+            .array_subqueries
+            .iter()
+            .map(|array| array.column_name.as_str())
+            .collect();
+        let bare: Vec<CurrentRow> = affected
+            .iter()
+            .map(|index| {
+                let row = &group.rows[*index];
+                let (cells, types): (Vec<_>, Vec<_>) = row
+                    .cells
+                    .iter()
+                    .zip(row.types.iter())
+                    .filter(|((name, _), _)| !relations.contains(name.as_str()))
+                    .map(|(cell, ty)| (cell.clone(), ty.clone()))
+                    .unzip();
+                CurrentRow {
+                    cells: Arc::new(cells),
+                    types: types.into(),
+                    ..row.clone()
+                }
+            })
+            .collect();
+        // DRAFT (`JAZZ_X_SCOPE=1`): only the top-level relations a hit's
+        // path starts with can have changed; the others keep their cells.
+        // DRAFT (`JAZZ_X_DEEP=1`): down the whole hit path, keeping the
+        // sibling relations of each level on it from the old row.
+        let scope: Option<BTreeMap<String, ScopeNode>> = x_scope()
+            .then(|| {
+                let mut tree = BTreeMap::new();
+                for (level, _) in hits {
+                    if let Some(level) = group.correlations.get(*level) {
+                        let depth = if x_deep() { level.path.len() } else { 1 };
+                        scope_insert(&mut tree, &level.path[..depth.min(level.path.len())]);
+                    }
+                }
+                tree
+            })
+            .and_then(|tree| scope_normalize(&group.prepared.query.array_subqueries, tree))
+            .filter(|tree| {
+                tree.len() < relations.len()
+                    || tree.values().any(|node| matches!(node, ScopeNode::Part(_)))
+            });
+        let nested = match &scope {
+            None => crate::db::with_plans(&group.plans, || {
+                self.nest_relations(&group.prepared, group.identity, &read, bare)
+            }),
+            Some(scope) => {
+                let mut scoped = group.prepared.clone();
+                scoped.query.array_subqueries =
+                    scope_prune(&group.prepared.query.array_subqueries, scope);
+                crate::db::with_plans(&group.plans, || {
+                    self.nest_relations(&scoped, group.identity, &read, bare)
+                })
+            }
+        };
+        let Ok(nested) = nested else {
+            return false;
+        };
+        if nested.len() != affected.len() {
+            return false;
+        }
+        // The old row with the scoped relations' cells replaced in place.
+        let nested: Vec<CurrentRow> = match &scope {
+            None => nested,
+            Some(scope) => {
+                let mut merged = Vec::with_capacity(nested.len());
+                for (index, fresh) in affected.iter().zip(nested) {
+                    let old = &group.rows[*index];
+                    let mut cells = (*old.cells).clone();
+                    let mut types = old.types.to_vec();
+                    for (name, node) in scope {
+                        let Some(from) = fresh.cells.iter().rposition(|(n, _)| n == name) else {
+                            return false;
+                        };
+                        let Some(to) = cells.iter().rposition(|(n, _)| n == name) else {
+                            return false;
+                        };
+                        match node {
+                            ScopeNode::Whole => {
+                                cells[to] = fresh.cells[from].clone();
+                                types[to] = fresh.types[from].clone();
+                            }
+                            ScopeNode::Part(sub) => {
+                                let (Some(old_value), Some(fresh_value)) =
+                                    (&cells[to].1, &fresh.cells[from].1)
+                                else {
+                                    return false;
+                                };
+                                let Some((value, ty)) = merge_relation(
+                                    old_value,
+                                    &types[to],
+                                    fresh_value,
+                                    &fresh.types[from],
+                                    sub,
+                                ) else {
+                                    return false;
+                                };
+                                cells[to].1 = Some(value);
+                                types[to] = ty;
+                            }
+                        }
+                    }
+                    merged.push(CurrentRow {
+                        cells: Arc::new(cells),
+                        types: types.into(),
+                        ..fresh
+                    });
+                }
+                merged
+            }
+        };
+        let prior: HashMap<RowUuid, CurrentRow> = if group.key.splices.is_empty() {
+            HashMap::new()
+        } else {
+            affected
+                .iter()
+                .map(|index| (group.rows[*index].id, group.rows[*index].clone()))
+                .collect()
+        };
+        let mut updated = Vec::new();
+        for (index, row) in affected.into_iter().zip(nested) {
+            if row.id != group.rows[index].id {
+                return false;
+            }
+            if row.cells != group.rows[index].cells {
+                updated.push(SubscriptionOutputRow {
+                    row: row.clone(),
+                    previous_index: Some(index),
+                    index,
+                    splices: Vec::new(),
+                });
+            }
+            group.rows[index] = row;
+        }
+        if !updated.is_empty() {
+            let mut event = delta(false, Vec::new(), updated, Vec::new());
+            self.add_splices(group, &prior, &mut event);
+            group.push(event);
+        }
+        Self::hold(group);
         true
     }
 
@@ -2068,6 +2856,21 @@ fn refresh_includes(group: &mut Group, changed: &BTreeSet<(String, RowUuid)>) {
 }
 
 impl Group {
+    /// Whether a root-only wake may be applied by re-checking its ids.
+    /// DRAFT (`JAZZ_RECHECK_RELATIONS`): with relations, a root row's write
+    /// may change another root row's relation cells (a relation over the
+    /// root table itself, or a policy of a relation reading it). That is
+    /// only seen when every root-table write is filtered by correlation or
+    /// evidence; a whole-table root watch reports it as a root-only wake,
+    /// which a recheck by id would miss. Read from the CURRENT watches:
+    /// `refresh_where` rebuilds them (and may widen the root to the whole
+    /// table) for a live group.
+    fn rechecks(&self) -> bool {
+        self.recheck
+            && (self.prepared.query.array_subqueries.is_empty()
+                || !self.watches.contains(&Watch::Table(self.root.clone())))
+    }
+
     fn push(&mut self, event: SubscriptionEvent) {
         self.members.retain(|m| m.queue.strong_count() > 0);
         for member in &self.members {
@@ -2109,6 +2912,602 @@ impl Group {
 /// read is one), whose compiled SQL
 /// reads its root table exactly once (a read policy that looks at other
 /// rows of the same table would let one row's change move another).
+/// DRAFT (`JAZZ_RECHECK_RELATIONS=1`): a group with array relations also
+/// re-checks root-only wakes by id. Optional relations do not filter roots
+/// (they are not in the root SQL, see `Ctx::array_requirements`), and a
+/// change to any relation table wakes the group with `None` (a full run), so
+/// only the changed roots' rows and their own relations can differ.
+fn recheck_relations() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_RECHECK_RELATIONS").as_deref() == Ok("1"))
+}
+
+/// DRAFT: compare every relation re-check with a full run, counting
+/// mismatches (`JAZZ_RECHECK_RELATIONS_SHADOW=1`).
+fn recheck_relations_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_RECHECK_RELATIONS_SHADOW").as_deref() == Ok("1"))
+}
+
+/// DRAFT: refresh correlation-only wakes by nesting the affected roots'
+/// relations again (`JAZZ_RENEST=1`).
+fn renest_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_RENEST").as_deref() == Ok("1"))
+}
+
+/// DRAFT: re-nest only the top-level relations a hit's path starts with
+/// (`JAZZ_X_SCOPE=1`).
+fn x_scope() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_SCOPE").as_deref() == Ok("1"))
+}
+
+/// DRAFT: re-check an updated held root row and re-nest only where a
+/// relation level holds it, instead of a full run (`JAZZ_X_SELFHIT=1`).
+fn x_selfhit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_SELFHIT").as_deref() == Ok("1"))
+}
+
+/// DRAFT: a shadow mismatch panics in test builds (`JAZZ_SHADOW_PANIC=1`).
+fn shadow_panics() -> bool {
+    cfg!(any(test, feature = "testing")) && {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1"))
+    }
+}
+
+/// DRAFT (`JAZZ_X_RPLAN=1`): what a kept re-check root plan was compiled
+/// under: the group's schema view, the store's current and owner schemas
+/// (identity is the group's own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootStamp {
+    schema: usize,
+    current: usize,
+    owner: usize,
+    withheld: bool,
+    settled_only: bool,
+    include_deleted: bool,
+}
+
+fn x_rplan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_RPLAN").as_deref() == Ok("1"))
+}
+
+fn x_rplan_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_RPLAN_SHADOW").as_deref() == Ok("1"))
+}
+
+fn rplan_stat(f: impl FnOnce(&mut fan_stats::Stats)) {
+    if fan_stats::on() {
+        fan_stats::S.with(|st| f(&mut st.borrow_mut()));
+    }
+}
+
+/// DRAFT: keep each root row's share of `held` (`JAZZ_X_HOLD=1`).
+fn x_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_HOLD").as_deref() == Ok("1"))
+}
+
+/// DRAFT: compare the kept `held` with a full one (`JAZZ_X_HOLD_SHADOW=1`).
+fn x_hold_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_HOLD_SHADOW").as_deref() == Ok("1"))
+}
+
+/// DRAFT: scope a re-nest down the whole hit path (`JAZZ_X_DEEP=1`).
+fn x_deep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_DEEP").as_deref() == Ok("1"))
+}
+
+/// What a scoped re-nest reads again under one relation: all of it, or
+/// only the named nested relations (the others keep their old cells).
+#[derive(Clone, Debug)]
+enum ScopeNode {
+    Whole,
+    Part(BTreeMap<String, ScopeNode>),
+}
+
+/// Add the relation path `path` (root first) to `tree`: its last relation
+/// is read again whole; the ones above it only in part.
+fn scope_insert(tree: &mut BTreeMap<String, ScopeNode>, path: &[String]) {
+    let Some((first, rest)) = path.split_first() else {
+        return;
+    };
+    if rest.is_empty() {
+        tree.insert(first.clone(), ScopeNode::Whole);
+        return;
+    }
+    match tree.entry(first.clone()).or_insert_with(|| ScopeNode::Part(BTreeMap::new())) {
+        ScopeNode::Whole => {}
+        ScopeNode::Part(sub) => scope_insert(sub, rest),
+    }
+}
+
+/// `tree` checked against the query's relations: `None` when it names
+/// one the query has not; a level whose dropped siblings could filter its
+/// rows (a required relation) is read whole.
+fn scope_normalize(
+    arrays: &[crate::query::ArraySubquery],
+    tree: BTreeMap<String, ScopeNode>,
+) -> Option<BTreeMap<String, ScopeNode>> {
+    let mut out = BTreeMap::new();
+    for (name, node) in tree {
+        let array = arrays.iter().find(|array| array.column_name == name)?;
+        let node = match node {
+            ScopeNode::Whole => ScopeNode::Whole,
+            ScopeNode::Part(sub) => {
+                let filters = array.nested_arrays.iter().any(|nested| {
+                    !sub.contains_key(&nested.column_name)
+                        && nested.requirement != crate::query::ArraySubqueryRequirement::Optional
+                });
+                if filters {
+                    ScopeNode::Whole
+                } else {
+                    ScopeNode::Part(scope_normalize(&array.nested_arrays, sub)?)
+                }
+            }
+        };
+        out.insert(name, node);
+    }
+    Some(out)
+}
+
+/// The relations of `arrays` that `tree` reads again, nested ones pruned
+/// the same way.
+fn scope_prune(
+    arrays: &[crate::query::ArraySubquery],
+    tree: &BTreeMap<String, ScopeNode>,
+) -> Vec<crate::query::ArraySubquery> {
+    arrays
+        .iter()
+        .filter_map(|array| {
+            let node = tree.get(&array.column_name)?;
+            let mut array = array.clone();
+            if let ScopeNode::Part(sub) = node {
+                array.nested_arrays = scope_prune(&array.nested_arrays, sub);
+            }
+            Some(array)
+        })
+        .collect()
+}
+
+/// A relation cell (an array of records) with the relations `tree` names
+/// taken from `fresh` (read with only those) and every other field kept
+/// from `old`, re-encoded under the descriptor a full run would build;
+/// `None` when the two do not line up row for row.
+fn merge_relation(
+    old: &Value,
+    old_ty: &ValueType,
+    fresh: &Value,
+    fresh_ty: &ValueType,
+    tree: &BTreeMap<String, ScopeNode>,
+) -> Option<(Value, ValueType)> {
+    use crate::records::{DescriptorField, OwnedRecord, RecordDescriptor};
+    let (Value::Array(olds), Value::Array(freshs)) = (old, fresh) else {
+        return None;
+    };
+    if olds.len() != freshs.len() {
+        return None;
+    }
+    if olds.is_empty() {
+        return Some((old.clone(), old_ty.clone()));
+    }
+    let (ValueType::Array(old_element), ValueType::Array(fresh_element)) = (old_ty, fresh_ty) else {
+        return None;
+    };
+    let (ValueType::Record(old_desc), ValueType::Record(fresh_desc)) =
+        (old_element.as_ref(), fresh_element.as_ref())
+    else {
+        return None;
+    };
+    let old_fields = old_desc.fields();
+    let fresh_fields = fresh_desc.fields();
+    // Relations are appended after the row's own cells: the last match.
+    let position = |fields: &[DescriptorField], name: &str| {
+        fields.iter().rposition(|field| field.name.as_deref() == Some(name))
+    };
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(olds.len());
+    let mut replaced: BTreeMap<usize, Vec<(ValueType, bool)>> = BTreeMap::new();
+    for (old, fresh) in olds.iter().zip(freshs) {
+        let (Value::Record(old), Value::Record(fresh)) = (old, fresh) else {
+            return None;
+        };
+        let mut values = old.to_values().ok()?;
+        let fresh_values = fresh.to_values().ok()?;
+        if values.first() != fresh_values.first() {
+            return None;
+        }
+        for (name, node) in tree {
+            let at = position(old_fields, name)?;
+            let from = position(fresh_fields, name)?;
+            let (value, ty) = match node {
+                ScopeNode::Whole => (
+                    fresh_values.get(from)?.clone(),
+                    fresh_fields[from].value_type.clone(),
+                ),
+                ScopeNode::Part(sub) => merge_relation(
+                    values.get(at)?,
+                    &old_fields[at].value_type,
+                    fresh_values.get(from)?,
+                    &fresh_fields[from].value_type,
+                    sub,
+                )?,
+            };
+            let filled = matches!(&value, Value::Array(items) if !items.is_empty());
+            replaced.entry(at).or_default().push((ty, filled));
+            values[at] = value;
+        }
+        rows.push(values);
+    }
+    let mut fields: Vec<DescriptorField> = old_fields.to_vec();
+    for (at, types) in replaced {
+        // A nested relation's type is its non-empty siblings' widest.
+        let mut shared: Option<ValueType> = None;
+        for (ty, filled) in &types {
+            if *filled {
+                shared = Some(match shared {
+                    None => ty.clone(),
+                    Some(other) => crate::values::widen(&other, ty).ok()?,
+                });
+            }
+        }
+        fields[at].value_type = shared.unwrap_or_else(|| types[0].0.clone());
+    }
+    let descriptor = RecordDescriptor::new_with_fields(fields.clone());
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let record = row
+            .iter()
+            .zip(&fields)
+            .map(|(value, field)| crate::values::coerce(value, &field.value_type))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let raw = descriptor.create(&record).ok()?;
+        values.push(Value::Record(OwnedRecord::new(raw, descriptor.clone())));
+    }
+    Some((
+        Value::Array(values),
+        ValueType::Array(Box::new(ValueType::Record(Box::new(descriptor)))),
+    ))
+}
+
+/// DRAFT: compare every re-nest with a full run (`JAZZ_RENEST_SHADOW=1`).
+fn renest_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_RENEST_SHADOW").as_deref() == Ok("1"))
+}
+
+/// What matched at one correlation level: the held row, and the held
+/// parents' `outer` atoms the row's old or new `inner` names.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Hit {
+    row: Option<RowUuid>,
+    atoms: HashSet<String>,
+}
+
+/// DRAFT (`JAZZ_X_HITS=1`): one changed row's atoms, derived once per
+/// change and shared by every related group instead of per group and level.
+struct ChangeAtoms<'a> {
+    row: RowUuid,
+    images: Option<&'a [Vec<(String, Sql)>]>,
+    id: std::cell::OnceCell<String>,
+    columns: RefCell<HashMap<(String, bool), Option<std::rc::Rc<Vec<String>>>>>,
+}
+
+impl<'a> ChangeAtoms<'a> {
+    fn new(row: RowUuid, images: Option<&'a [Vec<(String, Sql)>]>) -> Self {
+        Self {
+            row,
+            images,
+            id: std::cell::OnceCell::new(),
+            columns: RefCell::default(),
+        }
+    }
+
+    fn id(&self) -> &str {
+        self.id
+            .get_or_init(|| canon(&Sql::Blob(self.row.0.as_bytes().to_vec())))
+    }
+
+    /// The atoms of `column` in every image; `None` when the images or a
+    /// cell cannot be read.
+    fn column(&self, column: &str, list: bool) -> Option<std::rc::Rc<Vec<String>>> {
+        let images = self.images?;
+        let key = (column.to_owned(), list);
+        if let Some(known) = self.columns.borrow().get(&key) {
+            return known.clone();
+        }
+        let built = (|| {
+            let mut atoms = Vec::new();
+            for image in images {
+                for (_, cell) in image.iter().filter(|(name, _)| name == column) {
+                    atoms.extend(stored_atoms(cell, list)?);
+                }
+            }
+            Some(std::rc::Rc::new(atoms))
+        })();
+        self.columns.borrow_mut().insert(key, built.clone());
+        built
+    }
+}
+
+fn x_hits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_HITS").as_deref() == Ok("1"))
+}
+
+fn x_hits_shadow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("JAZZ_X_HITS_SHADOW").as_deref() == Ok("1"))
+}
+
+fn hits_mismatch(what: &str, table: &str) {
+    thread_local! {
+        static BAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let bad = BAD.with(|bad| {
+        bad.set(bad.get() + 1);
+        bad.get()
+    });
+    eprintln!("[hits-shadow] {what} mismatch on {table} mismatches={bad}");
+    if shadow_panics() {
+        panic!("[hits-shadow] {what} mismatch on {table}");
+    }
+}
+
+/// [`correlated_hits`] or, under `JAZZ_X_HITS`, its form over `atoms`.
+fn hits_of(
+    group: &Group,
+    table: &str,
+    atoms: &ChangeAtoms<'_>,
+    root_shortcut: bool,
+) -> Option<Vec<(usize, Hit)>> {
+    if !x_hits() {
+        return correlated_hits(group, table, atoms.row, atoms.images, root_shortcut);
+    }
+    let hits = correlated_hits_x(group, table, atoms, root_shortcut);
+    if x_hits_shadow()
+        && correlated_hits(group, table, atoms.row, atoms.images, root_shortcut) != hits
+    {
+        hits_mismatch("hits", table);
+    }
+    hits
+}
+
+/// [`correlated`] or, under `JAZZ_X_HITS`, its form over `atoms`.
+fn correlated_of(group: &Group, table: &str, atoms: &ChangeAtoms<'_>) -> bool {
+    if !x_hits() {
+        return correlated(group, table, atoms.row, atoms.images);
+    }
+    let hit = correlated_x(group, table, atoms);
+    if x_hits_shadow() && correlated(group, table, atoms.row, atoms.images) != hit {
+        hits_mismatch("correlated", table);
+    }
+    hit
+}
+
+fn correlated_hits_x(
+    group: &Group,
+    table: &str,
+    atoms: &ChangeAtoms<'_>,
+    root_shortcut: bool,
+) -> Option<Vec<(usize, Hit)>> {
+    let row = atoms.row;
+    if group.awaiting
+        || (root_shortcut
+            && group.root == table
+            && group
+                .root_held
+                .as_ref()
+                .is_some_and(|held| held.contains(&row)))
+    {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for (index, (level, held)) in group.correlations.iter().zip(&group.held).enumerate() {
+        if level.table != table {
+            continue;
+        }
+        if !held.complete() {
+            return None;
+        }
+        let mut hit = Hit {
+            row: held.rows.contains_key(&row).then_some(row),
+            atoms: HashSet::new(),
+        };
+        if level.inner == "id" {
+            let atom = atoms.id();
+            if held.parents.contains_key(atom) {
+                hit.atoms.insert(atom.to_owned());
+            }
+        } else {
+            for atom in atoms.column(&level.inner, level.inner_list)?.iter() {
+                if held.parents.contains_key(atom) {
+                    hit.atoms.insert(atom.clone());
+                }
+            }
+        }
+        if hit.row.is_some() || !hit.atoms.is_empty() {
+            hits.push((index, hit));
+        }
+    }
+    Some(hits)
+}
+
+fn correlated_x(group: &Group, table: &str, atoms: &ChangeAtoms<'_>) -> bool {
+    let row = atoms.row;
+    if group.awaiting
+        || (group.root == table
+            && group
+                .root_held
+                .as_ref()
+                .is_some_and(|held| held.contains(&row)))
+    {
+        return true;
+    }
+    group
+        .correlations
+        .iter()
+        .zip(&group.held)
+        .filter(|(level, _)| level.table == table)
+        .any(|(level, held)| {
+            if !held.complete() || held.rows.contains_key(&row) {
+                return true;
+            }
+            if level.inner == "id" {
+                return held.parents.contains_key(atoms.id());
+            }
+            match atoms.column(&level.inner, level.inner_list) {
+                Some(found) => found.iter().any(|atom| held.parents.contains_key(atom)),
+                None => true,
+            }
+        })
+}
+
+/// [`correlated`] with what matched: `None` when only a full run decides
+/// (awaiting, a held root row, an incomplete level, no images), else the
+/// matched levels (empty: no match).
+fn correlated_hits(
+    group: &Group,
+    table: &str,
+    row: RowUuid,
+    images: Option<&[Vec<(String, Sql)>]>,
+    root_shortcut: bool,
+) -> Option<Vec<(usize, Hit)>> {
+    if group.awaiting
+        || (root_shortcut
+            && group.root == table
+            && group
+                .root_held
+                .as_ref()
+                .is_some_and(|held| held.contains(&row)))
+    {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for (index, (level, held)) in group.correlations.iter().zip(&group.held).enumerate() {
+        if level.table != table {
+            continue;
+        }
+        if !held.complete() {
+            return None;
+        }
+        let mut hit = Hit {
+            row: held.rows.contains_key(&row).then_some(row),
+            atoms: HashSet::new(),
+        };
+        if level.inner == "id" {
+            let atom = canon(&Sql::Blob(row.0.as_bytes().to_vec()));
+            if held.parents.contains_key(&atom) {
+                hit.atoms.insert(atom);
+            }
+        } else {
+            let images = images?;
+            for image in images {
+                for (_, cell) in image.iter().filter(|(column, _)| *column == level.inner) {
+                    for atom in stored_atoms(cell, level.inner_list)? {
+                        if held.parents.contains_key(&atom) {
+                            hit.atoms.insert(atom);
+                        }
+                    }
+                }
+            }
+        }
+        if hit.row.is_some() || !hit.atoms.is_empty() {
+            hits.push((index, hit));
+        }
+    }
+    Some(hits)
+}
+
+/// Whether `root`'s subtree holds, at `level`, a parent whose `outer`
+/// value is one of `hit`'s atoms or the hit row; `None` when undecided.
+fn root_hit(level: &Correlation, root: &CurrentRow, hit: &Hit) -> Option<bool> {
+    let (last, through) = level.path.split_last()?;
+    let mut parents: Vec<Node> = vec![Node::Row(root)];
+    for column in through {
+        let mut next = Vec::new();
+        for parent in &parents {
+            next.extend(parent.children(column)?);
+        }
+        parents = next;
+    }
+    for parent in &parents {
+        if !hit.atoms.is_empty() {
+            let mut atoms = HashSet::new();
+            if !value_atoms(&parent.value(&level.outer)?, &mut atoms) {
+                return None;
+            }
+            if atoms.iter().any(|atom| hit.atoms.contains(atom)) {
+                return Some(true);
+            }
+        }
+        if let Some(row) = hit.row {
+            for child in parent.children(last)? {
+                if child.id()? == row {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+/// DRAFT shadow: a scoped refresh must leave the rows a full run reads.
+/// Mismatches are counted and printed per `label`.
+fn shadow_compare(fanout: &Inner, group: &mut Group, label: &str, on: bool) {
+    if !on || (group.renest_follows && label == "recheck") {
+        return;
+    }
+    thread_local! {
+        static SEEN: std::cell::RefCell<HashMap<String, (u64, u64, u64)>> = std::cell::RefCell::default();
+    }
+    let read = fanout.visible_read(&group.read, &group.tables);
+    let Ok(rows) = fanout
+        .run(&group.prepared, group.identity, &read)
+        .and_then(|rows| fanout.nest_relations(&group.prepared, group.identity, &read, rows))
+    else {
+        return;
+    };
+    let same = rows.len() == group.rows.len()
+        && rows
+            .iter()
+            .zip(&group.rows)
+            .all(|(a, b)| a.id == b.id && a.cells == b.cells && a.deleted == b.deleted);
+    // The cells' declared types too: an empty relation's type is not in its value.
+    let typed = same && rows.iter().zip(&group.rows).all(|(a, b)| a.types == b.types);
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        let entry = seen.entry(label.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 += u64::from(!same);
+        entry.2 += u64::from(same && !typed);
+        if (!same || !typed) && shadow_panics() {
+            panic!(
+                "[{label}-shadow] mismatch on {} (cells {}, types {}): kept {:?} full {:?}",
+                group.root, !same, !typed, group.rows, rows
+            );
+        }
+        if !same || !typed || entry.0 % 1000 == 0 {
+            eprintln!(
+                "[{label}-shadow] checks={} mismatches={} table={} rows={} full={} type_mismatches={}",
+                entry.0,
+                entry.1,
+                group.root,
+                group.rows.len(),
+                rows.len(),
+                entry.2
+            );
+        }
+    });
+}
+
 fn recheckable(query: &Query, root: &str, read: &ReadSpec, compiled: &Compiled) -> bool {
     !is_history_table(&query.table)
         && query.relation.is_none()
@@ -2118,7 +3517,11 @@ fn recheckable(query: &Query, root: &str, read: &ReadSpec, compiled: &Compiled) 
         && query.flat_join.is_none()
         && query.reachable.is_empty()
         && query.inherits.is_empty()
-        && query.array_subqueries.is_empty()
+        && (query.array_subqueries.is_empty()
+            || (recheck_relations()
+                && query.array_subqueries.iter().all(|array| {
+                    array.requirement == crate::query::ArraySubqueryRequirement::Optional
+                })))
         && query.includes.iter().all(|include| !include.require)
         && read.view.is_none()
         && read.cut.is_none()
@@ -2715,12 +4118,8 @@ impl EvidenceWalk<'_> {
                     return false;
                 };
                 let mut columns = BTreeSet::new();
-                let link = (self.through.is_empty() && table.stored == self.reader).then(|| {
-                    (
-                        table.stored.clone(),
-                        source.stored_name(via_column).to_owned(),
-                    )
-                });
+                let link = (self.through.is_empty() && table.stored == self.reader)
+                    .then(|| (table.stored.clone(), source.stored_name(via_column).to_owned()));
                 column(via_column, &mut columns) && self.inherit(source, *operation, columns, link)
             }
             PolicyExpr::ExistsRel { .. } => false,
@@ -3011,12 +4410,9 @@ impl Node<'_> {
 
 /// What `rows` hold at `level`.
 fn held(level: &Correlation, rows: &[CurrentRow]) -> Held {
-    let mut held = Held {
-        complete: true,
-        ..Held::default()
-    };
+    let mut held = Held::default();
     let Some((last, through)) = level.path.split_last() else {
-        held.complete = false;
+        held.incomplete += 1;
         return held;
     };
     let mut parents: Vec<Node> = rows.iter().map(Node::Row).collect();
@@ -3025,7 +4421,7 @@ fn held(level: &Correlation, rows: &[CurrentRow]) -> Held {
         for parent in &parents {
             match parent.children(column) {
                 Some(children) => next.extend(children),
-                None => held.complete = false,
+                None => held.incomplete += 1,
             }
         }
         parents = next;
@@ -3034,23 +4430,23 @@ fn held(level: &Correlation, rows: &[CurrentRow]) -> Held {
         match parent.value(&level.outer) {
             Some(value) => {
                 if !value_atoms(&value, &mut held.parents) {
-                    held.complete = false;
+                    held.incomplete += 1;
                 }
             }
-            None => held.complete = false,
+            None => held.incomplete += 1,
         }
         match parent.children(last) {
             Some(children) => {
                 for child in children {
                     match child.id() {
                         Some(id) => {
-                            held.rows.insert(id);
+                            *held.rows.entry(id).or_default() += 1;
                         }
-                        None => held.complete = false,
+                        None => held.incomplete += 1,
                     }
                 }
             }
-            None => held.complete = false,
+            None => held.incomplete += 1,
         }
     }
     held
@@ -3058,14 +4454,14 @@ fn held(level: &Correlation, rows: &[CurrentRow]) -> Held {
 
 /// Add a reference value's canonical stored forms (one per list element)
 /// to `out`; false when one has none.
-fn value_atoms(value: &Value, out: &mut HashSet<String>) -> bool {
+fn value_atoms(value: &Value, out: &mut impl AtomSink) -> bool {
     match value {
         Value::Nullable(None) => true,
         Value::Nullable(Some(inner)) => value_atoms(inner, out),
         Value::Array(items) => items.iter().all(|item| value_atoms(item, out)),
         value => match canon_value(value) {
             Some(atom) => {
-                out.insert(atom);
+                out.put(atom);
                 true
             }
             None => false,
@@ -3170,17 +4566,10 @@ fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>])
         .iter()
         .zip(&group.held)
         .filter(|(level, _)| level.table == *reader)
-        .map(|(level, held)| (level.inner == "id" && held.complete).then_some(held))
+        .map(|(level, held)| (level.inner == "id" && held.complete()).then_some(held))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
-    if levels.is_empty()
-        || levels.len()
-            != group
-                .correlations
-                .iter()
-                .filter(|l| l.table == *reader)
-                .count()
-    {
+    if levels.is_empty() || levels.len() != group.correlations.iter().filter(|l| l.table == *reader).count() {
         return true;
     }
     images.iter().any(|image| {
@@ -3188,14 +4577,10 @@ fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>])
             .iter()
             .filter(|(column, _)| column == via)
             .any(|(_, cell)| match stored_atoms(cell, false) {
-                Some(atoms) => atoms
-                    .iter()
-                    .any(|atom| levels.iter().any(|held| held.parents.contains(atom))),
+                Some(atoms) => atoms.iter().any(|atom| levels.iter().any(|held| held.parents.contains_key(atom))),
                 None => true,
             })
-    }) || !images
-        .iter()
-        .any(|image| image.iter().any(|(column, _)| column == via))
+    }) || !images.iter().any(|image| image.iter().any(|(column, _)| column == via))
 }
 
 fn policy_filter_enabled() -> bool {
@@ -3224,13 +4609,13 @@ fn correlated(
         .zip(&group.held)
         .filter(|(level, _)| level.table == table)
         .any(|(level, held)| {
-            if !held.complete || held.rows.contains(&row) {
+            if !held.complete() || held.rows.contains_key(&row) {
                 return true;
             }
             if level.inner == "id" {
                 return held
                     .parents
-                    .contains(&canon(&Sql::Blob(row.0.as_bytes().to_vec())));
+                    .contains_key(&canon(&Sql::Blob(row.0.as_bytes().to_vec())));
             }
             let Some(images) = images else {
                 return true;
@@ -3240,7 +4625,7 @@ fn correlated(
                     .iter()
                     .filter(|(column, _)| *column == level.inner)
                     .any(|(_, cell)| match stored_atoms(cell, level.inner_list) {
-                        Some(atoms) => atoms.iter().any(|atom| held.parents.contains(atom)),
+                        Some(atoms) => atoms.iter().any(|atom| held.parents.contains_key(atom)),
                         None => true,
                     })
             })
