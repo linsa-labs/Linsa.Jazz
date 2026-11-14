@@ -88,6 +88,12 @@ pub trait HostTables {
     /// created by `f` itself), which plain key-value pairs would hide from
     /// SQL.
     fn host_sql(&self, f: &mut dyn FnMut(&Connection) -> Result<(), Error>) -> Result<(), Error>;
+    /// DRAFT (group commit): switch the connection's `synchronous` between
+    /// `FULL` and `NORMAL`, outside any transaction. Host writes run at
+    /// `FULL` while the runtime's commits share one sync per tick.
+    fn host_synchronous_full(&self, _full: bool) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// Turn on SQLite's query planner stability guarantee
@@ -290,6 +296,10 @@ fn uri_flags() -> rusqlite::OpenFlags {
 }
 
 impl HostTables for StoreFile {
+    fn host_synchronous_full(&self, full: bool) -> Result<(), Error> {
+        set_synchronous(&self.conn, full)
+    }
+
     fn host_get(&self, table: HostTable, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         get(&self.conn, table, key)
     }
@@ -330,7 +340,21 @@ impl HostTables for StoreFile {
     }
 }
 
+/// DRAFT (group commit): see [`HostTables::host_synchronous_full`].
+fn set_synchronous(conn: &Connection, full: bool) -> Result<(), Error> {
+    conn.execute_batch(if full {
+        "PRAGMA synchronous = FULL"
+    } else {
+        "PRAGMA synchronous = NORMAL"
+    })
+    .map_err(storage)
+}
+
 impl HostTables for Db {
+    fn host_synchronous_full(&self, full: bool) -> Result<(), Error> {
+        self.with_host_connection(|conn| set_synchronous(conn, full))
+    }
+
     fn host_get(&self, table: HostTable, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.with_host_connection(|conn| get(conn, table, key))
     }

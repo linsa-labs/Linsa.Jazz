@@ -204,6 +204,211 @@ fn slow_query_threshold() -> Option<Duration> {
     }
 }
 
+/// Group commit: a file store's commits run at `synchronous = NORMAL`, and
+/// the owner fdatasyncs the WAL once per tick, before any of that tick's
+/// output leaves the store thread (see [`StoreOptions::group_commit`]).
+pub(crate) mod group_commit {
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// `JAZZ_GROUP_COMMIT=1`.
+    pub(crate) fn from_env() -> bool {
+        std::env::var("JAZZ_GROUP_COMMIT").is_ok_and(|v| v == "1")
+    }
+
+    /// Switch `tables`' connection to FULL (or back to NORMAL) when `group`
+    /// is on; a switch that fails leaves durability unknown: stop.
+    pub(super) fn full(group: bool, tables: &dyn jazz::host::HostTables, on: bool) {
+        if group && let Err(error) = tables.host_synchronous_full(on) {
+            eprintln!("group commit: switching synchronous failed, aborting: {error}");
+            std::process::abort();
+        }
+    }
+
+    /// Make the directory entry of the store's file durable.
+    pub(super) fn sync_dir(db: &Path) {
+        if let Some(dir) = db.parent()
+            && let Ok(dir) = File::open(dir)
+        {
+            let _ = dir.sync_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) mod tests {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicU64;
+        use std::sync::{Arc, Mutex};
+
+        /// Tests: a store directory whose next runtime's sync at open fails,
+        /// with the counter that takes the fail-stop's place.
+        pub(crate) static OPEN_FAULTS: Mutex<Option<HashMap<PathBuf, Arc<AtomicU64>>>> =
+            Mutex::new(None);
+
+        /// Tests: the next runtime opened on the store in `dir` fails its
+        /// sync at open; the returned counter counts the fail-stop.
+        pub(crate) fn fail_open_sync(dir: &std::path::Path) -> Arc<AtomicU64> {
+            let stops = Arc::new(AtomicU64::new(0));
+            OPEN_FAULTS
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(dir.to_path_buf(), Arc::clone(&stops));
+            stops
+        }
+    }
+
+    /// The WAL of one runtime: opened with it, so a reopened store syncs
+    /// the file it writes.
+    pub(super) struct Wal {
+        path: PathBuf,
+        file: Option<File>,
+        ticks: u64,
+        syncs: u64,
+        skipped: u64,
+        spent: Duration,
+        worst: Duration,
+        since: Option<Instant>,
+        /// Tests: syncs so far, never reset.
+        #[cfg(test)]
+        pub(super) total_syncs: u64,
+        /// Tests: the next sync fails.
+        #[cfg(test)]
+        pub(super) fail_next: bool,
+        /// Tests: counts fail-stops instead of aborting.
+        #[cfg(test)]
+        pub(super) stops: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    }
+
+    impl Wal {
+        /// The WAL of the store at `db`.
+        pub(super) fn new(db: &Path) -> Self {
+            let mut path = db.as_os_str().to_owned();
+            path.push("-wal");
+            #[cfg(test)]
+            let seed = db
+                .parent()
+                .and_then(|dir| tests::OPEN_FAULTS.lock().unwrap().as_mut()?.remove(dir));
+            Self {
+                path: PathBuf::from(path),
+                file: None,
+                ticks: 0,
+                syncs: 0,
+                skipped: 0,
+                spent: Duration::ZERO,
+                worst: Duration::ZERO,
+                since: None,
+                #[cfg(test)]
+                total_syncs: 0,
+                #[cfg(test)]
+                fail_next: seed.is_some(),
+                #[cfg(test)]
+                stops: seed,
+            }
+        }
+
+        /// Make every frame written so far durable. Err: the store must
+        /// fail-stop ([`Self::fail_stop`]).
+        pub(super) fn sync(&mut self) -> std::io::Result<()> {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next) {
+                return Err(std::io::Error::other("injected WAL sync failure"));
+            }
+            self.ticks += 1;
+            if self.file.is_none() {
+                match File::open(&self.path) {
+                    Ok(file) => {
+                        self.file = Some(file);
+                        if let Some(dir) = self.path.parent()
+                            && let Ok(dir) = File::open(dir)
+                        {
+                            dir.sync_all()?;
+                        }
+                    }
+                    // No WAL yet: nothing was committed through it.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Every tick: no cheap witness proves the WAL unchanged (a
+            // restarted WAL overwrites frames inside its length, and mtime
+            // has jiffy granularity).
+            let file = self.file.as_ref().expect("opened");
+            let started = Instant::now();
+            // The call itself is reviewed, not gated: no in-process witness
+            // tells a real fdatasync from the next line. The tests' count
+            // rides on its result, so deleting the call deletes the count.
+            #[cfg(test)]
+            let total_syncs = &mut self.total_syncs;
+            file.sync_data().inspect(|()| {
+                #[cfg(test)]
+                {
+                    *total_syncs += 1;
+                }
+            })?;
+            let took = started.elapsed();
+            self.syncs += 1;
+            self.spent += took;
+            self.worst = self.worst.max(took);
+            let since = *self.since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(10) {
+                eprintln!(
+                    "group commit stats (10 s): ticks={} syncs={} skipped={} spent_ms={} worst_ms={}",
+                    self.ticks,
+                    self.syncs,
+                    self.skipped,
+                    self.spent.as_millis(),
+                    self.worst.as_millis()
+                );
+                self.ticks = 0;
+                self.syncs = 0;
+                self.skipped = 0;
+                self.spent = Duration::ZERO;
+                self.worst = Duration::ZERO;
+                self.since = Some(Instant::now());
+            }
+            Ok(())
+        }
+
+        /// A failed fdatasync may leave the failed pages marked clean (and
+        /// the error reported once only), so no reopen in this process can
+        /// prove the commits written: stop the process. Tests with `stops`
+        /// set count it and return; the caller then sends nothing.
+        pub(super) fn fail_stop(&self, error: &std::io::Error) {
+            #[cfg(test)]
+            if let Some(stops) = &self.stops {
+                stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            eprintln!("group commit: WAL fdatasync failed, aborting the process: {error}");
+            std::process::abort()
+        }
+    }
+}
+
+/// How a store's commits reach the disk.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoreOptions {
+    /// Group commit: a file store's runtime commits at `synchronous =
+    /// NORMAL` and syncs the WAL once per tick, before that tick's output
+    /// leaves; host writes, and runtime jobs that reply from inside, still
+    /// commit at `FULL`. Ignored for an in-memory store.
+    pub group_commit: bool,
+}
+
+impl StoreOptions {
+    /// `JAZZ_GROUP_COMMIT=1` turns group commit on.
+    pub fn from_env() -> Self {
+        Self {
+            group_commit: group_commit::from_env(),
+        }
+    }
+}
+
 /// How often the owner ticks with no traffic, for time-based engine work
 /// such as expiring staged large-value chunks.
 pub(crate) const IDLE_TICK: Duration = Duration::from_secs(1);
@@ -292,14 +497,15 @@ struct StoreThread {
 /// The file a store lives in.
 #[derive(Clone)]
 enum Source {
-    /// The database file, and where its large-value bytes live.
-    File(PathBuf, Blobs),
+    /// The database file, where its large-value bytes live, and whether it
+    /// runs group commit.
+    File(PathBuf, Blobs, bool),
     /// An in-memory store shared by name within this process.
     Memory(String),
 }
 
 impl Source {
-    fn new(storage: &StorageConfig) -> Self {
+    fn new(storage: &StorageConfig, options: StoreOptions) -> Self {
         static NEXT_MEMORY_STORE: AtomicU64 = AtomicU64::new(0);
         match storage {
             StorageConfig::InMemory => Self::Memory(format!(
@@ -307,24 +513,31 @@ impl Source {
                 std::process::id(),
                 NEXT_MEMORY_STORE.fetch_add(1, Ordering::Relaxed)
             )),
-            StorageConfig::SQLite { path, blobs } => Self::File(path.clone(), blobs.clone()),
+            StorageConfig::SQLite { path, blobs } => {
+                Self::File(path.clone(), blobs.clone(), options.group_commit)
+            }
         }
     }
 
     fn open(&self) -> Result<StoreFile, String> {
         match self {
             Self::Memory(name) => StoreFile::shared_memory(name),
-            Self::File(path, _) => {
+            Self::File(path, _, group) => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|error| format!("create {}: {error}", parent.display()))?;
                 }
                 // Every commit (rows, catalogue, account registry) is durable
-                // when it returns.
+                // when it returns; under group commit the runtime's commits
+                // run `NORMAL`, and the owner fdatasyncs the WAL once per
+                // tick, before any frame of that tick leaves the store thread.
+                if *group {
+                    group_commit::sync_dir(path);
+                }
                 StoreFile::open(
                     path,
                     FileOptions {
-                        synchronous_full: true,
+                        synchronous_full: !group,
                         ..FileOptions::default()
                     },
                 )
@@ -337,7 +550,7 @@ impl Source {
     /// database file.
     fn chunk_store(&self) -> Result<Option<ChunkStoreChoice>, String> {
         match self {
-            Self::File(_, Blobs::Files(dir)) => jazz::chunk_store::FileChunkStore::new(dir)
+            Self::File(_, Blobs::Files(dir), _) => jazz::chunk_store::FileChunkStore::new(dir)
                 .map(|store| {
                     Some(ChunkStoreChoice {
                         store: Arc::new(store),
@@ -345,7 +558,7 @@ impl Source {
                     })
                 })
                 .map_err(|error| format!("open large-value directory {}: {error}", dir.display())),
-            Self::File(_, Blobs::Network(network)) => Ok(Some(ChunkStoreChoice {
+            Self::File(_, Blobs::Network(network), _) => Ok(Some(ChunkStoreChoice {
                 store: Arc::clone(&network.store),
                 network: true,
             })),
@@ -353,10 +566,24 @@ impl Source {
         }
     }
 
+    /// Whether this store runs group commit.
+    fn group_commit(&self) -> bool {
+        matches!(self, Self::File(_, _, true))
+    }
+
+    /// The WAL a runtime on this store syncs once per tick, under group
+    /// commit.
+    fn wal(&self) -> Option<group_commit::Wal> {
+        match self {
+            Self::File(path, _, true) => Some(group_commit::Wal::new(path)),
+            _ => None,
+        }
+    }
+
     fn reader(&self) -> Result<HostReader, String> {
         match self {
             Self::Memory(name) => HostReader::shared_memory(name),
-            Self::File(path, _) => HostReader::open(path, None),
+            Self::File(path, ..) => HostReader::open(path, None),
         }
         .map_err(|error| format!("open server store reader: {error}"))
     }
@@ -643,9 +870,15 @@ impl ChunkIoRunner {
 }
 
 impl AppStore {
-    /// Open the store `storage` names on its own thread.
+    /// Open the store `storage` names on its own thread, with
+    /// [`StoreOptions::from_env`].
     pub fn open(storage: &StorageConfig) -> Result<Self, String> {
-        let source = Source::new(storage);
+        Self::open_with(storage, StoreOptions::from_env())
+    }
+
+    /// Open the store `storage` names on its own thread.
+    pub fn open_with(storage: &StorageConfig, options: StoreOptions) -> Result<Self, String> {
+        let source = Source::new(storage, options);
         let (work, receiver) = std_mpsc::channel::<Work>();
         let thread_wake = work.clone();
         let (host, host_jobs) = std_mpsc::channel::<HostJob>();
@@ -1049,6 +1282,14 @@ impl StoreLoop {
         if let State::Idle(Err(_)) = self.state {
             self.state = State::Idle(self.source.open());
         }
+        // Under group commit a host write runs at FULL (synced before its
+        // reply or any reader sees it); the runtime's commits stay NORMAL.
+        let group = self.source.group_commit();
+        let job = |tables: &dyn HostTables| {
+            group_commit::full(group, tables, true);
+            job(tables);
+            group_commit::full(group, tables, false);
+        };
         let ran = match &self.state {
             State::Idle(Ok(file)) => catch_unwind(AssertUnwindSafe(|| job(file))),
             State::Idle(Err(error)) => {
@@ -1123,7 +1364,21 @@ impl StoreLoop {
             })
         });
         match opened {
-            Ok(owner) => {
+            Ok(mut owner) => {
+                // Under group commit, what opening wrote (migrations,
+                // admissions, the authority mint) ran at NORMAL: on disk
+                // before `Start` replies or any reader serves it.
+                owner.wal = self.source.wal();
+                if let Some(wal) = &mut owner.wal
+                    && let Err(error) = wal.sync()
+                {
+                    wal.fail_stop(&error);
+                    // Only a test's counting hook returns from the fail-stop:
+                    // the runtime did not start.
+                    drop(owner);
+                    self.state = State::Idle(self.source.open());
+                    return Err(format!("syncing the opened store failed: {error}"));
+                }
                 self.state = State::Running(owner);
                 self.started = Some(runtime);
                 // A runtime is serving again: the server is healthy.
@@ -1883,8 +2138,16 @@ impl ServerRuntimeHandle {
         job: impl FnOnce(&mut Owner) -> Result<T, String> + Send + 'static,
     ) -> Result<T, String> {
         let (reply, response) = oneshot::channel();
+        // Under group commit a job that replies (catalogue publish, session
+        // open) commits at FULL, since its reply leaves before any tick's
+        // sync. Jobs without a reply (thin requests, whose answers wait for
+        // the tick's sync) keep NORMAL.
         self.send(Box::new(move |owner| {
-            let _ = reply.send(job(owner));
+            let group = owner.wal.is_some();
+            group_commit::full(group, &owner.db, true);
+            let result = job(owner);
+            group_commit::full(group, &owner.db, false);
+            let _ = reply.send(result);
         }))?;
         response
             .await
@@ -1957,9 +2220,32 @@ struct Owner {
     app: Option<String>,
     /// Runs a network chunk store's I/O beside this thread.
     chunk_io: Option<ChunkIoRunner>,
+    /// Under group commit, the WAL this runtime syncs once per tick.
+    wal: Option<group_commit::Wal>,
+    /// Tests: what each tick did, in order (see [`Trace`]).
+    #[cfg(test)]
+    trace: Vec<Trace>,
     /// Tests: the next catalogue reload after a commit fails.
     #[cfg(test)]
     fail_next_reload: bool,
+}
+
+/// Tests: a step of the owner's work, recorded in order.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Trace {
+    /// A tick started.
+    Tick,
+    /// The tick's WAL sync returned: the WAL's fdatasyncs so far.
+    Synced(u64),
+    /// The WAL sync failed and the store fail-stopped.
+    FailStop,
+    /// Frames went to a sync session's output.
+    Sent(ServerSession),
+    /// Thin answers went to a thin session's output.
+    ThinSent(ServerSession),
+    /// The tick ended.
+    TickEnd,
 }
 
 struct OwnerSession {
@@ -2445,6 +2731,9 @@ impl Owner {
             catalogue,
             app,
             chunk_io,
+            wal: None,
+            #[cfg(test)]
+            trace: Vec::new(),
             #[cfg(test)]
             fail_next_reload: false,
         })
@@ -2678,7 +2967,20 @@ impl Owner {
         }
     }
 
+    /// Tests: record `step`.
+    #[cfg(test)]
+    fn trace(&mut self, step: Trace) {
+        self.trace.push(step);
+    }
+
+    /// Under group commit, whether this runtime syncs once per tick.
+    fn group_commit(&self) -> bool {
+        self.wal.is_some()
+    }
+
     fn tick(&mut self) {
+        #[cfg(test)]
+        self.trace(Trace::Tick);
         start_tick(self.sessions.values().map(|session| &*session.queues));
         let started = std::time::Instant::now();
         let ticked = block_on(self.db.tick());
@@ -2692,6 +2994,22 @@ impl Owner {
         }
         self.report_slow_queries();
         self.report_merge_fallbacks();
+        // Under group commit nothing this tick (or a thin request before
+        // it) wrote leaves the thread before the WAL holding it is on disk.
+        // A failed sync fail-stops the store: its pages may be marked
+        // clean, so a retry could not prove them written.
+        if let Some(wal) = &mut self.wal {
+            if let Err(error) = wal.sync() {
+                wal.fail_stop(&error);
+                #[cfg(test)]
+                self.trace(Trace::FailStop);
+                return;
+            }
+            #[cfg(test)]
+            let syncs = wal.total_syncs;
+            #[cfg(test)]
+            self.trace(Trace::Synced(syncs));
+        }
         for (subscriber, error) in self.db.take_closed_subscribers() {
             let Some(id) = self
                 .sessions
@@ -2707,6 +3025,8 @@ impl Owner {
             self.close_session(id);
         }
         let mut gone = Vec::new();
+        #[cfg(test)]
+        let mut sent = Vec::new();
         for (id, session) in &self.sessions {
             let mut outbound = session.queues.outbound.borrow_mut();
             let mut frames = Vec::new();
@@ -2726,11 +3046,19 @@ impl Owner {
             if session.output.send((Ok(frames), bytes)).is_err() {
                 gone.push(*id);
             }
+            #[cfg(test)]
+            sent.push(*id);
+        }
+        #[cfg(test)]
+        for id in sent {
+            self.trace(Trace::Sent(id));
         }
         for id in gone {
             self.close_session(id);
         }
         self.pump_thin();
+        #[cfg(test)]
+        self.trace(Trace::TickEnd);
     }
 }
 
@@ -2748,6 +3076,9 @@ fn superseded_error(published: &jazz::catalogue::BundleId) -> jazz::wire::WireEr
         ),
     )
 }
+
+#[cfg(test)]
+mod group_commit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2791,7 +3122,7 @@ mod tests {
 
     /// Hold the store thread in a runtime job until the returned sender
     /// sends (or drops).
-    fn hold(runtime: &ServerRuntimeHandle) -> std_mpsc::Sender<()> {
+    pub(super) fn hold(runtime: &ServerRuntimeHandle) -> std_mpsc::Sender<()> {
         let (entered, running) = std_mpsc::channel();
         let (release, released) = std_mpsc::channel::<()>();
         runtime
@@ -3715,7 +4046,7 @@ mod tests {
             .build()
     }
 
-    fn docs() -> JazzSchema {
+    pub(super) fn docs() -> JazzSchema {
         JazzSchema::new(&docs_source()).unwrap()
     }
 
@@ -3893,7 +4224,7 @@ mod tests {
     }
 
     /// A trusted thin session on `runtime`, with the docs schema declared.
-    async fn thin_docs_session(
+    pub(super) async fn thin_docs_session(
         runtime: &ServerRuntimeHandle,
     ) -> (ServerSession, ServerRuntimeFrameStream) {
         let session = runtime
@@ -3922,7 +4253,7 @@ mod tests {
         (session, stream)
     }
 
-    async fn send_thin(
+    pub(super) async fn send_thin(
         runtime: &ServerRuntimeHandle,
         session: ServerSession,
         id: u64,
@@ -3939,7 +4270,7 @@ mod tests {
     }
 
     /// The next thin answer within `wait`, or `None`.
-    async fn next_thin(
+    pub(super) async fn next_thin(
         stream: &mut ServerRuntimeFrameStream,
         wait: Duration,
     ) -> Option<(u64, jazz::thin::ThinBody)> {
@@ -3953,6 +4284,27 @@ mod tests {
             jazz::wire::WireFrame::ThinResponse(response) => Some((response.id, response.body)),
             other => panic!("expected a thin response, got {other:?}"),
         }
+    }
+
+    /// The next batch of thin answers within `wait`, in order, or `None`.
+    pub(super) async fn next_thin_batch(
+        stream: &mut ServerRuntimeFrameStream,
+        wait: Duration,
+    ) -> Option<Vec<(u64, jazz::thin::ThinBody)>> {
+        let frames = tokio::time::timeout(wait, stream.recv())
+            .await
+            .ok()?
+            .expect("open")
+            .expect("frames");
+        Some(
+            frames
+                .iter()
+                .map(|frame| match jazz::wire::decode_frame(frame).unwrap() {
+                    jazz::wire::WireFrame::ThinResponse(response) => (response.id, response.body),
+                    other => panic!("expected a thin response, got {other:?}"),
+                })
+                .collect(),
+        )
     }
 
     fn thin_query(transaction: Option<&str>) -> jazz::thin::ThinOp {
@@ -4012,10 +4364,18 @@ mod tests {
             );
             store_thread_is_free(&runtime).await;
             bucket.state.stall_gets.store(false, Ordering::Relaxed);
-            for id in [1, 2] {
-                let (answered, body) = next_thin(&mut stream, Duration::from_secs(20))
-                    .await
-                    .expect("answered once the leaves landed");
+            // Answers ready in one tick may leave in one batch (group
+            // commit sends a tick's held answers together, after its sync).
+            let mut answers = Vec::new();
+            while answers.len() < 2 {
+                answers.extend(
+                    next_thin_batch(&mut stream, Duration::from_secs(20))
+                        .await
+                        .expect("answered once the leaves landed"),
+                );
+            }
+            assert_eq!(answers.len(), 2, "one answer per request");
+            for (id, (answered, body)) in [1, 2].into_iter().zip(answers) {
                 assert_eq!(answered, id, "answered in order");
                 assert_eq!(thin_body(body), value);
             }
