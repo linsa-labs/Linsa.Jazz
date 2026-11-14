@@ -692,6 +692,11 @@ struct Inner {
     pub(crate) claims: HashMap<AuthorSubject, BTreeMap<String, Value>>,
     /// Live subscription groups and their invalidation index.
     fan: fanout::Fanout,
+    /// DRAFT (`JAZZ_X_CHECK=1`): kept policy check statements. Per store,
+    /// not per thread: one thread can host several stores (the native
+    /// relay's owner thread), and a schema one of them frees can be
+    /// reallocated at the same address for another.
+    check_plans: RefCell<HashMap<CheckKey, Rc<CheckPlan>>>,
     /// Rows written since the last dispatch: (table, id, branch key).
     changed: RefCell<Vec<(String, RowUuid, Vec<u8>)>>,
     /// The write checks of the unit being applied, run at its end.
@@ -1900,6 +1905,7 @@ impl Db {
                 ),
                 claims: HashMap::new(),
                 fan: fanout::Fanout::default(),
+                check_plans: RefCell::new(HashMap::new()),
                 changed: RefCell::new(Vec::new()),
                 deferred: RefCell::new(None),
                 trusted_rows: RefCell::new(BTreeMap::new()),
@@ -6154,20 +6160,14 @@ impl Inner {
         operation: Operation,
         existing: bool,
     ) -> Result<bool, Error> {
-        let plan_key = (
-            std::ptr::from_ref(schema) as usize,
-            table.stored.clone(),
-            operation,
-            author,
-        );
+        let plan_key = CheckKey::new(schema, table, operation, author);
         let claims = self.claims.get(&author);
-        let kept = CHECK_PLANS.with(|plans| {
-            plans
-                .borrow()
-                .get(&plan_key)
-                .filter(|plan| plan.claims.as_ref() == claims)
-                .cloned()
-        });
+        let kept = self
+            .check_plans
+            .borrow()
+            .get(&plan_key)
+            .filter(|plan| plan.claims.as_ref() == claims)
+            .cloned();
         let (plan, hit) = match kept {
             Some(plan) => (plan, true),
             None => {
@@ -6184,7 +6184,7 @@ impl Inner {
                     params,
                     constant,
                 });
-                CHECK_PLANS.with(|plans| plans.borrow_mut().insert(plan_key, plan.clone()));
+                self.check_plans.borrow_mut().insert(plan_key, plan.clone());
                 (plan, false)
             }
         };
@@ -11053,28 +11053,60 @@ struct CheckPlan {
     constant: bool,
 }
 
-type CheckKey = (usize, String, Operation, AuthorSubject);
+/// What a kept policy check was compiled under. The schema's address is
+/// only a fast discriminator; its version, bundle, naming and governing
+/// schema are part of the key so an address reused by a different schema
+/// cannot hit a plan compiled for another one.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CheckKey {
+    schema: usize,
+    version: crate::ids::SchemaVersionId,
+    bundle: Option<crate::catalogue::BundleId>,
+    stored_names: bool,
+    governing: Option<(usize, crate::ids::SchemaVersionId, Option<crate::catalogue::BundleId>)>,
+    table: String,
+    operation: Operation,
+    author: AuthorSubject,
+}
+
+impl CheckKey {
+    fn new(schema: &Schema, table: &Table, operation: Operation, author: AuthorSubject) -> Self {
+        Self {
+            schema: std::ptr::from_ref(schema) as usize,
+            version: schema.version,
+            bundle: schema.bundle,
+            stored_names: schema.stored_names,
+            governing: schema
+                .policies_from
+                .as_ref()
+                .map(|governing| (Rc::as_ptr(governing) as usize, governing.version, governing.bundle)),
+            table: table.stored.clone(),
+            operation,
+            author,
+        }
+    }
+}
 
 thread_local! {
-    static CHECK_PLANS: RefCell<HashMap<CheckKey, std::rc::Rc<CheckPlan>>> =
-        RefCell::new(HashMap::new());
     static CHECK_STATS: std::cell::Cell<(u64, u64, u64, u64, Option<std::time::Instant>)> =
         const { std::cell::Cell::new((0, 0, 0, 0, None)) };
 }
 
-/// Drop the kept policy checks (the schema changed).
-pub(crate) fn clear_check_plans() {
-    CHECK_PLANS.with(|plans| plans.borrow_mut().clear());
+impl Inner {
+    /// Drop the kept policy checks (the schema changed).
+    pub(crate) fn clear_check_plans(&self) {
+        self.check_plans.borrow_mut().clear();
+    }
 }
 
 fn check_plans_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_CHECK").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_CHECK"))
 }
 
 fn check_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_CHECK_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_CHECK_SHADOW"))
 }
 
 /// Count a planned check: hit or miss, skipped as constant, shadow
@@ -11082,7 +11114,7 @@ fn check_shadow() -> bool {
 fn check_stat(hit: bool, skipped: bool, mismatch: bool) {
     if mismatch
         && cfg!(any(test, feature = "testing"))
-        && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+        && jazz_types::x_flags::shadow("JAZZ_SHADOW_PANIC")
     {
         panic!("[check-shadow] a planned policy check differs from a fresh one");
     }
@@ -11135,7 +11167,7 @@ fn current_plans() -> Option<Plans> {
 /// Run `f` with `plans` armed for its relation reads (`JAZZ_X_PLAN=1`).
 pub(crate) fn with_plans<T>(plans: &Plans, f: impl FnOnce() -> T) -> T {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("JAZZ_X_PLAN").as_deref() == Ok("1")) {
+    if !*ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_PLAN")) {
         return f();
     }
     struct Reset(Option<Plans>);
@@ -11152,10 +11184,10 @@ pub(crate) fn with_plans<T>(plans: &Plans, f: impl FnOnce() -> T) -> T {
 /// Count a kept-plan hit (with its shadow, `JAZZ_X_PLAN_SHADOW=1`) or miss.
 fn plan_stat(hit: bool, same: impl FnOnce() -> bool) {
     static SHADOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let shadow = *SHADOW.get_or_init(|| std::env::var("JAZZ_X_PLAN_SHADOW").as_deref() == Ok("1"));
+    let shadow = *SHADOW.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_PLAN_SHADOW"));
     let mismatch = hit && shadow && !same();
     if mismatch && cfg!(any(test, feature = "testing"))
-        && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+        && jazz_types::x_flags::shadow("JAZZ_SHADOW_PANIC")
     {
         panic!("[plan-shadow] kept relation plan differs from a fresh compile");
     }
@@ -11175,13 +11207,13 @@ fn plan_stat(hit: bool, same: impl FnOnce() -> bool) {
 /// DRAFT: relation parents from the row's own cell (`JAZZ_X_PCELL=1`).
 fn x_parent_cell() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_PCELL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_PCELL"))
 }
 
 /// DRAFT: run `f` with cell decoding off when `JAZZ_X_READ=1`.
 pub(crate) fn x_without_cells<T>(f: impl FnOnce() -> T) -> T {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("JAZZ_X_READ").as_deref() == Ok("1")) {
+    if !*ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_READ")) {
         return f();
     }
     struct Reset(bool);

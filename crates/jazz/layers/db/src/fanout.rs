@@ -497,7 +497,7 @@ fn canon(value: &Sql) -> String {
 /// DRAFT: canonical atoms without Debug formatting (`JAZZ_X_CANON=1`).
 fn x_fast_canon() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_CANON").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_CANON"))
 }
 
 fn canon_value(value: &Value) -> Option<String> {
@@ -1769,7 +1769,7 @@ impl Inner {
     /// The active schema changed: every subscription re-runs and restates
     /// its rows (a reset), since their shape may have changed.
     pub(super) fn reset_everything(&mut self) {
-        super::clear_check_plans();
+        self.clear_check_plans();
         self.refresh_where(|_| true, true);
     }
 
@@ -2919,42 +2919,42 @@ impl Group {
 /// only the changed roots' rows and their own relations can differ.
 fn recheck_relations() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_RECHECK_RELATIONS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_RECHECK_RELATIONS"))
 }
 
 /// DRAFT: compare every relation re-check with a full run, counting
 /// mismatches (`JAZZ_RECHECK_RELATIONS_SHADOW=1`).
 fn recheck_relations_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_RECHECK_RELATIONS_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_RECHECK_RELATIONS_SHADOW"))
 }
 
 /// DRAFT: refresh correlation-only wakes by nesting the affected roots'
 /// relations again (`JAZZ_RENEST=1`).
 fn renest_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_RENEST").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_RENEST"))
 }
 
 /// DRAFT: re-nest only the top-level relations a hit's path starts with
 /// (`JAZZ_X_SCOPE=1`).
 fn x_scope() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_SCOPE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_SCOPE"))
 }
 
 /// DRAFT: re-check an updated held root row and re-nest only where a
 /// relation level holds it, instead of a full run (`JAZZ_X_SELFHIT=1`).
 fn x_selfhit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_SELFHIT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_SELFHIT"))
 }
 
 /// DRAFT: a shadow mismatch panics in test builds (`JAZZ_SHADOW_PANIC=1`).
 fn shadow_panics() -> bool {
     cfg!(any(test, feature = "testing")) && {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1"))
+        *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_SHADOW_PANIC"))
     }
 }
 
@@ -2973,12 +2973,12 @@ struct RootStamp {
 
 fn x_rplan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_RPLAN").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_RPLAN"))
 }
 
 fn x_rplan_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_RPLAN_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_RPLAN_SHADOW"))
 }
 
 fn rplan_stat(f: impl FnOnce(&mut fan_stats::Stats)) {
@@ -2990,19 +2990,19 @@ fn rplan_stat(f: impl FnOnce(&mut fan_stats::Stats)) {
 /// DRAFT: keep each root row's share of `held` (`JAZZ_X_HOLD=1`).
 fn x_hold() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_HOLD").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_HOLD"))
 }
 
 /// DRAFT: compare the kept `held` with a full one (`JAZZ_X_HOLD_SHADOW=1`).
 fn x_hold_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_HOLD_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_HOLD_SHADOW"))
 }
 
 /// DRAFT: scope a re-nest down the whole hit path (`JAZZ_X_DEEP=1`).
 fn x_deep() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_DEEP").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_DEEP"))
 }
 
 /// What a scoped re-nest reads again under one relation: all of it, or
@@ -3180,7 +3180,7 @@ fn merge_relation(
 /// DRAFT: compare every re-nest with a full run (`JAZZ_RENEST_SHADOW=1`).
 fn renest_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_RENEST_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_RENEST_SHADOW"))
 }
 
 /// What matched at one correlation level: the held row, and the held
@@ -3239,12 +3239,12 @@ impl<'a> ChangeAtoms<'a> {
 
 fn x_hits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_HITS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_HITS"))
 }
 
 fn x_hits_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_HITS_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_HITS_SHADOW"))
 }
 
 fn hits_mismatch(what: &str, table: &str) {
@@ -4585,7 +4585,7 @@ fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>])
 
 fn policy_filter_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_POLICY_FILTER").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_POLICY_FILTER"))
 }
 
 fn correlated(

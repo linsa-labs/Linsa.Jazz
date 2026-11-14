@@ -421,17 +421,23 @@ fn a_failed_wal_sync_fail_stops_before_anything_is_sent() {
     store.close().unwrap();
 }
 
-/// Gate 6: without the option the store commits at FULL everywhere and
-/// syncs nothing per tick; an in-memory store ignores the option.
+/// Gate 6: with the option off the store commits at FULL everywhere and
+/// syncs nothing per tick; an in-memory store ignores the option. The env
+/// turns it on unless `JAZZ_GROUP_COMMIT=0` or `JAZZ_X_ALL=0`.
 #[test]
-fn group_commit_is_off_by_default() {
-    assert!(
-        std::env::var_os("JAZZ_GROUP_COMMIT").is_none(),
-        "the runtime tests run without JAZZ_GROUP_COMMIT"
+fn group_commit_off_commits_at_full() {
+    let off = |var: &str| std::env::var(var).as_deref() == Ok("0");
+    assert_eq!(
+        StoreOptions::from_env().group_commit,
+        !(off("JAZZ_GROUP_COMMIT") || off("JAZZ_X_ALL")),
+        "group commit is on unless the env turns it off"
     );
-    assert_eq!(StoreOptions::from_env(), StoreOptions::default());
     let dir = tempfile::tempdir().unwrap();
-    let store = AppStore::open(&StorageConfig::data_dir(dir.path())).unwrap();
+    let store = AppStore::open_with(
+        &StorageConfig::data_dir(dir.path()),
+        StoreOptions { group_commit: false },
+    )
+    .unwrap();
     assert_eq!(host_synchronous(&store), FULL);
     let runtime = store.start_runtime(todos(), NodeRole::Core, false).unwrap();
     assert_eq!(

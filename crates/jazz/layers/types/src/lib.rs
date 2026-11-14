@@ -28,6 +28,7 @@ pub mod column_schema;
 /// the stored-scalar envelope for variable-width cells.
 #[allow(missing_docs)]
 pub mod large_values;
+pub mod x_flags;
 /// Logical values, value types and the record encoding Jazz schemas are
 /// described in.
 #[allow(missing_docs)]

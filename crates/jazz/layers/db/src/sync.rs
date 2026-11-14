@@ -3255,7 +3255,7 @@ fn watch_key(cell: &Sql) -> String {
     // DRAFT (`JAZZ_X_WKEY=1`): a tag and hex, not the Debug print. Keys are
     // hashed in-process only (`wk`), and every one is made here.
     static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*FAST.get_or_init(|| std::env::var("JAZZ_X_WKEY").as_deref() == Ok("1")) {
+    if !*FAST.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_WKEY")) {
         return format!("{cell:?}");
     }
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -15343,12 +15343,12 @@ thread_local! {
 impl FollowMemo {
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("JAZZ_X_FOLLOW").as_deref() == Ok("1"))
+        *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_FOLLOW"))
     }
 
     fn shadow() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("JAZZ_X_FOLLOW_SHADOW").as_deref() == Ok("1"))
+        *ON.get_or_init(|| jazz_types::x_flags::shadow("JAZZ_X_FOLLOW_SHADOW"))
     }
 
     /// Armed until the guard drops: the rest of a tick.
@@ -15389,7 +15389,7 @@ impl FollowMemo {
     fn count(hit: bool, mismatch: bool) {
         if mismatch
             && cfg!(any(test, feature = "testing"))
-            && std::env::var("JAZZ_SHADOW_PANIC").as_deref() == Ok("1")
+            && jazz_types::x_flags::shadow("JAZZ_SHADOW_PANIC")
         {
             panic!("[follow-shadow] a kept follow read differs from a fresh one");
         }
@@ -15419,10 +15419,10 @@ impl Drop for FollowMemoGuard {
 
 fn x_tick() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_TICK").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_TICK"))
 }
 
 fn x_pruned_direct() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_PRUNED").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_PRUNED"))
 }

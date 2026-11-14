@@ -3350,7 +3350,7 @@ pub fn decode_node(
 /// anyway and fail loudly on a mismatch.
 fn lvmemo_shadow() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_LVMEMO_SHADOW").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::x_flags::shadow("JAZZ_X_LVMEMO_SHADOW"))
 }
 
 /// Decode a node through the exact format selected by its owner descriptor.

@@ -44,6 +44,7 @@ pub use jazz_protocol::protocol_limits;
 pub use jazz_protocol::thin;
 pub use jazz_types::account_registry;
 pub use jazz_types::app_id;
+pub use jazz_types::x_flags;
 pub use jazz_types::column_schema;
 pub use jazz_types::identity;
 pub use jazz_types::ids;

@@ -1748,7 +1748,7 @@ impl lv::chunks::ChunkProvider for Stored<'_> {
     /// cache re-hashes what it reads from the chunk store).
     fn object_verified(&self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("JAZZ_X_LVMEMO").as_deref() == Ok("1"))
+        *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_LVMEMO"))
     }
 }
 
@@ -3078,5 +3078,5 @@ mod tests {
 /// DRAFT: skip reading back Bytes values on admission (`JAZZ_X_ADMIT=1`).
 fn x_admit_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("JAZZ_X_ADMIT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_ADMIT"))
 }

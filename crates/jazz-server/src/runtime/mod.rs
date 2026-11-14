@@ -212,9 +212,9 @@ pub(crate) mod group_commit {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    /// `JAZZ_GROUP_COMMIT=1`.
+    /// On unless `JAZZ_GROUP_COMMIT=0` (or `JAZZ_X_ALL=0`).
     pub(crate) fn from_env() -> bool {
-        std::env::var("JAZZ_GROUP_COMMIT").is_ok_and(|v| v == "1")
+        jazz::x_flags::on("JAZZ_GROUP_COMMIT")
     }
 
     /// Switch `tables`' connection to FULL (or back to NORMAL) when `group`
@@ -401,7 +401,7 @@ pub struct StoreOptions {
 }
 
 impl StoreOptions {
-    /// `JAZZ_GROUP_COMMIT=1` turns group commit on.
+    /// Group commit is on unless `JAZZ_GROUP_COMMIT=0` (or `JAZZ_X_ALL=0`).
     pub fn from_env() -> Self {
         Self {
             group_commit: group_commit::from_env(),
