@@ -88,6 +88,16 @@ pub trait HostTables {
     /// created by `f` itself), which plain key-value pairs would hide from
     /// SQL.
     fn host_sql(&self, f: &mut dyn FnMut(&Connection) -> Result<(), Error>) -> Result<(), Error>;
+    /// Commit through this connection at `synchronous = FULL` (`true`) or
+    /// `NORMAL` (`false`) from now on. A host that syncs the WAL itself
+    /// runs its own commits at `NORMAL` and switches to `FULL` for writes
+    /// it answers at once. `Ok(false)`: the connection is inside a
+    /// transaction, where SQLite refuses the switch, and stays as it was
+    /// (what is written now commits with that transaction). Tables without
+    /// a connection of their own ignore it.
+    fn host_synchronous_full(&self, _full: bool) -> Result<bool, Error> {
+        Ok(true)
+    }
 }
 
 /// Turn on SQLite's query planner stability guarantee
@@ -290,6 +300,10 @@ fn uri_flags() -> rusqlite::OpenFlags {
 }
 
 impl HostTables for StoreFile {
+    fn host_synchronous_full(&self, full: bool) -> Result<bool, Error> {
+        set_synchronous(&self.conn, full)
+    }
+
     fn host_get(&self, table: HostTable, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         get(&self.conn, table, key)
     }
@@ -330,7 +344,25 @@ impl HostTables for StoreFile {
     }
 }
 
+/// [`HostTables::host_synchronous_full`] on `conn`.
+fn set_synchronous(conn: &Connection, full: bool) -> Result<bool, Error> {
+    if !conn.is_autocommit() {
+        return Ok(false);
+    }
+    conn.execute_batch(if full {
+        "PRAGMA synchronous = FULL"
+    } else {
+        "PRAGMA synchronous = NORMAL"
+    })
+    .map_err(storage)?;
+    Ok(true)
+}
+
 impl HostTables for Db {
+    fn host_synchronous_full(&self, full: bool) -> Result<bool, Error> {
+        self.with_host_connection(|conn| set_synchronous(conn, full))
+    }
+
     fn host_get(&self, table: HostTable, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.with_host_connection(|conn| get(conn, table, key))
     }
@@ -502,6 +534,26 @@ fn delete(conn: &Connection, table: HostTable, key: &[u8]) -> Result<(), Error> 
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, StatementStatus};
+
+    /// A connection inside a transaction keeps its `synchronous` level and
+    /// says so, where SQLite itself refuses the pragma with an error;
+    /// outside one it switches.
+    #[test]
+    fn synchronous_is_not_switched_inside_a_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        let level = || -> i64 {
+            conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert!(super::set_synchronous(&conn, true).unwrap());
+        assert_eq!(level(), 2, "FULL");
+        conn.execute_batch("SAVEPOINT held").unwrap();
+        assert!(!super::set_synchronous(&conn, false).unwrap());
+        assert_eq!(level(), 2, "still FULL inside the transaction");
+        conn.execute_batch("RELEASE held").unwrap();
+        assert!(super::set_synchronous(&conn, false).unwrap());
+        assert_eq!(level(), 1, "NORMAL outside it");
+    }
 
     /// Reprepares of a cached `LIMIT ?` read run `runs` times on `conn`.
     fn reprepares(conn: &Connection, runs: i64) -> i32 {
