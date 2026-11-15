@@ -788,6 +788,9 @@ struct Inner {
     /// followed key found, read once for every session following it
     /// (see `sync::FollowMemo`).
     follow_memo: Rc<RefCell<Option<sync::FollowMemo>>>,
+    /// Whether `_jazz_pruned_txs` exists, as last read (see
+    /// `sync::has_pruned_txs`).
+    pruned_txs: std::cell::Cell<Option<sync::Known>>,
 }
 
 /// Large-value nodes one tick may reclaim.
@@ -2122,6 +2125,7 @@ impl Db {
                 migrations: config.migrations,
                 withheld: std::cell::Cell::new(withheld > 0),
                 follow_memo: Rc::default(),
+                pruned_txs: std::cell::Cell::new(None),
             })),
         };
         {
