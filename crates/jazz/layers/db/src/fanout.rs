@@ -4211,7 +4211,7 @@ fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>])
         .iter()
         .zip(&group.held)
         .filter(|(level, _)| level.table == *reader)
-        .map(|(level, held)| (level.inner == "id" && held.complete).then_some(held))
+        .map(|(level, held)| (level.inner == "id" && held.complete()).then_some(held))
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
     if levels.is_empty()
@@ -4231,7 +4231,7 @@ fn linked(group: &Group, occurrence: &Occurrence, images: &[Vec<(String, Sql)>])
             .any(|(_, cell)| match stored_atoms(cell, *list) {
                 Some(atoms) => atoms
                     .iter()
-                    .any(|atom| levels.iter().any(|held| held.parents.contains(atom))),
+                    .any(|atom| levels.iter().any(|held| held.parents.contains_key(atom))),
                 None => true,
             })
     }) || !images
