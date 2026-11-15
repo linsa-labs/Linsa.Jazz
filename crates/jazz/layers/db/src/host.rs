@@ -174,6 +174,18 @@ impl StoreFile {
             options.cache_kib
         ))
         .map_err(storage)?;
+        // Fork A/B (`JAZZ_X_CKPT=<pages>`, off unless set): the WAL size at
+        // which a commit runs the automatic checkpoint (SQLite's default
+        // is 1000 pages).
+        if options.journal == Journal::Wal
+            && let Some(pages) = std::env::var("JAZZ_X_CKPT")
+                .ok()
+                .and_then(|pages| pages.parse::<u32>().ok())
+                .filter(|pages| *pages > 0)
+        {
+            conn.execute_batch(&format!("PRAGMA wal_autocheckpoint = {pages}"))
+                .map_err(storage)?;
+        }
         Ok(Self {
             conn,
             path: Some((path.to_path_buf(), options.vfs)),

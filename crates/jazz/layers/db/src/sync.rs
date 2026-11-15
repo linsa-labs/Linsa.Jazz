@@ -15417,9 +15417,12 @@ pub fn decode_session_read_cells_for_test(decode: bool) {
 
 fn session_read_decodes_cells() -> bool {
     #[cfg(feature = "testing")]
-    return SESSION_READ_CELLS.with(std::cell::Cell::get);
-    #[cfg(not(feature = "testing"))]
-    false
+    if SESSION_READ_CELLS.with(std::cell::Cell::get) {
+        return true;
+    }
+    // Fork A/B: `JAZZ_X_READ=0` decodes them, as before the change.
+    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*SKIP.get_or_init(|| jazz_types::x_flags::on("JAZZ_X_READ"))
 }
 
 #[cfg(test)]
