@@ -1,16 +1,11 @@
-//! DRAFT switches for the store-thread CPU optimizations.
+//! A/B switches for this fork's stand measurements (fork only, not part of
+//! any upstream change).
 //!
-//! Every optimization is on unless `JAZZ_X_ALL=0` or its own variable is
-//! `0`; a shadow check (the old computation run beside the new one) is off
-//! unless its variable is `1`. Read once per process by each caller.
+//! A switch is on unless its own variable or `JAZZ_X_ALL` is `0`. Each
+//! caller reads its switch once per process.
 
-/// Whether optimization `name` is on.
+/// Whether switch `name` is on.
 pub fn on(name: &str) -> bool {
     let off = |var: &str| std::env::var(var).as_deref() == Ok("0");
     !(off("JAZZ_X_ALL") || off(name))
-}
-
-/// Whether shadow check `name` is on.
-pub fn shadow(name: &str) -> bool {
-    std::env::var(name).as_deref() == Ok("1")
 }

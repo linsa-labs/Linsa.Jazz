@@ -465,17 +465,11 @@ impl Owner {
             return false;
         };
         let response = ThinResponse { id, body };
-        // Under group commit an answer waits for the tick's WAL sync
-        // (`pump_thin` sends it after).
-        let group = self.group_commit();
         let Some(thin) = self.thin.get_mut(&session) else {
             return false;
         };
-        if thin.has_room() && thin.held.is_empty() && !group {
-            let sent = thin.send(vec![response]);
-            #[cfg(test)]
-            self.trace(super::Trace::ThinSent(session));
-            if !sent {
+        if thin.has_room() && thin.held.is_empty() {
+            if !thin.send(vec![response]) {
                 self.close_thin_session(session);
             }
         } else {
@@ -605,25 +599,14 @@ impl Owner {
     /// it queues the next tick ([`super::ServerRuntimeFrameStream::recv`]).
     pub(super) fn pump_thin(&mut self) {
         let mut gone = Vec::new();
-        #[cfg(test)]
-        let mut traced = Vec::new();
         for (session, thin) in &mut self.thin {
             if !thin.has_room() {
                 continue;
             }
-            let frames = drain_thin(thin);
-            #[cfg(test)]
-            if frames.as_ref().is_some_and(|frames| !frames.is_empty()) {
-                traced.push(*session);
-            }
-            let sent = frames.is_some_and(|frames| thin.send_frames(frames));
+            let sent = drain_thin(thin).is_some_and(|frames| thin.send_frames(frames));
             if !sent {
                 gone.push(*session);
             }
-        }
-        #[cfg(test)]
-        for session in traced {
-            self.trace(super::Trace::ThinSent(session));
         }
         for session in gone {
             self.close_thin_session(session);

@@ -59,6 +59,8 @@ mod fanout_differential;
 mod fanout_policy_pins;
 #[path = "../flat_joins.rs"]
 mod flat_joins;
+#[path = "../follow_memo.rs"]
+mod follow_memo;
 #[path = "../gather_policy_double_ref.rs"]
 mod gather_policy_double_ref;
 #[path = "../history_reads.rs"]
@@ -67,6 +69,8 @@ mod history_reads;
 mod host_tables;
 #[path = "../include_live.rs"]
 mod include_live;
+#[path = "../kept_plans.rs"]
+mod kept_plans;
 #[path = "../large_value_append.rs"]
 mod large_value_append;
 #[path = "../large_value_chunk_store.rs"]
@@ -83,6 +87,8 @@ mod large_value_sync;
 mod large_value_tx_update;
 #[path = "../large_values.rs"]
 mod large_values;
+#[path = "../late_enum_tags.rs"]
+mod late_enum_tags;
 #[path = "../latest_only_tables.rs"]
 mod latest_only_tables;
 #[path = "../link_identities.rs"]
@@ -111,6 +117,8 @@ mod pending_rebase_scope;
 mod permission_advice;
 #[path = "../policy_activation.rs"]
 mod policy_activation;
+#[path = "../policy_check_plans.rs"]
+mod policy_check_plans;
 #[path = "../policy_support_rows.rs"]
 mod policy_support_rows;
 #[path = "../pre_sync_writes.rs"]
