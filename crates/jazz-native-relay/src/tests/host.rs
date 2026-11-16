@@ -800,6 +800,169 @@ fn upload_status_has_pinned_bytes_and_answers() {
     fixture.close(foreground);
 }
 
+fn pending_upload_rows(fixture: &Fixture, foreground: u64, table: &str) -> Vec<[u8; 16]> {
+    match fixture.execute(
+        foreground,
+        ForegroundDbCommandRequest::PendingUploadRows {
+            table: table.to_owned(),
+        },
+    ) {
+        ForegroundDbCommandResponse::PendingUploadRows { rows } => rows,
+        response => panic!("PendingUploadRows: {response:?}"),
+    }
+}
+
+#[test]
+fn pending_upload_rows_has_pinned_bytes_and_names_the_foregrounds_row() {
+    // Appended command and answer: existing ordinals stay fixed.
+    assert_eq!(
+        postcard::to_allocvec(&ForegroundDbCommandRequest::PendingUploadRows {
+            table: "t".to_owned()
+        })
+        .unwrap(),
+        vec![41, 1, b't']
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ForegroundDbCommandResponse::PendingUploadRows {
+            rows: vec![[0xab; 16]]
+        })
+        .unwrap(),
+        [vec![32, 1], vec![0xab; 16]].concat()
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new();
+    let capability = fixture.admit(&directory.path().join("alice.sqlite"), "alice", 0x12);
+    let foreground = fixture.open(&capability);
+    fixture.insert_todo(foreground, [0xa1; 16], "local only");
+    // Before any tick the commit is the foreground's alone: an answer read
+    // from the relay's store only would call it sent.
+    assert_eq!(
+        pending_upload_rows(&fixture, foreground, "todos"),
+        [[0xa1; 16]]
+    );
+    assert_eq!(upload_status(&fixture, foreground)["pending"], 1);
+    fixture.tick(foreground);
+    // Now both stores hold it: one write, not two.
+    assert_eq!(
+        pending_upload_rows(&fixture, foreground, "todos"),
+        [[0xa1; 16]]
+    );
+    assert_eq!(
+        upload_status(&fixture, foreground)["pending"],
+        1,
+        "counted once"
+    );
+    fixture.close(foreground);
+}
+
+/// ```text
+/// process 1: foreground ──insert(t1)──► relay store ──✗ no server
+/// process 2: a new foreground of the same store
+///   pending rows of todos: t1 (the store recovered the commit; the new
+///   foreground never wrote it)
+/// ```
+#[test]
+fn pending_upload_rows_names_a_row_the_store_recovered_after_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("alice.sqlite");
+    {
+        let first = Fixture::new();
+        let capability = first.admit(&path, "alice", 0x13);
+        let foreground = first.open(&capability);
+        first.insert_todo(foreground, [0xa2; 16], "never synced");
+        let other = first.open(&capability);
+        first.wait_for_row(other, (RowUuid::from_bytes([0xa2; 16]), "never synced"));
+        first.close(foreground);
+        first.close(other);
+    }
+    let second = Fixture::new();
+    let capability = second.admit(&path, "alice", 0x13);
+    let foreground = second.open(&capability);
+    second.tick(foreground);
+    assert_eq!(
+        pending_upload_rows(&second, foreground, "todos"),
+        [[0xa2; 16]],
+        "the recovered commit still names its row"
+    );
+    second.close(foreground);
+}
+
+fn upload_status(fixture: &Fixture, foreground: u64) -> serde_json::Value {
+    let ForegroundDbCommandResponse::UploadStatus { status_json } =
+        fixture.execute(foreground, ForegroundDbCommandRequest::UploadStatus)
+    else {
+        panic!("an upload status");
+    };
+    serde_json::from_str(&status_json).unwrap()
+}
+
+/// ```text
+/// process 1: foreground ──insert(t1)──► relay store ──✗ no server
+/// process 2: a new foreground; then the server connects and accepts t1
+///   before: pending 1, rows [t1]
+///   after:  pending 0, rows [], and the revision moved (the only signal a
+///           foreground gets: no session of its own waits for t1)
+/// ```
+#[test]
+fn a_recovered_row_leaves_the_pending_set_when_the_server_accepts_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("alice.sqlite");
+    let (server, head) = {
+        let bundle = renamed_label_bundle();
+        server_with_history(&bundle)
+    };
+    let bundle = renamed_label_bundle();
+    {
+        let first = Fixture::new();
+        let capability = first.admit_app(&path, "alice", 0x14, &head, Some(&bundle));
+        let foreground = first.open(&capability);
+        first.insert_todo(foreground, [0xa3; 16], "written offline");
+        let other = first.open(&capability);
+        first.wait_for_row(other, (RowUuid::from_bytes([0xa3; 16]), "written offline"));
+        first.close(foreground);
+        first.close(other);
+    }
+    let second = Fixture::new();
+    let capability = second.admit_app(&path, "alice", 0x14, &head, Some(&bundle));
+    let foreground = second.open(&capability);
+    second.tick(foreground);
+    let before = upload_status(&second, foreground);
+    assert_eq!(before["pending"], 1, "the recovered commit is counted");
+    assert_eq!(
+        second.execute(foreground, ForegroundDbCommandRequest::PendingUploadCount),
+        ForegroundDbCommandResponse::PendingUploadCount { count: 1 },
+        "the count older hosts read agrees"
+    );
+    assert_eq!(
+        pending_upload_rows(&second, foreground, "todos"),
+        [[0xa3; 16]]
+    );
+
+    let relay = second.open_relay(&capability);
+    let upstream = server
+        .accept_subscriber(Fixture::author(0x14), Default::default())
+        .unwrap();
+    for _ in 0..200 {
+        second.carry(relay, &upstream);
+        second.tick(foreground);
+        if upload_status(&second, foreground)["pending"] == 0 {
+            break;
+        }
+    }
+    let after = upload_status(&second, foreground);
+    assert_eq!(
+        after["pending"], 0,
+        "the server accepted the recovered commit"
+    );
+    assert!(
+        pending_upload_rows(&second, foreground, "todos").is_empty(),
+        "an accepted row is not pending"
+    );
+    assert_ne!(after["pendingRevision"], before["pendingRevision"]);
+    second.close(foreground);
+}
+
 #[test]
 fn slow_query_commands_have_pinned_bytes_and_answer() {
     // Appended commands and answers: existing ordinals stay fixed.
@@ -1481,7 +1644,18 @@ fn a_store_is_rebuilt_once_per_schema_version() {
     let _alice = first
         .attach_client(identity(0x02), BTreeMap::new())
         .unwrap();
+    let revision = |relay: &NativeRelay| {
+        relay
+            .run(|worker| Ok(worker.persistent_pending_revision()))
+            .unwrap()
+    };
+    let before = revision(&first);
     assert_eq!(carry(&first), 2, "refused, rebuilt once, refused again");
+    assert!(
+        revision(&first) > before,
+        "the rebuilt store continues the pending revision, so a status read \
+         across the rebuild is never taken for an unchanged one"
+    );
     assert!(first.upstream_refusal().unwrap().is_some());
     drop(first);
 
