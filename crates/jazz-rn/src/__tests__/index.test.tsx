@@ -16,6 +16,7 @@ type NativeForegroundCommand =
   | { type: "takeSlowQueryReport"; app?: string }
   | { type: "setSlowQueryThresholdMs"; ms: number }
   | { type: "deleteStore" }
+  | { type: "pendingUploadRows"; table: string }
   | {
       type: "all";
       query: Uint8Array;
