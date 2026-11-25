@@ -12,7 +12,7 @@ on:
         description: JSON matrix for NAPI platform packages. Release callers use every platform; preview callers may omit expensive optional platforms.
         required: false
         type: string
-        default: '[{"os":"blacksmith-16vcpu-ubuntu-2404","target":"x86_64-unknown-linux-gnu","platform":"linux-x64-gnu","use_sccache":false},{"os":"blacksmith-16vcpu-ubuntu-2404-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-arm64-gnu","use_sccache":false},{"os":"blacksmith-6vcpu-macos-15","target":"x86_64-apple-darwin","platform":"darwin-x64","use_sccache":false},{"os":"blacksmith-6vcpu-macos-15","target":"aarch64-apple-darwin","platform":"darwin-arm64","use_sccache":false},{"os":"blacksmith-16vcpu-windows-2025","target":"x86_64-pc-windows-msvc","platform":"win32-x64-msvc","use_sccache":false}]'
+        default: '[{"os":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","platform":"linux-x64-gnu","use_sccache":false},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","platform":"linux-arm64-gnu","use_sccache":false},{"os":"macos-15","target":"x86_64-apple-darwin","platform":"darwin-x64","use_sccache":false},{"os":"macos-15","target":"aarch64-apple-darwin","platform":"darwin-arm64","use_sccache":false},{"os":"windows-2025","target":"x86_64-pc-windows-msvc","platform":"win32-x64-msvc","use_sccache":false}]'
       include_rn:
         description: Build and stage jazz-rn's Android and iOS relay artifacts. Keep false for ordinary package previews; releases opt in explicitly.
         required: false
@@ -59,7 +59,7 @@ jobs:
   # this artifact) take it from there. Keep the artifact names.
   build-linux:
     name: Build server Linux (${{ matrix.arch }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     env:
       CARGO_ZIGBUILD_CACHE_DIR: /tmp/cargo-zigbuild-cache
     strategy:
@@ -130,11 +130,11 @@ jobs:
       matrix:
         include:
           - arch: x64
-            os: blacksmith-4vcpu-ubuntu-2404
+            os: ubuntu-24.04
             artifact: jazz-tools-linux-x64
           # Jazz Cloud runs the arm64 build.
           - arch: arm64
-            os: blacksmith-4vcpu-ubuntu-2404-arm
+            os: ubuntu-24.04-arm
             artifact: jazz-tools-linux-arm64
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -176,7 +176,7 @@ jobs:
     # 16 vCPUs: a release's version bump recompiles every jazz crate, and
     # on 4 vCPUs that (with LTO and wasm-opt) took 5-10 min, the release
     # build's critical path.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -235,7 +235,7 @@ jobs:
     # 16 vCPUs: a release's version bump recompiles every jazz crate, and
     # on 4 vCPUs that (with LTO and wasm-opt) took 5-10 min, the release
     # build's critical path.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -296,7 +296,7 @@ jobs:
     name: Build jazz-wasm backend entry
     # 16 vCPUs, like the other jazz-wasm builds: a release's version bump
     # recompiles every jazz crate.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -351,7 +351,7 @@ jobs:
     needs: [build-wasm-durable-object, build-wasm-backend]
     # 16 vCPUs: it builds the correctness artifacts, then runs the suite (5.4
     # min on 4 vCPUs); the release build's last packages job.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -475,7 +475,7 @@ jobs:
   build-jazz-rn-android:
     name: Build jazz-rn Android relay (${{ matrix.abi }})
     if: inputs.include_rn
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -535,7 +535,7 @@ jobs:
   seal-jazz-rn-android:
     name: Seal jazz-rn Android relay artifacts
     needs: build-jazz-rn-android
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -575,7 +575,7 @@ jobs:
   build-jazz-rn-ios-slices:
     name: Build jazz-rn iOS relay (${{ matrix.target }})
     if: inputs.include_rn
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     strategy:
       fail-fast: true
       matrix:
@@ -687,7 +687,7 @@ jobs:
   build-jazz-rn-ios-clean:
     name: Build jazz-rn iOS relay without cache (${{ matrix.target }})
     if: inputs.include_rn && inputs.reproduce_ios_relay
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     strategy:
       fail-fast: true
       matrix:
@@ -724,7 +724,7 @@ jobs:
     name: Check the cached iOS relay matches a clean build
     if: inputs.include_rn && inputs.reproduce_ios_relay
     needs: [build-jazz-rn-ios-slices, build-jazz-rn-ios-clean]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -751,7 +751,7 @@ jobs:
     name: Build jazz-rn iOS relay XCFramework
     if: inputs.include_rn
     needs: build-jazz-rn-ios-slices
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -788,7 +788,7 @@ jobs:
 
   assemble-packages:
     name: Assemble npm packages
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - build-linux
       - check-linux-heap-profile
@@ -1010,9 +1010,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-4vcpu-ubuntu-2404
+          - os: ubuntu-24.04
             platform: linux-x64-gnu
-          - os: blacksmith-4vcpu-ubuntu-2404-arm
+          - os: ubuntu-24.04-arm
             platform: linux-arm64-gnu
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -1052,7 +1052,7 @@ jobs:
         needs.seal-jazz-rn-android.result == 'success' &&
         needs.build-jazz-rn-ios.result == 'success'
       }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       artifact: ${{ steps.artifact.outputs.name }}
 
@@ -1121,7 +1121,7 @@ jobs:
     needs: assemble-jazz-rn
     if: inputs.include_rn && needs.assemble-jazz-rn.result == 'success'
     # 16 vCPUs: the C++ build for every ABI is most of this job.
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -1138,7 +1138,9 @@ jobs:
         run: echo "GRADLE_USER_HOME=${RUNNER_TEMP}/gradle-home" >> "${GITHUB_ENV}"
       # Committed only by release-artifacts' pushes to main and release, never
       # by a PR's run, which still mounts it.
-      - uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+      # LINSA FORK: GitHub-hosted runners have no Blacksmith sticky disks.
+      - if: ${{ !startsWith(github.repository, 'linsa-labs/') }}
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
         with:
           key: rn-consumer-android-gradle-${{ github.repository_id }}-v2
           commit: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release') && 'true' || 'false' }}
@@ -1201,7 +1203,7 @@ jobs:
     name: Verify packaged jazz-rn iOS consumer
     needs: assemble-jazz-rn
     if: inputs.include_rn && needs.assemble-jazz-rn.result == 'success'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -1307,7 +1309,7 @@ jobs:
     name: Pack npm tarballs
     if: inputs.release_bundles
     needs: [assemble-packages, assemble-jazz-rn]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

@@ -18,6 +18,7 @@ on:
   push:
     tags:
       - "linsa-sqlite-*"
+      - "linsa-b3-*"
   workflow_dispatch:
     inputs:
       tag:
