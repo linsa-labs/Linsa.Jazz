@@ -860,6 +860,10 @@ pub struct NativeRelayHost {
     /// relay scope. A foreground never chooses or retains this state itself.
     foreground_node_leases: BTreeMap<RelayScope, ForegroundNodeLeasePool>,
     next_handle: u64,
+    /// PREWARM DRAFT: the schema source last parsed in this process (by the
+    /// prewarm, from its record, or by an admission), so the attach that
+    /// brings the same text does not parse it again.
+    parsed_schema: Option<ParsedSchemaSource>,
     /// Deterministic transport seam for host-level socket lifecycle tests.
     /// Production always uses [`NativeWebSocketConnector`].
     #[cfg(test)]
@@ -876,6 +880,76 @@ pub struct NativeRelayHost {
 struct AdmittedRelayScope {
     config: RelayOpenConfig,
     claims: BTreeMap<String, Value>,
+    /// PREWARM DRAFT: the request this scope was admitted from, without
+    /// claims, recorded for the next launch's prewarm.
+    prewarm_record: String,
+}
+
+/// PREWARM DRAFT: the next launch opens the relay from this, before JS asks.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PrewarmRecord {
+    scope: RelayScopeRequest,
+    sqlite_path: String,
+    schema_json: String,
+    identity: DbIdentity,
+    #[serde(default)]
+    claims: BTreeMap<String, Value>,
+    /// sha256 (hex) of the schema text JavaScript attached, before it was
+    /// canonicalized: the next launch's attach of the same text skips the
+    /// parse (see [`ParsedSchemaSource`]).
+    #[serde(default)]
+    raw_schema_sha256: Option<String>,
+}
+
+const PREWARM_RECORD: &str = "jazz-prewarm.json";
+
+/// PREWARM DRAFT: a schema source and what parsing it gave. Attaching it
+/// costs ~60 ms of the JS thread on a Realme G95 (two JSON parses and a
+/// schema conversion), work the prewarm already did off-thread from the
+/// record of the launch before.
+#[derive(Clone)]
+struct ParsedSchemaSource {
+    /// sha256 (hex) of the text before canonicalization, when known.
+    raw_sha256: Option<String>,
+    /// The canonical text `relay_open_config` parsed.
+    canonical: String,
+    /// Its result; scope, path and identity are the admission's own.
+    config: RelayOpenConfig,
+}
+
+/// The relay configuration a scope admission request names.
+fn relay_open_config(
+    scope: RelayScopeRequest,
+    sqlite_path: String,
+    schema_json: &str,
+    identity: DbIdentity,
+) -> Result<RelayOpenConfig, JazzNativeRelayStatus> {
+    let mut public_schema = serde_json::from_str::<serde_json::Value>(schema_json)
+        .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    let migrations = public_schema
+        .as_object_mut()
+        .and_then(|fields| fields.remove("migrations"))
+        .map(|bundle| serde_json::to_vec(&bundle))
+        .transpose()
+        .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    let migrations =
+        jazz::tools::deployment::published::lowered_client_migrations(migrations.as_deref())
+            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    let public_schema = serde_json::from_value(public_schema)
+        .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    let schema =
+        JazzSchema::new(&public_schema).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+    Ok(RelayOpenConfig {
+        supported_abi: NativeRelayAbiRange {
+            minimum: NATIVE_RELAY_ABI_V1,
+            maximum: NATIVE_RELAY_ABI_V1,
+        },
+        scope: scope.into(),
+        sqlite_path: PathBuf::from(sqlite_path),
+        schema,
+        migrations,
+        identity,
+    })
 }
 
 struct OpenedRelay {
@@ -1079,6 +1153,7 @@ impl Default for NativeRelayHost {
             foregrounds: BTreeMap::new(),
             foreground_node_leases: BTreeMap::new(),
             next_handle: 1,
+            parsed_schema: None,
             #[cfg(test)]
             socket_connector: None,
             #[cfg(test)]
@@ -1595,7 +1670,7 @@ impl NativeRelayHost {
         {
             return Err(JazzNativeRelayStatus::InvalidHandle);
         }
-        let (config, author, claims) = {
+        let (config, author, claims, prewarm_record) = {
             let admitted = self
                 .admitted_scopes
                 .get(&admitted_scope)
@@ -1604,8 +1679,10 @@ impl NativeRelayHost {
                 admitted.config.clone(),
                 admitted.config.identity.author,
                 admitted.claims.clone(),
+                admitted.prewarm_record.clone(),
             )
         };
+        let record_dir = config.sqlite_path.parent().map(|dir| dir.to_path_buf());
         let scope = config.scope.clone();
         let relay = self.registry.open_admitted(config).map_err(relay_status)?;
         self.ensure_private_scope_worker(admitted_scope, &scope, relay.clone(), author)?;
@@ -1623,7 +1700,18 @@ impl NativeRelayHost {
         let client_handle = self
             .allocate()
             .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let lease = self.acquire_foreground_lease(&scope)?;
+        let lease = match self.registry.take_prewarmed_node(&scope) {
+            Some(node) => match self
+                .foreground_node_leases
+                .entry(scope.clone())
+                .or_default()
+                .acquire_fresh(node)
+            {
+                Ok(lease) => lease,
+                Err(_) => self.acquire_foreground_lease(&scope)?,
+            },
+            None => self.acquire_foreground_lease(&scope)?,
+        };
         let client = match relay.attach_foreground_client(
             DbIdentity {
                 node: lease.node,
@@ -1680,6 +1768,12 @@ impl NativeRelayHost {
                 lease,
             },
         );
+        if let Some(dir) = record_dir {
+            let tmp = dir.join(format!("{PREWARM_RECORD}.tmp"));
+            if std::fs::write(&tmp, prewarm_record.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join(PREWARM_RECORD));
+            }
+        }
         Ok(foreground)
     }
 
@@ -1989,6 +2083,7 @@ impl NativeRelayHost {
     fn admit_scope(
         &mut self,
         request: RelayScopeAdmissionRequest,
+        raw_schema_sha256: Option<String>,
     ) -> Result<AdmissionCapability, JazzNativeRelayStatus> {
         RelayScope::from(request.scope.clone())
             .validate()
@@ -1997,34 +2092,42 @@ impl NativeRelayHost {
             return Err(JazzNativeRelayStatus::LifecycleFailure);
         }
         reject_bearer_claims(&request.claims)?;
-        // The attached schema, and beside its tables the migrations the app
-        // ships, if any (`ClientMigrations` in jazz-tools).
-        let mut public_schema = serde_json::from_str::<serde_json::Value>(&request.schema_json)
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let migrations = public_schema
-            .as_object_mut()
-            .and_then(|fields| fields.remove("migrations"))
-            .map(|bundle| serde_json::to_vec(&bundle))
-            .transpose()
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let migrations =
-            jazz::tools::deployment::published::lowered_client_migrations(migrations.as_deref())
-                .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let public_schema = serde_json::from_value(public_schema)
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let schema =
-            JazzSchema::new(&public_schema).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let config = RelayOpenConfig {
-            supported_abi: NativeRelayAbiRange {
-                minimum: NATIVE_RELAY_ABI_V1,
-                maximum: NATIVE_RELAY_ABI_V1,
-            },
-            scope: request.scope.into(),
-            sqlite_path: PathBuf::from(request.sqlite_path),
-            schema,
-            migrations,
+        let prewarm_record = serde_json::to_string(&PrewarmRecord {
+            scope: request.scope.clone(),
+            sqlite_path: request.sqlite_path.clone(),
+            schema_json: request.schema_json.clone(),
             identity: request.identity,
+            claims: request.claims.clone(),
+            raw_schema_sha256: raw_schema_sha256.clone(),
+        })
+        .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        let config = match &self.parsed_schema {
+            Some(parsed) if parsed.canonical == request.schema_json => RelayOpenConfig {
+                scope: request.scope.into(),
+                sqlite_path: PathBuf::from(request.sqlite_path),
+                identity: request.identity,
+                ..parsed.config.clone()
+            },
+            _ => {
+                let config = relay_open_config(
+                    request.scope,
+                    request.sqlite_path,
+                    &request.schema_json,
+                    request.identity,
+                )?;
+                self.parsed_schema = Some(ParsedSchemaSource {
+                    raw_sha256: raw_schema_sha256.clone(),
+                    canonical: request.schema_json.clone(),
+                    config: config.clone(),
+                });
+                config
+            }
         };
+        if let Some(parsed) = &mut self.parsed_schema
+            && raw_schema_sha256.is_some()
+        {
+            parsed.raw_sha256 = raw_schema_sha256;
+        }
         // A scope is immutable once trusted code has admitted it. Reject a
         // conflicting second configuration before JavaScript can receive a
         // capability, even if no relay alias has been opened yet.
@@ -2044,6 +2147,7 @@ impl NativeRelayHost {
             AdmittedRelayScope {
                 config,
                 claims: request.claims,
+                prewarm_record,
             },
         );
         Ok(handle)
@@ -2159,18 +2263,40 @@ impl NativeRelayHost {
         // Canonicalize at this credential-free boundary before constructing a
         // JazzSchema. A malformed schema consumes the one-shot session setup;
         // callers must restart setup rather than attach a different schema.
-        let value = serde_json::from_str::<serde_json::Value>(schema_json)
-            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
-        let schema_json =
-            serde_json::to_string(&value).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        // PREWARM DRAFT: the same text as the one parsed already in this
+        // process (by the prewarm, from the last launch's record) has the
+        // same canonical form; reuse it instead of parsing again.
+        let raw_sha256 = jazz::sha256::hash(schema_json.as_bytes()).to_hex();
+        let schema_json = match &self.parsed_schema {
+            Some(parsed) if parsed.raw_sha256.as_deref() == Some(raw_sha256.as_str()) => {
+                parsed.canonical.clone()
+            }
+            _ => {
+                let value = serde_json::from_str::<serde_json::Value>(schema_json)
+                    .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+                serde_json::to_string(&value).map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?
+            }
+        };
+        // PREWARM DRAFT: a relay prewarmed for this scope already holds this
+        // process's fresh node; adopt it instead of the one setup minted.
+        if let Some(identity) = self
+            .registry
+            .speculative_identity(&RelayScope::from(pending.scope.clone()))
+            && identity.author == pending.identity.author
+        {
+            pending.identity = identity;
+        }
         let socket = pending.socket;
-        let admitted = self.admit_scope(RelayScopeAdmissionRequest {
-            scope: pending.scope,
-            sqlite_path: pending.sqlite_path,
-            schema_json,
-            identity: pending.identity,
-            claims: pending.claims,
-        })?;
+        let admitted = self.admit_scope(
+            RelayScopeAdmissionRequest {
+                scope: pending.scope,
+                sqlite_path: pending.sqlite_path,
+                schema_json,
+                identity: pending.identity,
+                claims: pending.claims,
+            },
+            Some(raw_sha256),
+        )?;
         if let Some(socket) = socket {
             self.private_socket_sessions.insert(admitted, socket);
         }
@@ -2631,6 +2757,72 @@ impl JazzNativeRelayHostLease {
     }
 }
 
+/// PREWARM DRAFT: open the relay the last launch admitted under
+/// `storage_root`, and its first foreground's Db, before JavaScript asks.
+///
+/// # Safety
+/// `host` must be live; `root` must be readable for `root_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jazz_native_relay_host_prewarm(
+    host: *mut JazzNativeRelayHost,
+    root: *const u8,
+    root_len: usize,
+) -> JazzNativeRelayStatus {
+    ffi_call(|| {
+        if host.is_null() || root.is_null() {
+            return Err(JazzNativeRelayStatus::InvalidArgument);
+        }
+        let root = unsafe { std::slice::from_raw_parts(root, root_len) };
+        let root = std::str::from_utf8(root).map_err(|_| JazzNativeRelayStatus::InvalidArgument)?;
+        let path = std::path::Path::new(root).join(PREWARM_RECORD);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(());
+        };
+        let record: PrewarmRecord =
+            serde_json::from_slice(&bytes).map_err(|_| JazzNativeRelayStatus::InvalidArgument)?;
+        let sqlite_path = PathBuf::from(&record.sqlite_path);
+        let started = std::time::Instant::now();
+        // A fresh node for this process, as session setup would give it; the
+        // admitted open adopts it (see `attach_canonical_schema`).
+        let identity = fresh_client_identity(record.identity.author).map_err(relay_status)?;
+        let config = relay_open_config(
+            record.scope,
+            record.sqlite_path,
+            &record.schema_json,
+            identity,
+        )?;
+        relay::prewarm_note(
+            &sqlite_path,
+            &format!("prewarm config in {} ms", started.elapsed().as_millis()),
+        );
+        let host = unsafe { &*host };
+        let mut guard = host
+            .inner
+            .lock()
+            .map_err(|_| JazzNativeRelayStatus::LifecycleFailure)?;
+        guard.parsed_schema = Some(ParsedSchemaSource {
+            raw_sha256: record.raw_schema_sha256.clone(),
+            canonical: record.schema_json.clone(),
+            config: config.clone(),
+        });
+        let queries: Vec<relay::PrewarmQuery> = std::fs::read(
+            std::path::Path::new(root).join(relay::PREWARM_QUERIES),
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+        let foreground = (!queries.is_empty())
+            .then(|| fresh_client_identity(identity.author).ok())
+            .flatten()
+            .map(|node| (node, record.claims.clone(), queries));
+        guard
+            .registry
+            .prewarm(config, foreground)
+            .map_err(relay_status)?;
+        Ok(())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn jazz_native_relay_host_new() -> *mut JazzNativeRelayHost {
     Box::into_raw(Box::new(JazzNativeRelayHost {
@@ -2760,7 +2952,7 @@ pub unsafe extern "C" fn jazz_native_relay_host_admit_scope_json(
         let request = serde_json::from_slice::<TrustedRelayScopeAdmissionJson>(request)
             .map_err(|_| JazzNativeRelayStatus::InvalidCommand)?
             .normalize()?;
-        let capability = host.lock()?.admit_scope(request)?;
+        let capability = host.lock()?.admit_scope(request, None)?;
         unsafe { write_capability_out(out, capability) };
         Ok(())
     })

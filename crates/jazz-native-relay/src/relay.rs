@@ -20,7 +20,7 @@
 //! wakes it through the platform callback.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -536,6 +536,42 @@ impl NativeRelay {
         })
     }
 
+    /// PREWARM DRAFT: queue a prewarmed foreground without waiting.
+    pub(crate) fn prewarm_foreground(
+        &self,
+        identity: DbIdentity,
+        claims: BTreeMap<String, Value>,
+        queries: Vec<PrewarmQuery>,
+    ) -> Result<(), RelayError> {
+        let job: RelayJob =
+            Box::new(move |worker| worker.prewarm_foreground(identity, claims, queries));
+        let commands = self
+            .inner
+            .commands
+            .lock()
+            .map_err(|_| RelayError::Poisoned("relay command queue"))?;
+        commands
+            .as_ref()
+            .ok_or(RelayError::Closed)?
+            .try_send(RelayCommand::Run(job))
+            .map_err(|_| RelayError::OwnerQueueFull)
+    }
+
+    /// PREWARM DRAFT: queue the spare foreground open without waiting.
+    pub(crate) fn prepare_spare(&self) -> Result<(), RelayError> {
+        let job: RelayJob = Box::new(|worker| worker.prepare_spare());
+        let commands = self
+            .inner
+            .commands
+            .lock()
+            .map_err(|_| RelayError::Poisoned("relay command queue"))?;
+        commands
+            .as_ref()
+            .ok_or(RelayError::Closed)?
+            .try_send(RelayCommand::Run(job))
+            .map_err(|_| RelayError::OwnerQueueFull)
+    }
+
     /// Run `operation` on the owner thread and wait for its result.
     pub(crate) fn run<T: Send + 'static>(
         &self,
@@ -925,6 +961,34 @@ pub(crate) struct RelayWorker {
     redrive: bool,
     /// When time-bound waits were last evaluated.
     timed: Instant,
+    /// PREWARM DRAFT: a foreground Db opened ahead of the first attach.
+    spare: Option<Db>,
+    /// PREWARM DRAFT: a foreground attached ahead of the first open, with
+    /// the last launch's first queries subscribed on it.
+    prewarmed: Option<PrewarmedForeground>,
+    /// PREWARM DRAFT: the first queries of this launch's first foreground.
+    recording: Option<(Instant, u64, Vec<PrewarmQuery>)>,
+    prewarm_pending_retire: Option<(u64, Vec<u8>)>,
+}
+
+/// PREWARM DRAFT: one recorded first query.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrewarmQuery {
+    pub query: Vec<u8>,
+    pub options_json: String,
+}
+
+pub(crate) const PREWARM_QUERIES: &str = "jazz-prewarm-queries.json";
+const PREWARM_RECORD_WINDOW: Duration = Duration::from_secs(5);
+const PREWARM_HOLD: Duration = Duration::from_secs(10);
+
+struct PrewarmedForeground {
+    id: u64,
+    identity: DbIdentity,
+    claims: BTreeMap<String, Value>,
+    /// Prewarm subscriptions still open: query bytes → handle.
+    subscriptions: Vec<(Vec<u8>, u64)>,
+    claimed: Option<Instant>,
 }
 
 /// A binding's tick requests set `dirty`; the owner's drive ticks it.
@@ -1031,7 +1095,243 @@ impl RelayWorker {
             rebuilt: false,
             redrive: false,
             timed: Instant::now(),
+            spare: None,
+            prewarmed: None,
+            recording: None,
+            prewarm_pending_retire: None,
         })
+    }
+
+    /// PREWARM DRAFT: attach a foreground now and subscribe the recorded
+    /// first queries on it, so their rows reach its Db before JS asks.
+    fn prewarm_foreground(
+        &mut self,
+        identity: DbIdentity,
+        claims: BTreeMap<String, Value>,
+        queries: Vec<PrewarmQuery>,
+    ) {
+        let started = Instant::now();
+        let id = match self.attach(identity, claims.clone(), 0) {
+            Ok(id) => id,
+            Err(error) => {
+                prewarm_note(&self.sqlite_path, &format!("prewarm attach failed: {error}"));
+                return;
+            }
+        };
+        let mut subscriptions = Vec::new();
+        if let Ok(client) = self.client_mut(id) {
+            for query in queries {
+                match foreground_command(
+                    client,
+                    ForegroundDbCommandRequest::Subscribe {
+                        query: query.query.clone(),
+                        options_json: query.options_json,
+                    },
+                ) {
+                    Ok(ForegroundDbCommandResponse::Subscribed { subscription }) => {
+                        subscriptions.push((query.query, subscription));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let count = subscriptions.len();
+        self.prewarmed = Some(PrewarmedForeground {
+            id,
+            identity,
+            claims,
+            subscriptions,
+            claimed: None,
+        });
+        self.drive();
+        prewarm_note(
+            &self.sqlite_path,
+            &format!("prewarm subscribed {count} in {} ms", started.elapsed().as_millis()),
+        );
+    }
+
+    /// PREWARM DRAFT: remember `command` if it is one of the first queries,
+    /// and retire a prewarm subscription the foreground now holds itself.
+    fn prewarm_observe(&mut self, id: u64, command: &ForegroundDbCommandRequest) {
+        let (query, options_json, subscribe) = match command {
+            ForegroundDbCommandRequest::Subscribe { query, options_json } => {
+                (query, options_json, true)
+            }
+            ForegroundDbCommandRequest::All { query, options_json, transaction: None } => {
+                (query, options_json, false)
+            }
+            _ => return self.prewarm_expire(id),
+        };
+        if let Some((started, recording_id, queries)) = &mut self.recording
+            && *recording_id == id
+            && started.elapsed() < PREWARM_RECORD_WINDOW
+        {
+            let entry = PrewarmQuery {
+                query: query.clone(),
+                options_json: options_json.clone(),
+            };
+            if !queries.contains(&entry) {
+                queries.push(entry);
+                if let Some(dir) = self.sqlite_path.parent()
+                    && let Ok(bytes) = serde_json::to_vec(queries)
+                {
+                    let tmp = dir.join(format!("{PREWARM_QUERIES}.tmp"));
+                    if std::fs::write(&tmp, bytes).is_ok() {
+                        let _ = std::fs::rename(&tmp, dir.join(PREWARM_QUERIES));
+                    }
+                }
+            }
+        }
+        if subscribe {
+            self.prewarm_pending_retire = Some((id, query.clone()));
+        }
+        self.prewarm_expire(id);
+    }
+
+    /// PREWARM DRAFT: after JS opened its own subscription for a prewarmed
+    /// query, close the prewarm one; after the hold, close all of them.
+    fn prewarm_retire(&mut self, id: u64, query: &[u8]) {
+        let Some(prewarmed) = &mut self.prewarmed else { return };
+        if prewarmed.id != id {
+            return;
+        }
+        let mut closing = Vec::new();
+        prewarmed.subscriptions.retain(|(bytes, handle)| {
+            if bytes.as_slice() == query {
+                closing.push(*handle);
+                false
+            } else {
+                true
+            }
+        });
+        if let Ok(client) = self.client_mut(id) {
+            for handle in closing {
+                if client.subscriptions.remove(&handle).is_some() {
+                    client.dirty.set(true);
+                }
+            }
+        }
+    }
+
+    fn prewarm_expire(&mut self, id: u64) {
+        let expired = matches!(
+            &self.prewarmed,
+            Some(PrewarmedForeground { id: pid, claimed: Some(at), subscriptions, .. })
+                if *pid == id && at.elapsed() >= PREWARM_HOLD && !subscriptions.is_empty()
+        );
+        if !expired {
+            return;
+        }
+        let handles: Vec<u64> = self
+            .prewarmed
+            .as_mut()
+            .map(|p| std::mem::take(&mut p.subscriptions).into_iter().map(|(_, h)| h).collect())
+            .unwrap_or_default();
+        if let Ok(client) = self.client_mut(id) {
+            for handle in handles {
+                if client.subscriptions.remove(&handle).is_some() {
+                    client.dirty.set(true);
+                }
+            }
+        }
+        prewarm_note(&self.sqlite_path, "prewarm hold expired");
+    }
+
+    /// PREWARM DRAFT: open the next foreground's Db now (schema DDL and
+    /// migrations), under this relay's own identity; attach rebinds it.
+    fn prepare_spare(&mut self) {
+        if self.spare.is_some() {
+            return;
+        }
+        let started = Instant::now();
+        match self.open_foreground_db(self.identity) {
+            Ok(db) => {
+                self.spare = Some(db);
+                prewarm_note(&self.sqlite_path, &format!("spare ready in {} ms", started.elapsed().as_millis()));
+            }
+            Err(error) => prewarm_note(&self.sqlite_path, &format!("spare failed: {error}")),
+        }
+    }
+
+    /// A foreground client's in-memory store. A fresh one replays the
+    /// genesis DDL and every migration's ALTERs (each a full schema
+    /// reparse); the image of the first one this engine build, schema and
+    /// migrations produced, kept beside the relay's file, opens without them.
+    fn open_foreground_db(&self, identity: DbIdentity) -> Result<Db, RelayError> {
+        let config = || relay_db_config(self.schema.clone(), identity, &self.migrations);
+        let scope = self.foreground_image_scope();
+        let key = self.foreground_image_key();
+        let path = self
+            .sqlite_path
+            .parent()
+            .filter(|_| !FOREGROUND_IMAGE_OFF.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|dir| dir.join(format!("foreground-{scope}-{key}.image")));
+        if let Some(path) = &path
+            && let Ok(file) = std::fs::read(path)
+        {
+            // The image is only a shortcut: a panic on its way in must not take the worker
+            // (and with it the store and the link) down. It turns the shortcut off for the
+            // rest of the process and the open goes the fresh way.
+            let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                foreground_image_body(&file).map(|image| block_on(Db::open_image(config(), image)))
+            }));
+            match opened {
+                Ok(Some(Ok(db))) => {
+                    prewarm_note(&self.sqlite_path, "foreground image hit");
+                    return Ok(db);
+                }
+                Ok(Some(Err(error))) => {
+                    prewarm_note(&self.sqlite_path, &format!("foreground image refused: {error}"));
+                    let _ = std::fs::remove_file(path);
+                }
+                Ok(None) => {
+                    prewarm_note(&self.sqlite_path, "foreground image damaged");
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(_) => {
+                    FOREGROUND_IMAGE_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                    prewarm_note(&self.sqlite_path, "foreground image panicked; off for this process");
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let db = block_on(Db::open(config())).map_err(|error| RelayError::Host(error.into()))?;
+        if let Some(path) = &path
+            && let Ok(image) = db.image()
+        {
+            match write_foreground_image(path, &scope, &image) {
+                Ok(()) => prewarm_note(&self.sqlite_path, &format!("foreground image written, {} bytes", image.len())),
+                Err(error) => prewarm_note(&self.sqlite_path, &format!("foreground image not written: {error}")),
+            }
+        }
+        Ok(db)
+    }
+
+    /// Which relay's images a file belongs to: the scopes that share a directory each keep
+    /// their own, and a write replaces only its own scope's older ones.
+    fn foreground_image_scope(&self) -> String {
+        let name = self
+            .sqlite_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        jazz::sha256::hash(name.as_bytes()).to_hex()[..12].to_owned()
+    }
+
+    /// What shapes a fresh foreground store: this engine build, the schema
+    /// and every migration schema in full (not only their version ids:
+    /// defaults and indexes are outside those), and the lenses.
+    fn foreground_image_key(&self) -> String {
+        let mut material = Vec::new();
+        material.extend_from_slice(b"foreground-image-2\0");
+        material.extend_from_slice(env!("JAZZ_RELAY_BUILD_ID").as_bytes());
+        for schema in std::iter::once(&self.schema).chain(self.migrations.schemas.iter()) {
+            material.push(0);
+            material.extend(serde_json::to_vec(schema.public_schema()).unwrap_or_default());
+        }
+        material.push(0);
+        material.extend_from_slice(format!("{:?}", self.migrations.lenses).as_bytes());
+        jazz::sha256::hash(&material).to_hex()[..32].to_owned()
     }
 
     fn run(&mut self, receiver: mpsc::Receiver<RelayCommand>) {
@@ -1111,18 +1411,48 @@ impl RelayWorker {
         claims: BTreeMap<String, Value>,
         high_water: u64,
     ) -> Result<u64, RelayError> {
+        if let Some(prewarmed) = &mut self.prewarmed
+            && prewarmed.claimed.is_none()
+        {
+            if prewarmed.identity == identity && prewarmed.claims == claims {
+                prewarmed.claimed = Some(Instant::now());
+                let id = prewarmed.id;
+                self.recording = Some((Instant::now(), id, Vec::new()));
+                prewarm_note(&self.sqlite_path, "attach claimed prewarmed foreground");
+                return Ok(id);
+            }
+            let id = prewarmed.id;
+            prewarm_note(
+                &self.sqlite_path,
+                &format!(
+                    "prewarmed foreground MISS: identity={} claims={}",
+                    prewarmed.identity != identity,
+                    prewarmed.claims != claims
+                ),
+            );
+            self.prewarmed = None;
+            let _ = self.detach(id);
+        }
         // A relay serves its own identity's sessions only: it uploads what
         // they write as itself.
         self.persistent
             .db
             .check_serves(identity.author)
             .map_err(|error| RelayError::Host(error.into()))?;
-        let db = block_on(Db::open(relay_db_config(
-            self.schema.clone(),
-            identity,
-            &self.migrations,
-        )))
-        .map_err(|error| RelayError::Host(error.into()))?;
+        let spare = self
+            .spare
+            .take()
+            .and_then(|mut db| db.rebind_identity(identity).then_some(db));
+        let db = match spare {
+            Some(db) => {
+                prewarm_note(&self.sqlite_path, "attach used spare");
+                db
+            }
+            None => {
+                prewarm_note(&self.sqlite_path, "attach opened fresh");
+                self.open_foreground_db(identity)?
+            }
+        };
         // Continue after the node's previous holder: its transaction ids
         // were (seq, node), and the relay deduplicates by them.
         if high_water > 0 {
@@ -1176,6 +1506,9 @@ impl RelayWorker {
                 next_handle: 0,
             },
         );
+        if self.prewarmed.is_none() && self.recording.is_none() {
+            self.recording = Some((Instant::now(), id, Vec::new()));
+        }
         self.drive();
         Ok(id)
     }
@@ -1487,11 +1820,15 @@ impl RelayWorker {
         id: u64,
         command: ForegroundDbCommandRequest,
     ) -> Result<ForegroundDbCommandResponse, RelayError> {
+        self.prewarm_observe(id, &command);
         let client = self.client_mut(id)?;
         let response = match foreground_command(client, command) {
             Ok(response) => response,
             Err(error) => operation_error(error),
         };
+        if let Some((pid, query)) = self.prewarm_pending_retire.take() {
+            self.prewarm_retire(pid, &query);
+        }
         Ok(response)
     }
 }
@@ -2202,26 +2539,135 @@ fn wait_for_write(
 #[derive(Default)]
 pub struct NativeRelayRegistry {
     relays: Mutex<BTreeMap<RelayScope, NativeRelay>>,
+    /// PREWARM DRAFT: relays opened from the last launch's record, not yet
+    /// claimed by an admitted open. A mismatching admitted open replaces them.
+    speculative: Mutex<BTreeSet<RelayScope>>,
+    /// PREWARM DRAFT: the node of a prewarmed foreground, per scope.
+    prewarmed_nodes: Mutex<BTreeMap<RelayScope, jazz::ids::NodeUuid>>,
+}
+
+/// PREWARM DRAFT: append one line to `<store dir>/jazz-prewarm.log`.
+pub(crate) fn prewarm_note(sqlite_path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Some(dir) = sqlite_path.parent()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("jazz-prewarm.log"))
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "{now} {line}");
+    }
+    #[cfg(target_os = "android")]
+    {
+        unsafe extern "C" {
+            fn __android_log_write(
+                prio: std::os::raw::c_int,
+                tag: *const std::os::raw::c_char,
+                text: *const std::os::raw::c_char,
+            ) -> std::os::raw::c_int;
+        }
+        if let Ok(text) = std::ffi::CString::new(line) {
+            unsafe { __android_log_write(4, c"JazzPrewarm".as_ptr(), text.as_ptr()) };
+        }
+    }
 }
 
 impl NativeRelayRegistry {
+    /// PREWARM DRAFT: take the prewarmed foreground node of `scope`.
+    pub fn take_prewarmed_node(&self, scope: &RelayScope) -> Option<jazz::ids::NodeUuid> {
+        self.prewarmed_nodes.lock().ok()?.remove(scope)
+    }
+
+    /// PREWARM DRAFT: open `config`'s relay ahead of admission and queue its
+    /// spare foreground. Does nothing if the scope is already open.
+    pub(crate) fn prewarm(
+        &self,
+        config: RelayOpenConfig,
+        foreground: Option<(DbIdentity, BTreeMap<String, Value>, Vec<PrewarmQuery>)>,
+    ) -> Result<(), RelayError> {
+        config.validate()?;
+        let mut relays = self
+            .relays
+            .lock()
+            .map_err(|_| RelayError::Poisoned("relay registry"))?;
+        if relays.contains_key(&config.scope) {
+            return Ok(());
+        }
+        let path = config.sqlite_path.clone();
+        let started = Instant::now();
+        let relay = NativeRelay::spawn(config.clone())?;
+        prewarm_note(&path, &format!("relay open in {} ms", started.elapsed().as_millis()));
+        relay.prepare_spare()?;
+        if let Some((identity, claims, queries)) = foreground {
+            let node = identity.node;
+            relay.prewarm_foreground(identity, claims, queries)?;
+            self.prewarmed_nodes
+                .lock()
+                .map_err(|_| RelayError::Poisoned("relay registry"))?
+                .insert(config.scope.clone(), node);
+        }
+        relays.insert(config.scope.clone(), relay);
+        self.speculative
+            .lock()
+            .map_err(|_| RelayError::Poisoned("relay registry"))?
+            .insert(config.scope);
+        Ok(())
+    }
+
+    /// PREWARM DRAFT: the identity of a prewarmed, unclaimed relay.
+    pub fn speculative_identity(&self, scope: &RelayScope) -> Option<DbIdentity> {
+        // Same lock order as `prewarm` / `open_admitted`: relays, then speculative.
+        let relays = self.relays.lock().ok()?;
+        let speculative = self.speculative.lock().ok()?;
+        if !speculative.contains(scope) {
+            return None;
+        }
+        relays.get(scope).map(|relay| relay.inner.identity)
+    }
+
     pub fn open_admitted(&self, config: RelayOpenConfig) -> Result<NativeRelay, RelayError> {
         config.validate()?;
         let mut relays = self
             .relays
             .lock()
             .map_err(|_| RelayError::Poisoned("relay registry"))?;
+        let speculative = self
+            .speculative
+            .lock()
+            .map_err(|_| RelayError::Poisoned("relay registry"))?
+            .remove(&config.scope);
         if let Some(existing) = relays.get(&config.scope) {
-            if existing.inner.sqlite_path != config.sqlite_path
+            let mismatch = existing.inner.sqlite_path != config.sqlite_path
                 || existing.inner.schema_version != config.schema.version_id()
                 || existing.inner.migrations != config.migrations_key()
-                || existing.inner.identity != config.identity
-            {
+                || existing.inner.identity != config.identity;
+            if mismatch && speculative {
+                prewarm_note(
+                    &config.sqlite_path,
+                    &format!(
+                        "prewarm MISS: path={} schema={} migrations={} identity={}",
+                        existing.inner.sqlite_path != config.sqlite_path,
+                        existing.inner.schema_version != config.schema.version_id(),
+                        existing.inner.migrations != config.migrations_key(),
+                        existing.inner.identity != config.identity,
+                    ),
+                );
+                existing.inner.shutdown();
+                relays.remove(&config.scope);
+            } else if mismatch {
                 return Err(RelayError::ScopeConfigurationMismatch);
-            }
-            if existing.is_alive() {
+            } else if existing.is_alive() {
+                if speculative {
+                    prewarm_note(&config.sqlite_path, "prewarm HIT");
+                }
                 return Ok(existing.clone());
             }
+        }
+        if let Some(existing) = relays.get(&config.scope) {
             existing.inner.shutdown();
             relays.remove(&config.scope);
         }
@@ -3009,4 +3455,61 @@ mod sorted_union_len_tests {
         assert_eq!(sorted_union_len(&[1, 3, 5], &[2, 3, 6, 7]), 6);
         assert_eq!(sorted_union_len(&[1, 2, 3], &[1, 2, 3]), 3);
     }
+}
+
+const FOREGROUND_IMAGE_MAGIC: &[u8; 8] = b"JZFGIMG1";
+
+/// Set once an image load panicked: no further image is read in this process.
+static FOREGROUND_IMAGE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The image inside a file `write_foreground_image` wrote, if its length and
+/// digest still match.
+fn foreground_image_body(file: &[u8]) -> Option<&[u8]> {
+    let header = 8 + 8 + 32;
+    if file.len() < header || &file[..8] != FOREGROUND_IMAGE_MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(file[8..16].try_into().ok()?) as usize;
+    let body = &file[header..];
+    if body.len() != len || jazz::sha256::hash(body).as_bytes()[..] != file[16..48] {
+        return None;
+    }
+    Some(body)
+}
+
+/// Write an image durably next to the store, replacing this scope's other
+/// images there (an earlier engine's or schema's) and its own stale tmp files.
+fn write_foreground_image(path: &std::path::Path, scope: &str, image: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(FOREGROUND_IMAGE_MAGIC)?;
+        file.write_all(&(image.len() as u64).to_le_bytes())?;
+        file.write_all(jazz::sha256::hash(image).as_bytes())?;
+        file.write_all(image)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let other = entry.path();
+            let name = other.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ours = name.starts_with(&format!("foreground-{scope}-"));
+            let image = name.ends_with(".image");
+            // Only this process's tmp files: another one may be writing its own.
+            let own_tmp = name.ends_with(".tmp") && name.contains(&format!(".{}-", std::process::id()));
+            if other != path && ours && (image || own_tmp) {
+                let _ = std::fs::remove_file(other);
+            }
+        }
+    }
+    Ok(())
 }

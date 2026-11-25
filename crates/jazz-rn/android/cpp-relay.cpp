@@ -74,6 +74,21 @@ std::shared_ptr<ForegroundRuntimeInstallation> foregroundInstallation(
 }
 }  // namespace
 
+extern "C" __attribute__((weak)) jazz_native_relay_status jazz_native_relay_host_prewarm(
+    jazz_native_relay_host *host, const uint8_t *root, size_t root_len);
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_jazzrn_JazzRelayBridge_nativePrewarm(JNIEnv *env, jclass, jlong host, jbyteArray root) {
+  if (&jazz_native_relay_host_prewarm == nullptr) return -1;
+  const jsize length = env->GetArrayLength(root);
+  jbyte *bytes = env->GetByteArrayElements(root, nullptr);
+  const auto status = jazz_native_relay_host_prewarm(
+      reinterpret_cast<jazz_native_relay_host *>(host),
+      reinterpret_cast<const uint8_t *>(bytes), static_cast<size_t>(length));
+  env->ReleaseByteArrayElements(root, bytes, JNI_ABORT);
+  return static_cast<jint>(status);
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_jazzrn_JazzRelayBridge_nativeCreate(JNIEnv *, jclass) {
   return reinterpret_cast<jlong>(jazz_native_relay_host_new());

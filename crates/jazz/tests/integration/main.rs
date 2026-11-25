@@ -177,6 +177,8 @@ mod relayed_read_refusal;
 mod remote_read_after_bulk_writes;
 #[path = "../reopened_admitted_versions.rs"]
 mod reopened_admitted_versions;
+#[path = "../foreground_image.rs"]
+mod foreground_image;
 #[path = "../replica_lost_tail.rs"]
 mod replica_lost_tail;
 #[path = "../required_relation_policies.rs"]
