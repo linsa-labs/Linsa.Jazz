@@ -1716,13 +1716,20 @@ impl Error {
 }
 
 impl Db {
-    /// PREWARM DRAFT: give a freshly opened, never-written handle another
-    /// identity. Only valid before the first write or read; refused (false,
-    /// nothing changed) while another handle shares the store.
+    /// Give a freshly opened, never-written handle another identity.
+    /// Refused (false, nothing changed) while another handle shares the
+    /// store, or once the store holds anything the old identity stamped: a
+    /// sync client, a session, or a transaction sequence.
     pub fn rebind_identity(&mut self, identity: crate::options::DbIdentity) -> bool {
         let Some(store) = Rc::get_mut(&mut self.inner) else {
             return false;
         };
+        if store.client.borrow().is_some()
+            || !store.sessions.borrow().is_empty()
+            || store.seq.get() != 0
+        {
+            return false;
+        }
         if store.system_node == store.identity.node {
             store.system_node = identity.node;
         }

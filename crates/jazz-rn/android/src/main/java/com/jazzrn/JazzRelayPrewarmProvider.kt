@@ -5,7 +5,10 @@ import android.content.ContentValues
 import android.database.Cursor
 import android.net.Uri
 
-/** PREWARM DRAFT: starts the relay prewarm at process start, off the main thread. */
+/**
+ * Starts the relay prewarm at process start, off the main thread: the relay the last launch
+ * admitted opens while the app is still loading its JavaScript.
+ */
 class JazzRelayPrewarmProvider : ContentProvider() {
   override fun onCreate(): Boolean {
     val app = context?.applicationContext ?: return true
@@ -13,7 +16,7 @@ class JazzRelayPrewarmProvider : ContentProvider() {
       try {
         JazzRelayBridge.prewarm(app)
       } catch (error: Throwable) {
-        android.util.Log.w("JazzPrewarm", "prewarm failed", error)
+        android.util.Log.w("JazzRelay", "relay prewarm failed", error)
       }
     }, "jazz-prewarm").start()
     return true

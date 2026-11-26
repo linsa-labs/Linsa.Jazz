@@ -13,6 +13,8 @@ fn main() {
         "../jazz",
         "../jazz-text",
         "../jazz-native-transport",
+        "../jazz-compression",
+        "../../vendor",
         "../../Cargo.toml",
         "../../Cargo.lock",
     ] {

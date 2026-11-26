@@ -141,3 +141,16 @@ fn bytes_that_are_not_a_store_image_are_refused() {
         assert!(block_on(Db::open_image(config(), bytes)).is_err());
     }
 }
+
+#[test]
+fn a_store_keeps_its_identity_once_it_was_written() {
+    let other = DbIdentity {
+        node: NodeUuid::from_bytes([4; 16]),
+        author: AuthorSubject::SYSTEM,
+    };
+    let mut untouched = block_on(Db::open(config())).unwrap();
+    assert!(untouched.rebind_identity(other));
+    let mut written = block_on(Db::open(config())).unwrap();
+    insert_note(&written, 1, None);
+    assert!(!written.rebind_identity(other));
+}

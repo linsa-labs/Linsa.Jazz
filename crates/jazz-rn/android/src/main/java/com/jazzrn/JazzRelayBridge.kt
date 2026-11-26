@@ -135,11 +135,12 @@ internal object JazzRelayBridge {
     }
   }
 
-  /** PREWARM DRAFT: open the last launch's relay before JavaScript asks. */
+  /** Open the last launch's relay before JavaScript asks (see JazzRelayPrewarmProvider). */
   @Synchronized
   fun prewarm(context: Context) {
-    val status = nativePrewarm(ensureHost(), nativeRelayStorageRoot(context).canonicalPath.toByteArray(Charsets.UTF_8))
-    android.util.Log.i("JazzPrewarm", "prewarm status=$status")
+    val root = nativeRelayStorageRoot(context).canonicalPath.toByteArray(Charsets.UTF_8)
+    val status = nativePrewarm(ensureHost(), root)
+    if (status != 0) android.util.Log.w("JazzRelay", "relay prewarm status $status")
   }
 
   @JvmStatic private external fun nativePrewarm(host: Long, root: ByteArray): Int
